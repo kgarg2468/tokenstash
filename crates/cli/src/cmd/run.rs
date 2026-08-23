@@ -16,7 +16,9 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
+use secrecy::SecretString;
 use tokenstash_core::need::{self, NeedOpts};
+use tokenstash_core::redact::Redactor;
 use tokenstash_core::tasks::SecretRequest;
 
 #[derive(Args)]
@@ -84,24 +86,33 @@ fn load_env(path: &std::path::Path) -> HashMap<String, String> {
     s.lines().filter_map(tokenstash_core::envfile::parse_line).collect()
 }
 
-/// Run, teeing output to the terminal and capturing it for diagnosis.
+/// Run, teeing output to the terminal and capturing it for diagnosis. Every line passes
+/// through a redactor seeded with the values we injected: a child that echoes its own
+/// environment must not put a secret on an agent-visible stream.
 fn spawn(cmd: &[String], extra: &HashMap<String, String>) -> Result<(i32, String)> {
+    let mut redactor = Redactor::new();
+    for v in extra.values() {
+        redactor.add(&SecretString::from(v.clone()));
+    }
+    let redactor = std::sync::Arc::new(redactor);
     let mut c = Command::new(&cmd[0]);
     c.args(&cmd[1..]).envs(extra).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = c.spawn()?;
     let out = child.stdout.take().unwrap();
     let err = child.stderr.take().unwrap();
-    let t1 = std::thread::spawn(move || tee(out, false));
-    let t2 = std::thread::spawn(move || tee(err, true));
+    let (r1, r2) = (redactor.clone(), redactor.clone());
+    let t1 = std::thread::spawn(move || tee(out, false, &r1));
+    let t2 = std::thread::spawn(move || tee(err, true, &r2));
     let status = child.wait()?;
     let mut captured = t1.join().unwrap_or_default();
     captured.push_str(&t2.join().unwrap_or_default());
     Ok((status.code().unwrap_or(1), captured))
 }
 
-fn tee<R: std::io::Read>(r: R, is_err: bool) -> String {
+fn tee<R: std::io::Read>(r: R, is_err: bool, redactor: &Redactor) -> String {
     let mut buf = String::new();
     for line in BufReader::new(r).lines().map_while(Result::ok) {
+        let line = redactor.redact(&line);
         if is_err { let _ = writeln!(std::io::stderr(), "{line}"); } else { let _ = writeln!(std::io::stdout(), "{line}"); }
         buf.push_str(&line);
         buf.push('\n');
