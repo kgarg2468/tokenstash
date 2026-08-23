@@ -35,6 +35,12 @@ enum Cmd {
     Trust(cmd::admin::TrustArgs),
     /// Show recent audit events (never values).
     Audit(cmd::admin::AuditArgs),
+    /// Detect agents, write MCP config + skill file, choose a stash backend, set trust roots.
+    Init(cmd::init::InitArgs),
+    /// Check that everything works.
+    Doctor,
+    /// Run a command with the project's env file loaded; if it dies on a missing key, file the task, wait, inject, restart.
+    Run(cmd::run::RunArgs),
     /// Serve the MCP server over stdio (used by agents; configured by `init`).
     Mcp,
     /// Serve the localhost inbox (started automatically when a task is filed).
@@ -68,6 +74,9 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Bind(a) => cmd::admin::bind(a),
         Cmd::Trust(a) => cmd::admin::trust(a),
         Cmd::Audit(a) => cmd::admin::audit(a),
+        Cmd::Init(a) => cmd::init::init(a),
+        Cmd::Doctor => cmd::doctor::doctor(),
+        Cmd::Run(a) => cmd::run::run(a),
         Cmd::Mcp => cmd::mcp::serve(),
         Cmd::Inbox(a) => cmd::inbox::serve(a),
         Cmd::Open => {
