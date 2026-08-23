@@ -58,6 +58,7 @@ pub fn need(a: NeedArgs) -> Result<i32> {
         blocking: false,
         timeout: Duration::from_secs(a.timeout),
         force: a.force,
+        require_approval: false,
     };
     let mut outcomes = need::need(&app.ctx(), &project, &agent, &a.names, &opts)?;
 
