@@ -40,7 +40,7 @@ pub struct SecretRequest {
 /// Create (or reuse the open) secret task for `name` in `project`. Registry fills in gaps.
 pub fn create_secret_task(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &str, req: &SecretRequest) -> Result<Task> {
     let pid = project.to_string_lossy().to_string();
-    if let Some(t) = ctx.db.open_secret_task(&pid, name)? {
+    if let Some(t) = ctx.db.open_secret_task(&pid, name, identity)? {
         return Ok(t);
     }
     let p = registry::lookup(name);

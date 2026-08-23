@@ -109,7 +109,7 @@ pub fn need(ctx: &Ctx, project: &Path, agent: &str, names: &[String], opts: &Nee
         // Honor a recent refusal: "denied — do not ask again" must actually mean that.
         if !opts.force {
             let since = (chrono::Utc::now() - chrono::Duration::hours(ctx.cfg.task_ttl_hours as i64)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-            if let Some(d) = ctx.db.recent_denial(&pid, name, &since)? {
+            if let Some(d) = ctx.db.recent_denial(&pid, name, &identity, &since)? {
                 outcomes.push(Outcome::Denied { name: name.clone(), task_id: d.id });
                 continue;
             }
