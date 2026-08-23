@@ -1987,6 +1987,7 @@ dependencies = [
  "dirs",
  "notify-rust",
  "open",
+ "rand",
  "regex",
  "rpassword",
  "secrecy",

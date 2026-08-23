@@ -24,6 +24,10 @@ const IDLE_EXIT: Duration = Duration::from_secs(30 * 60);
 
 pub fn serve(a: InboxArgs) -> Result<i32> {
     let app = App::open()?;
+    let token = match std::env::var("TOKENSTASH_INBOX_TOKEN") {
+        Ok(t) if t.len() >= 16 && t.chars().all(|c| c.is_ascii_hexdigit()) => t,
+        _ => crate::notify::inbox_token(),
+    };
     let port = a.port.unwrap_or(app.cfg.inbox_port);
     let server = match Server::http(format!("127.0.0.1:{port}")) {
         Ok(s) => s,
@@ -35,7 +39,7 @@ pub fn serve(a: InboxArgs) -> Result<i32> {
         match server.recv_timeout(Duration::from_secs(1)) {
             Ok(Some(req)) => {
                 last_activity = Instant::now();
-                if let Err(e) = handle(&app, req) {
+                if let Err(e) = handle(&app, req, &token) {
                     eprintln!("inbox: {e:#}");
                 }
             }
@@ -53,29 +57,40 @@ pub fn serve(a: InboxArgs) -> Result<i32> {
     }
 }
 
-fn handle(app: &App, mut req: Request) -> Result<()> {
+fn handle(app: &App, mut req: Request, token: &str) -> Result<()> {
     let url = req.url().to_string();
-    let path = url.split('?').next().unwrap_or("/").to_string();
+    let (path, query) = match url.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (url.clone(), String::new()),
+    };
     let method = req.method().as_str().to_string();
     app.db.expire_overdue()?;
 
     if path == "/health" {
         return respond(req, 200, "text/plain", "ok".into());
     }
+    // Every other route requires the session token. 404 (not 403) so probing
+    // reveals nothing. Blocks loopback CSRF and replay of agent-visible URLs.
+    let supplied = parse_form(&query).get("t").cloned().unwrap_or_default();
+    if !secure_eq(&supplied, token) {
+        eprintln!("inbox: rejected unauthorized request to {path}");
+        return respond(req, 404, "text/plain", "not found".into());
+    }
+
     if path == "/api/tasks" {
         let list = app.db.list_tasks(None, true)?;
         return respond(req, 200, "application/json", serde_json::to_string(&list)?);
     }
     if path == "/" {
         let list = app.db.list_tasks(None, true)?;
-        let flash = url.split('?').nth(1).and_then(|q| parse_form(q).remove("m"));
-        return respond(req, 200, "text/html; charset=utf-8", page_index(&list, flash.as_deref()));
+        let flash = parse_form(&query).remove("m");
+        return respond(req, 200, "text/html; charset=utf-8", page_index(&list, flash.as_deref(), token));
     }
     if let Some(id) = path.strip_prefix("/t/") {
         let id = id.trim_end_matches('/').to_string();
         let Some(task) = app.db.find_task(&id)? else { return respond(req, 404, "text/plain", "no such task".into()) };
         if method == "GET" {
-            return respond(req, 200, "text/html; charset=utf-8", page_task(&task, None));
+            return respond(req, 200, "text/html; charset=utf-8", page_task(&task, None, token));
         }
         if method == "POST" {
             let mut body = String::new();
@@ -106,8 +121,8 @@ fn handle(app: &App, mut req: Request) -> Result<()> {
                 }
             })();
             return match msg {
-                Ok(m) => redirect(req, &format!("/?m={}", urlencoding::encode(&m))),
-                Err(e) => respond(req, 200, "text/html; charset=utf-8", page_task(&task, Some(&format!("{e:#}")))),
+                Ok(m) => redirect(req, &format!("/?m={}&t={}", urlencoding::encode(&m), token)),
+                Err(e) => respond(req, 200, "text/html; charset=utf-8", page_task(&task, Some(&format!("{e:#}")), token)),
             };
         }
     }
@@ -140,6 +155,14 @@ fn parse_form(s: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// Constant-time string compare for the session token.
+fn secure_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
@@ -161,7 +184,7 @@ fn layout(title: &str, body: String) -> String {
     format!("<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>{} · tokenstash</title><style>{CSS}</style></head><body><main><h1>tokenstash inbox</h1>{body}</main></body></html>", esc(title))
 }
 
-fn page_index(list: &[Task], flash: Option<&str>) -> String {
+fn page_index(list: &[Task], flash: Option<&str>, token: &str) -> String {
     let mut b = String::new();
     if let Some(f) = flash {
         b.push_str(&format!("<div class=flash>✓ {}</div>", esc(f)));
@@ -176,16 +199,16 @@ fn page_index(list: &[Task], flash: Option<&str>) -> String {
             TaskKind::Human => esc(&t.title),
         };
         b.push_str(&format!(
-            "<div class=card><div class=mut>{} · {}</div><h2>{}</h2><div class=mut>{}</div><div class=row><a class='btn p' href='/t/{}'>Open →</a></div></div>",
-            esc(&tokenstash_core::project::short(std::path::Path::new(&t.project))), esc(&t.agent), what, esc(&t.title), t.id
+            "<div class=card><div class=mut>{} · {}</div><h2>{}</h2><div class=mut>{}</div><div class=row><a class='btn p' href='/t/{}?t={}'>Open →</a></div></div>",
+            esc(&tokenstash_core::project::short(std::path::Path::new(&t.project))), esc(&t.agent), what, esc(&t.title), t.id, token
         ));
     }
     layout("Inbox", b)
 }
 
-fn page_task(t: &Task, err: Option<&str>) -> String {
+fn page_task(t: &Task, err: Option<&str>, token: &str) -> String {
     let mut b = String::new();
-    b.push_str("<p><a href='/'>← all tasks</a></p>");
+    b.push_str(&format!("<p><a href='/?t={}'>← all tasks</a></p>", token));
     if let Some(e) = err {
         b.push_str(&format!("<div class=err>{}</div>", esc(e)));
     }
@@ -204,18 +227,21 @@ fn page_task(t: &Task, err: Option<&str>) -> String {
     match t.kind {
         TaskKind::Secret => {
             b.push_str(&format!(
-                "<form method=post><label class=mut for=v>{}</label><input id=v type=password name=value autocomplete=off autofocus placeholder='paste here — never shown, never sent anywhere but your keychain'>{}<div class=row><button class=p type=submit>Store &amp; inject</button><button class=bad name=action value=deny formnovalidate>Decline</button></div><p class=mut style='margin-top:10px'><label><input type=checkbox name=skip_check> skip the provider check</label> — if the check fails you'll see it here and nothing is stored</p></form>",
+                "<form method=post action='/t/{}?t={}'><label class=mut for=v>{}</label><input id=v type=password name=value autocomplete=off autofocus placeholder='paste here — never shown, never sent anywhere but your keychain'>{}<div class=row><button class=p type=submit>Store &amp; inject</button><button class=bad name=action value=deny formnovalidate>Decline</button></div><p class=mut style='margin-top:10px'><label><input type=checkbox name=skip_check> skip the provider check</label> — if the check fails you'll see it here and nothing is stored</p></form>",
+                t.id, token,
                 esc(&t.name.clone().unwrap_or_default()),
                 t.pattern.as_ref().map(|p| format!("<div class=mut>must match <code>{}</code></div>", esc(p))).unwrap_or_default()
             ));
         }
         TaskKind::Approval => {
-            b.push_str(&format!("<p>Keys: <code>{}</code></p><form method=post><div class=row><button class=p name=action value=allow>Allow for this project</button><button class=bad name=action value=deny>Deny</button></div></form>",
-                esc(&t.names.iter().filter(|n| n.as_str() != "*").cloned().collect::<Vec<_>>().join("</code>, <code>"))));
+            b.push_str(&format!("<p>Keys: <code>{}</code></p><form method=post action='/t/{}?t={}'><div class=row><button class=p name=action value=allow>Allow for this project</button><button class=bad name=action value=deny>Deny</button></div></form>",
+                esc(&t.names.iter().filter(|n| n.as_str() != "*").cloned().collect::<Vec<_>>().join("</code>, <code>")),
+                t.id, token
+            ));
         }
         TaskKind::Human => {
             let note = if t.expects == "text" { "<textarea name=note rows=3 placeholder='your answer'></textarea>" } else { "<input type=text name=note placeholder='optional note'>" };
-            b.push_str(&format!("<form method=post>{note}<div class=row><button class=p name=action value=done>Done</button><button class=bad name=action value=deny>Can't do this</button></div></form>"));
+            b.push_str(&format!("<form method=post action='/t/{}?t={}'>{note}<div class=row><button class=p name=action value=done>Done</button><button class=bad name=action value=deny>Can't do this</button></div></form>", t.id, token));
         }
     }
     b.push_str("</div>");

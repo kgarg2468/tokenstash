@@ -21,6 +21,7 @@ notify-rust = "4"
 rpassword = "7"
 open = "5"
 urlencoding = "2"
+rand.workspace = true
 secrecy.workspace = true
 dirs.workspace = true
 regex.workspace = true
