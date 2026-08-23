@@ -1,0 +1,53 @@
+//! Private, atomic file writes. Used for anything that holds a secret value.
+
+use anyhow::{bail, Context, Result};
+use std::fs;
+use std::io::Write;
+use std::path::Path;
+
+/// Write `contents` to `path` such that:
+/// - the file is 0600 from the first byte (created with that mode, O_EXCL temp file);
+/// - a pre-existing symlink at `path` is refused, never written through;
+/// - the write is atomic: on any failure the previous file is untouched;
+/// - the temp file is never left behind.
+pub fn write_atomic_private(path: &Path, contents: &str) -> Result<()> {
+    if let Ok(md) = fs::symlink_metadata(path) {
+        if md.file_type().is_symlink() {
+            bail!("{} is a symlink; refusing to write a secret through it", path.display());
+        }
+        if !md.is_file() {
+            bail!("{} exists and is not a regular file", path.display());
+        }
+    }
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
+    let tmp = dir.join(format!(".{name}.tokenstash-{}.tmp", std::process::id()));
+    let _guard = RemoveOnDrop(tmp.clone());
+
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true); // O_EXCL: fails if anything (incl. a symlink) is there
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    f.write_all(contents.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // belt and braces for filesystems that ignore mode at create
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+struct RemoveOnDrop(std::path::PathBuf);
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}

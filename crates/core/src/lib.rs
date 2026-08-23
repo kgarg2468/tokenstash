@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod db;
+pub mod fsutil;
 pub mod redact;
 pub mod registry;
 pub mod stash;
