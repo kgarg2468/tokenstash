@@ -65,9 +65,8 @@ pub fn need(a: NeedArgs) -> Result<i32> {
     if outcomes.iter().any(|o| o.is_pending()) {
         notify_pending(&app, &project, &agent, &outcomes);
         if a.blocking {
-            let blocking = NeedOpts { blocking: true, ..opts.clone() };
-            // re-run to wait (hits are idempotent; pending tasks are reused)
-            outcomes = need::need(&app.ctx(), &project, &agent, &a.names, &blocking)?;
+            // wait on the tasks already filed; never file a second set
+            need::wait(&app.ctx(), &project, &mut outcomes, opts.timeout)?;
         }
     }
 
