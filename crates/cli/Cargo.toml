@@ -1,0 +1,26 @@
+[package]
+name = "tokenstash"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Your agent asks you for a key once. Never again — in any project, in any agent."
+
+[[bin]]
+name = "tokenstash"
+path = "src/main.rs"
+
+[dependencies]
+tokenstash-core = { path = "../core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+clap = { version = "4", features = ["derive"] }
+tiny_http = "0.12"
+notify-rust = "4"
+rpassword = "7"
+open = "5"
+urlencoding = "2"
+secrecy.workspace = true
+dirs.workspace = true
+regex.workspace = true
