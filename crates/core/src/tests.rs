@@ -64,6 +64,17 @@ fn gitignore_is_enforced_in_repos() {
     // already covered by a glob
     std::fs::write(dir.join(".gitignore"), ".env*\n").unwrap();
     assert!(!envfile::ensure_gitignore(&sub, ".env.local").unwrap());
+    // a symlinked .gitignore is refused, and the symlink target is untouched
+    #[cfg(unix)]
+    {
+        let target = dir.join("elsewhere.txt");
+        std::fs::write(&target, "keep me\n").unwrap();
+        std::fs::remove_file(dir.join(".gitignore")).unwrap();
+        std::os::unix::fs::symlink(&target, dir.join(".gitignore")).unwrap();
+        assert!(envfile::ensure_gitignore(&sub, ".env.local").is_err());
+        assert!(envfile::write(&sub, ".env.local", "K2", &SecretString::from("vvvvvvvv".to_string())).is_err(), "injection must fail when .gitignore cannot be enforced");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me\n");
+    }
 }
 
 #[test]
@@ -342,6 +353,15 @@ fn answering_a_secret_marks_the_task_before_injection() {
     assert!(stash.get("RESEND_API_KEY@default").unwrap().is_some());
     assert_eq!(db.get_task(&tid).unwrap().unwrap().status, db::TaskStatus::Answered);
     assert!(db.get_secret("RESEND_API_KEY", "default").unwrap().is_some());
+    // a blocking wait must not report Injected while the file is still unwritable...
+    let blocking = need::NeedOpts { blocking: true, timeout: std::time::Duration::from_millis(200), ..Default::default() };
+    let r = need::need(&ctx, &proj, "t", &["RESEND_API_KEY".to_string()], &blocking);
+    assert!(r.is_err(), "must surface the injection failure, not claim success");
+    // ...and once the obstacle is gone, the next call injects from the stash without asking
+    std::fs::remove_file(proj.join(".env.local")).unwrap();
+    let out = need::need(&ctx, &proj, "t", &["RESEND_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    assert!(matches!(out[0], need::Outcome::Injected { .. }));
+    assert!(envfile::has(&proj, ".env.local", "RESEND_API_KEY"));
 }
 
 #[test]
