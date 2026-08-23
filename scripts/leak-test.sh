@@ -54,6 +54,17 @@ MY_SERVICE_TOKEN="$INHERITED" "$TS" run -- "$PROJ/echo2.sh" >"$OUT/run2.txt" 2>&
 grep -q "$INHERITED" "$OUT/run2.txt" && { echo "LEAK: inherited env value echoed by child"; exit 1; }
 grep -q "\[redacted\]" "$OUT/run2.txt" || { echo "run shim did not redact inherited value"; exit 1; }
 
+# a secret passed as a command-line argument to `run` must not be persisted in the task text
+cat > "$PROJ/fail.sh" <<'SH'
+#!/bin/sh
+echo "Error: GROQ_API_KEY is not set" >&2; exit 1
+SH
+chmod +x "$PROJ/fail.sh"
+ARGSECRET="argsecret-LEAKCANARY-$(date +%s)"
+"$TS" run --timeout 1 -- "$PROJ/fail.sh" --token "$ARGSECRET" >"$OUT/run3.txt" 2>&1 || true
+"$TS" tasks --all --history --json >"$OUT/tasks2.txt" 2>&1
+grep -q "$ARGSECRET" "$OUT/tasks2.txt" && { echo "LEAK: command argument persisted in task"; exit 1; }
+
 # the env file is the ONE place the value is allowed to be
 grep -q "OPENAI_API_KEY=$CANARY" "$PROJ/.env.local"
 grep -q "^.env.local$" "$PROJ/.gitignore"
