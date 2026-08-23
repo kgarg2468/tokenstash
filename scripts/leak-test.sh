@@ -43,6 +43,16 @@ SH
 chmod +x "$PROJ/echo.sh"
 "$TS" run -- "$PROJ/echo.sh" >"$OUT/run.txt" 2>&1 || true
 grep -q "\[redacted\]" "$OUT/run.txt" || { echo "run shim did not redact"; exit 1; }
+# ...and an inherited parent-environment secret under a secret-looking name is redacted too
+INHERITED="inherited-LEAKCANARY-$(date +%s)-zzzz"
+cat > "$PROJ/echo2.sh" <<'SH'
+#!/bin/sh
+echo "MY_SERVICE_TOKEN is $MY_SERVICE_TOKEN"
+SH
+chmod +x "$PROJ/echo2.sh"
+MY_SERVICE_TOKEN="$INHERITED" "$TS" run -- "$PROJ/echo2.sh" >"$OUT/run2.txt" 2>&1 || true
+grep -q "$INHERITED" "$OUT/run2.txt" && { echo "LEAK: inherited env value echoed by child"; exit 1; }
+grep -q "\[redacted\]" "$OUT/run2.txt" || { echo "run shim did not redact inherited value"; exit 1; }
 
 # the env file is the ONE place the value is allowed to be
 grep -q "OPENAI_API_KEY=$CANARY" "$PROJ/.env.local"
