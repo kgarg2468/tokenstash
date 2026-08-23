@@ -112,9 +112,13 @@ pub fn git_root(start: &Path) -> Option<PathBuf> {
 }
 
 /// If inside a git repo, make sure `.gitignore` at the root ignores the env file.
+/// `.gitignore` is repo-controlled; a symlink there is refused rather than written through.
 pub fn ensure_gitignore(project: &Path, env_file: &str) -> Result<bool> {
     let Some(root) = git_root(project) else { return Ok(false) };
     let gi = root.join(".gitignore");
+    if fs::symlink_metadata(&gi).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+        anyhow::bail!("{} is a symlink; refusing to modify it (and cannot guarantee {env_file} stays uncommitted)", gi.display());
+    }
     let existing = if gi.exists() { fs::read_to_string(&gi)? } else { String::new() };
     let covered = existing.lines().map(str::trim).any(|l| {
         l == env_file
@@ -134,6 +138,6 @@ pub fn ensure_gitignore(project: &Path, env_file: &str) -> Result<bool> {
     s.push_str("# added by tokenstash — never commit injected secrets\n");
     s.push_str(env_file);
     s.push('\n');
-    fs::write(&gi, s)?;
+    crate::fsutil::write_atomic(&gi, &s)?;
     Ok(true)
 }
