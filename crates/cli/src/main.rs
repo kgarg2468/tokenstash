@@ -81,10 +81,14 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Inbox(a) => cmd::inbox::serve(a),
         Cmd::Open => {
             let cfg = tokenstash_core::Config::load()?;
-            let url = util::inbox_url(&cfg, None);
             notify::ensure_inbox(&cfg);
-            let _ = open::that(&url);
-            println!("{url}");
+            match notify::verified_inbox_link(&cfg, None) {
+                Some(url) => {
+                    let _ = open::that(&url);
+                    println!("{}", crate::util::inbox_url(&cfg, None));
+                }
+                None => eprintln!("tokenstash: nothing verified on port {} — is another process using it?", cfg.inbox_port),
+            }
             Ok(0)
         }
         Cmd::Registry => {

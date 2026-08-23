@@ -48,8 +48,9 @@ pub fn ensure_inbox(cfg: &Config) {
         return;
     }
     let Ok(exe) = std::env::current_exe() else { return };
+    let token = inbox_token();
     let mut c = std::process::Command::new(exe);
-    c.arg("inbox").env("TOKENSTASH_INBOX_TOKEN", inbox_token()).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    c.arg("inbox").env("TOKENSTASH_INBOX_TOKEN", token).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -57,11 +58,43 @@ pub fn ensure_inbox(cfg: &Config) {
     }
     let _ = c.spawn();
     for _ in 0..20 {
-        if inbox_running(cfg) {
+        if port_knows_token(cfg) {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Minimal one-shot HTTP GET over raw TCP; returns the response body, or None.
+fn http_get(port: u16, path_qs: &str) -> Option<String> {
+    use std::io::{Read, Write};
+    let mut s = TcpStream::connect_timeout(&format!("127.0.0.1:{port}").parse().ok()?, Duration::from_millis(500)).ok()?;
+    write!(s, "GET {path_qs} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").ok()?;
+    let mut buf = String::new();
+    s.read_to_string(&mut buf).ok()?;
+    buf.split_once("\r\n\r\n").map(|(_, body)| body.to_string())
+}
+
+/// True when whatever listens on the inbox port proves it knows the session token —
+/// i.e., it is our inbox and not a port squatter waiting to capture deep links.
+/// Challenge–response: the raw token never touches the wire on this path.
+fn port_knows_token(cfg: &Config) -> bool {
+    use sha2::Digest;
+    let token = inbox_token();
+    let mut b = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut b);
+    let challenge: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    let expected = format!("{:x}", sha2::Sha256::digest(format!("{token}:{challenge}")));
+    http_get(cfg.inbox_port, &format!("/verify?c={challenge}")).map(|body| body.trim() == expected).unwrap_or(false)
+}
+
+/// Deep link for humans (desktop notification / `tokenstash open`), only when the
+/// listener on our port has proven it is ours. None means: don't hand out links.
+pub fn verified_inbox_link(cfg: &Config, task_id: Option<&str>) -> Option<String> {
+    if !port_knows_token(cfg) {
+        return None;
+    }
+    Some(crate::util::inbox_link(cfg, task_id))
 }
 
 pub fn desktop(cfg: &Config, title: &str, body: &str, url: &str) {

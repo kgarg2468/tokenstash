@@ -5,6 +5,7 @@ use crate::util::App;
 use anyhow::Result;
 use clap::Args;
 use secrecy::SecretString;
+use sha2::Digest;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tiny_http::{Header, Request, Response, Server};
@@ -68,6 +69,19 @@ fn handle(app: &App, mut req: Request, token: &str) -> Result<()> {
 
     if path == "/health" {
         return respond(req, 200, "text/plain", "ok".into());
+    }
+    // Ownership proof: the caller sends a fresh challenge `c`; only the real inbox
+    // (which knows the token) can answer with sha256("token:c"). The raw token never
+    // travels on this path, so a port squatter observing the exchange learns nothing
+    // it can replay for a new challenge.
+    if path == "/verify" {
+        let challenge = parse_form(&query).get("c").cloned().unwrap_or_default();
+        let answer = format!("{:x}", sha2::Sha256::digest(format!("{token}:{challenge}")));
+        return if !challenge.is_empty() {
+            respond(req, 200, "text/plain", answer)
+        } else {
+            respond(req, 404, "text/plain", "not found".into())
+        };
     }
     // Every other route requires the session token. 404 (not 403) so probing
     // reveals nothing. Blocks loopback CSRF and replay of agent-visible URLs.

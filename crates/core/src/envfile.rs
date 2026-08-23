@@ -13,6 +13,14 @@ use std::process::Command;
 /// in a commit-eligible file.
 pub fn write(project: &Path, env_file: &str, name: &str, value: &SecretString) -> Result<PathBuf> {
     let path = project.join(env_file);
+    // A symlink here would route the secret outside the protected path (e.g. into a
+    // tracked file or another user's config): refuse rather than follow it.
+    if path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+        anyhow::bail!(
+            "{} is a symlink — refusing to write a secret through it. Remove the link and re-run.",
+            path.display()
+        );
+    }
     enforce_uncommittable(project, env_file)?;
     let existing = if path.exists() { fs::read_to_string(&path)? } else { String::new() };
     let mut out = String::with_capacity(existing.len() + 64);

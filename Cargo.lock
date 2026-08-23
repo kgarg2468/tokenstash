@@ -1993,6 +1993,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2",
  "tiny_http",
  "tokenstash-core",
  "urlencoding",
