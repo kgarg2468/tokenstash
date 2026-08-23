@@ -65,6 +65,26 @@ pub fn with_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
     out
 }
 
+/// Atomic replace for a non-secret, repo-visible file (e.g. `.gitignore`): O_EXCL temp,
+/// fsync, rename. Refuses a symlinked destination. Default (umask) permissions.
+pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    if let Ok(md) = fs::symlink_metadata(path) {
+        if md.file_type().is_symlink() {
+            bail!("{} is a symlink; refusing to write through it", path.display());
+        }
+    }
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
+    let tmp = dir.join(format!(".{name}.tokenstash-{}.tmp", std::process::id()));
+    let _guard = RemoveOnDrop(tmp.clone());
+    let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    f.write_all(contents.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
+}
+
 struct RemoveOnDrop(std::path::PathBuf);
 impl Drop for RemoveOnDrop {
     fn drop(&mut self) {

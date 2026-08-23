@@ -151,7 +151,16 @@ fn wait(ctx: &Ctx, project: &Path, outcomes: &mut [Outcome], timeout: Duration) 
                 match t.status {
                     TaskStatus::Pending => any_pending = true,
                     TaskStatus::Answered => {
+                        // Answered means stored; do not assume injected. Verify the env file
+                        // has it, and if not, inject from the stash now (the value exists).
                         let written: PathBuf = project.join(&ctx.cfg.env_file);
+                        if !crate::envfile::has(project, &ctx.cfg.env_file, name) {
+                            let v = ctx.stash.get(&stash_key(name, &t.identity))?
+                                .ok_or_else(|| anyhow::anyhow!("task {} is answered but {name}@{} is not in the stash", t.id, t.identity))?;
+                            crate::envfile::write(project, &ctx.cfg.env_file, name, &v)
+                                .map_err(|e| anyhow::anyhow!("{name} is stored but could not be written to {}: {e:#}", written.display()))?;
+                            ctx.db.audit(Some(&project.to_string_lossy()), None, "inject", Some(name), Some(&t.identity), Some("after-answer"))?;
+                        }
                         *o = Outcome::Injected { name: name.clone(), identity: t.identity.clone(), written_to: written.display().to_string(), generated: false };
                     }
                     TaskStatus::Denied => *o = Outcome::Denied { name: name.clone(), task_id: task_id.clone() },
