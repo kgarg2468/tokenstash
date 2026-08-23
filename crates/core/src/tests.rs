@@ -343,3 +343,39 @@ fn answering_a_secret_marks_the_task_before_injection() {
     assert_eq!(db.get_task(&tid).unwrap().unwrap().status, db::TaskStatus::Answered);
     assert!(db.get_secret("RESEND_API_KEY", "default").unwrap().is_some());
 }
+
+#[test]
+fn same_name_different_identities_get_separate_tasks() {
+    let _env = env_lock();
+    let home = tmp("ident-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("ident-proj").canonicalize().unwrap();
+    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let name = vec!["OPENAI_API_KEY".to_string()];
+    let work = need::need(&ctx, &proj, "t", &name, &need::NeedOpts { identity: Some("work".into()), ..Default::default() }).unwrap();
+    let personal = need::need(&ctx, &proj, "t", &name, &need::NeedOpts { identity: Some("personal".into()), ..Default::default() }).unwrap();
+    let (tw, tp) = match (&work[0], &personal[0]) {
+        (need::Outcome::Pending { task_id: a, .. }, need::Outcome::Pending { task_id: b, .. }) => (a.clone(), b.clone()),
+        other => panic!("expected two pending tasks, got {other:?}"),
+    };
+    assert_ne!(tw, tp, "different identities must not share a task");
+    assert_eq!(db.get_task(&tw).unwrap().unwrap().identity, "work");
+    assert_eq!(db.get_task(&tp).unwrap().unwrap().identity, "personal");
+    // answering the work task stores under @work only
+    tasks::answer_secret(&ctx, &db.get_task(&tw).unwrap().unwrap(), SecretString::from("sk-workworkwork123".to_string()), true).unwrap();
+    assert!(stash.get("OPENAI_API_KEY@work").unwrap().is_some());
+    assert!(stash.get("OPENAI_API_KEY@personal").unwrap().is_none());
+    assert_eq!(db.get_task(&tp).unwrap().unwrap().status, db::TaskStatus::Pending, "personal task untouched");
+    // a repeat request for the same identity reuses its open task; denial is per identity too
+    let again = need::need(&ctx, &proj, "t", &name, &need::NeedOpts { identity: Some("personal".into()), ..Default::default() }).unwrap();
+    assert!(matches!(&again[0], need::Outcome::Pending { task_id, .. } if *task_id == tp));
+    tasks::deny(&ctx, &db.get_task(&tp).unwrap().unwrap(), None).unwrap();
+    let denied = need::need(&ctx, &proj, "t", &name, &need::NeedOpts { identity: Some("personal".into()), ..Default::default() }).unwrap();
+    assert!(matches!(denied[0], need::Outcome::Denied { .. }));
+    let work_hit = need::need(&ctx, &proj, "t", &name, &need::NeedOpts { identity: Some("work".into()), ..Default::default() }).unwrap();
+    assert!(matches!(work_hit[0], need::Outcome::Injected { .. }), "work identity unaffected by personal denial");
+}
