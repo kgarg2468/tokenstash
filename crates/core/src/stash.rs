@@ -9,7 +9,7 @@
 //! - `insecure-file`: 0600 JSON file. ONLY for CI/tests. Requires explicit opt-in via
 //!   `TOKENSTASH_STASH=insecure-file` or config. Prints a warning.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use secrecy::{ExposeSecret, SecretString};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -79,7 +79,7 @@ impl KeyringStash {
         #[cfg(target_os = "linux")]
         {
             let k = Self::keyutils()?;
-            k.probe().context("no usable Linux keyring (Secret Service unavailable and keyutils failed)")?;
+            k.probe().map_err(|e| anyhow!("no usable Linux keyring (Secret Service unavailable and keyutils failed): {e}"))?;
             return Ok(k);
         }
         #[allow(unreachable_code)]
