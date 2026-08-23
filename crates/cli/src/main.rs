@@ -35,6 +35,12 @@ enum Cmd {
     Trust(cmd::admin::TrustArgs),
     /// Show recent audit events (never values).
     Audit(cmd::admin::AuditArgs),
+    /// Serve the MCP server over stdio (used by agents; configured by `init`).
+    Mcp,
+    /// Serve the localhost inbox (started automatically when a task is filed).
+    Inbox(cmd::inbox::InboxArgs),
+    /// Open the inbox in your browser.
+    Open,
     /// Print the provider registry (names and signup URLs).
     Registry,
 }
@@ -62,6 +68,16 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Bind(a) => cmd::admin::bind(a),
         Cmd::Trust(a) => cmd::admin::trust(a),
         Cmd::Audit(a) => cmd::admin::audit(a),
+        Cmd::Mcp => cmd::mcp::serve(),
+        Cmd::Inbox(a) => cmd::inbox::serve(a),
+        Cmd::Open => {
+            let cfg = tokenstash_core::Config::load()?;
+            let url = util::inbox_url(&cfg, None);
+            notify::ensure_inbox(&cfg);
+            let _ = open::that(&url);
+            println!("{url}");
+            Ok(0)
+        }
         Cmd::Registry => {
             for p in tokenstash_core::registry::all() {
                 println!("{:<36} {:<22} {}{}", p.name, p.provider, p.url, if p.sensitive { "  [sensitive]" } else { "" });
