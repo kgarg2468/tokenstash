@@ -95,6 +95,15 @@ ARGSECRET="argsecret-LEAKCANARY-$(date +%s)"
 "$TS" tasks --all --history --json >"$OUT/tasks2.txt" 2>&1
 grep -q "$ARGSECRET" "$OUT/tasks2.txt" && { echo "LEAK: command argument persisted in task"; exit 1; }
 
+# a registry-named inherited value is redacted even when short (whole-token)
+cat > "$PROJ/echo6.sh" <<'SH'
+#!/bin/sh
+echo "hf token: $HF_TOKEN ok"
+SH
+chmod +x "$PROJ/echo6.sh"
+HF_TOKEN=abc "$TS" run -- "$PROJ/echo6.sh" >"$OUT/run7.txt" 2>&1 || true   # HF_TOKEN=abc
+grep -q "hf token: abc ok" "$OUT/run7.txt" && { echo "LEAK: short registry-named value echoed"; exit 1; }
+
 # the env file is the ONE place the value is allowed to be
 grep -q "OPENAI_API_KEY=$CANARY" "$PROJ/.env.local"
 grep -q "^.env.local$" "$PROJ/.gitignore"
