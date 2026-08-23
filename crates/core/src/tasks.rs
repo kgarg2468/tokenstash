@@ -73,8 +73,17 @@ pub fn create_secret_task(ctx: &Ctx, project: &Path, agent: &str, name: &str, id
     Ok(t)
 }
 
+/// Split an approval entry `NAME@identity` (identity defaults to "default").
+pub fn split_identity(entry: &str) -> (&str, &str) {
+    match entry.split_once('@') {
+        Some((n, i)) if !i.is_empty() => (n, i),
+        _ => (entry, "default"),
+    }
+}
+
 /// Create or merge into the open approval task for this project.
-/// `names` may include "*" meaning "this project is outside trust roots".
+/// `names` are `NAME@identity` entries and may include "*" meaning "this project is
+/// outside trust roots".
 pub fn create_approval_task(ctx: &Ctx, project: &Path, agent: &str, names: &[String]) -> Result<Task> {
     let pid = project.to_string_lossy().to_string();
     if let Some(mut t) = ctx.db.open_approval_task(&pid)? {
@@ -92,6 +101,7 @@ pub fn create_approval_task(ctx: &Ctx, project: &Path, agent: &str, names: &[Str
     }
     let outside = names.iter().any(|n| n == "*");
     let concrete: Vec<&String> = names.iter().filter(|n| n.as_str() != "*").collect();
+    let _ = &concrete;
     let title = if outside {
         format!("Allow {} to use {} key(s)?", crate::project::short(project), concrete.len())
     } else {
@@ -278,18 +288,20 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, allow: bool) -> Result<AnswerResu
     }
     let project = Path::new(&pid);
     let mut injected = vec![];
-    for n in &task.names {
-        ctx.db.approve(&pid, n)?;
-        if n == "*" {
+    for entry in &task.names {
+        if entry == "*" {
+            ctx.db.approve(&pid, "*")?;
             continue;
         }
-        let identity = ctx.db.binding(&pid, n)?.unwrap_or_else(|| "default".into());
-        if let Some(v) = ctx.stash.get(&stash_key(n, &identity))? {
+        // Inject exactly the identity that was requested; approval is recorded per name.
+        let (n, identity) = split_identity(entry);
+        ctx.db.approve(&pid, n)?;
+        if let Some(v) = ctx.stash.get(&stash_key(n, identity))? {
             if project.is_dir() {
                 crate::envfile::write(project, &ctx.cfg.env_file, n, &v)?;
-                ctx.db.touch_secret(n, &identity)?;
-                ctx.db.audit(Some(&pid), Some(&task.agent), "inject", Some(n), Some(&identity), Some("after-approval"))?;
-                injected.push(n.clone());
+                ctx.db.touch_secret(n, identity)?;
+                ctx.db.audit(Some(&pid), Some(&task.agent), "inject", Some(n), Some(identity), Some("after-approval"))?;
+                injected.push(n.to_string());
             }
         }
     }

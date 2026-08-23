@@ -25,7 +25,7 @@ pub struct NeedOpts {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Outcome {
     Injected { name: String, identity: String, written_to: String, generated: bool },
-    Pending { name: String, task_id: String, title: String, url: Option<String> },
+    Pending { name: String, identity: String, task_id: String, title: String, url: Option<String> },
     Denied { name: String, task_id: String },
     Expired { name: String, task_id: String },
 }
@@ -92,9 +92,11 @@ pub fn need(ctx: &Ctx, project: &Path, agent: &str, names: &[String], opts: &Nee
                     if reason == GateReason::OutsideTrustRoots {
                         outside = true;
                     }
-                    gated.push(name.clone());
+                    // Carry the identity into the approval so the approver injects the key
+                    // that was actually requested, not the binding/default.
+                    gated.push(format!("{name}@{identity}"));
                     // placeholder; task id filled below
-                    outcomes.push(Outcome::Pending { name: name.clone(), task_id: String::new(), title: String::new(), url: None });
+                    outcomes.push(Outcome::Pending { name: name.clone(), identity: identity.clone(), task_id: String::new(), title: String::new(), url: None });
                 }
             }
             continue;
@@ -118,7 +120,7 @@ pub fn need(ctx: &Ctx, project: &Path, agent: &str, names: &[String], opts: &Nee
             }
         }
         let t = tasks::create_secret_task(ctx, project, agent, name, &identity, &opts.req)?;
-        outcomes.push(Outcome::Pending { name: name.clone(), task_id: t.id, title: t.title, url: t.url });
+        outcomes.push(Outcome::Pending { name: name.clone(), identity: identity.clone(), task_id: t.id, title: t.title, url: t.url });
     }
 
     if !gated.is_empty() {
@@ -128,8 +130,8 @@ pub fn need(ctx: &Ctx, project: &Path, agent: &str, names: &[String], opts: &Nee
         }
         let t = tasks::create_approval_task(ctx, project, agent, &names_for_task)?;
         for o in outcomes.iter_mut() {
-            if let Outcome::Pending { name, task_id, title, .. } = o {
-                if task_id.is_empty() && gated.contains(name) {
+            if let Outcome::Pending { name, identity, task_id, title, .. } = o {
+                if task_id.is_empty() && gated.contains(&format!("{name}@{identity}")) {
                     *task_id = t.id.clone();
                     *title = t.title.clone();
                 }
@@ -149,22 +151,23 @@ fn wait(ctx: &Ctx, project: &Path, outcomes: &mut [Outcome], timeout: Duration) 
     loop {
         let mut any_pending = false;
         for o in outcomes.iter_mut() {
-            if let Outcome::Pending { name, task_id, .. } = o {
+            if let Outcome::Pending { name, identity, task_id, .. } = o {
                 let Some(t) = ctx.db.get_task(task_id)? else { continue };
                 match t.status {
                     TaskStatus::Pending => any_pending = true,
                     TaskStatus::Answered => {
-                        // Answered means stored; do not assume injected. Verify the env file
-                        // has it, and if not, inject from the stash now (the value exists).
+                        // Answered means stored/approved; do not assume injected. Verify the env
+                        // file has it, and if not, inject from the stash now under the identity
+                        // THIS request asked for (an approval task's own identity is irrelevant).
                         let written: PathBuf = project.join(&ctx.cfg.env_file);
                         if !crate::envfile::has(project, &ctx.cfg.env_file, name) {
-                            let v = ctx.stash.get(&stash_key(name, &t.identity))?
-                                .ok_or_else(|| anyhow::anyhow!("task {} is answered but {name}@{} is not in the stash", t.id, t.identity))?;
+                            let v = ctx.stash.get(&stash_key(name, identity))?
+                                .ok_or_else(|| anyhow::anyhow!("task {} is answered but {name}@{identity} is not in the stash", t.id))?;
                             crate::envfile::write(project, &ctx.cfg.env_file, name, &v)
                                 .map_err(|e| anyhow::anyhow!("{name} is stored but could not be written to {}: {e:#}", written.display()))?;
-                            ctx.db.audit(Some(&project.to_string_lossy()), None, "inject", Some(name), Some(&t.identity), Some("after-answer"))?;
+                            ctx.db.audit(Some(&project.to_string_lossy()), None, "inject", Some(name), Some(identity), Some("after-answer"))?;
                         }
-                        *o = Outcome::Injected { name: name.clone(), identity: t.identity.clone(), written_to: written.display().to_string(), generated: false };
+                        *o = Outcome::Injected { name: name.clone(), identity: identity.clone(), written_to: written.display().to_string(), generated: false };
                     }
                     TaskStatus::Denied => *o = Outcome::Denied { name: name.clone(), task_id: task_id.clone() },
                     TaskStatus::Expired => *o = Outcome::Expired { name: name.clone(), task_id: task_id.clone() },
