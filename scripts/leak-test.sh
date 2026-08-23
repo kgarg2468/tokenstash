@@ -10,6 +10,14 @@ OUT="$(mktemp -d)"
 CANARY="sk-LEAKCANARY-$(date +%s)-0123456789abcdef"
 
 "$TS" init --no-agents --trust "$PROJ" >"$OUT/init.txt" 2>&1 || true
+# Own the inbox for this run: a dedicated port, started by us, killed by PID. Never touch
+# whatever real inbox the developer may have running.
+PORT=$(( 20000 + RANDOM % 20000 ))
+sed -i.bak -e "s/^inbox_port = .*/inbox_port = $PORT/" -e "s/^notifications = .*/notifications = false/" "$TOKENSTASH_HOME/config.toml"
+"$TS" inbox --port "$PORT" --keep >"$OUT/inbox.txt" 2>&1 &
+INBOX_PID=$!
+trap 'kill "$INBOX_PID" 2>/dev/null || true' EXIT
+for _ in $(seq 1 30); do curl -fs "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break; sleep 0.1; done
 "$TS" need OPENAI_API_KEY AUTH_SECRET --agent ci --why "leak test" >"$OUT/need1.txt" 2>&1 || true
 TID=$("$TS" tasks --json | python3 -c "import json,sys;print([t for t in json.load(sys.stdin) if t.get('name')=='OPENAI_API_KEY'][0]['id'])")
 echo "$CANARY" | "$TS" answer "$TID" --stdin --skip-check >"$OUT/answer.txt" 2>&1
@@ -36,6 +44,8 @@ if strings "$TOKENSTASH_HOME/tokenstash.db"* | grep -q "$CANARY"; then echo "LEA
 # exit-code contract
 rc=0; "$TS" need OPENAI_API_KEY --agent ci >/dev/null 2>&1 || rc=$?; [ $rc -eq 0 ] || { echo "hit should exit 0 (got $rc)"; fail=1; }
 rc=0; "$TS" need NEVER_SEEN_KEY --agent ci >/dev/null 2>&1 || rc=$?; [ $rc -eq 10 ] || { echo "miss should exit 10 (got $rc)"; fail=1; }
-pkill -f "[t]okenstash inbox" >/dev/null 2>&1 || true
+# inbox page must not contain the value either
+curl -fs "http://127.0.0.1:$PORT/" >"$OUT/inbox-index.html" 2>/dev/null || true
+if grep -q "$CANARY" "$OUT/inbox-index.html"; then echo "LEAK: canary in inbox page"; fail=1; fi
 if [ $fail -eq 0 ]; then echo "leak test passed"; fi
 exit $fail

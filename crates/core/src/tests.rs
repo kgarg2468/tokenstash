@@ -89,6 +89,109 @@ fn redactor_scrubs_values() {
 }
 
 #[test]
+fn redactor_handles_short_values_and_unicode() {
+    // short values are redacted where they stand alone, not inside other words
+    let r = redact::Redactor::new().with(&SecretString::from("ab".to_string()));
+    assert_eq!(r.redact("token ab rejected"), "token [redacted] rejected");
+    assert_eq!(r.redact("(ab)"), "([redacted])");
+    assert_eq!(r.redact("cabbage about"), "cabbage about");
+    assert_eq!(r.redact("ab"), "[redacted]");
+    // multibyte values must not panic in mask()
+    assert_eq!(redact::mask(&SecretString::from("ключ-секрет-значение".to_string())), "клю…ие");
+    let r = redact::Redactor::new().with(&SecretString::from("ключ".to_string()));
+    assert_eq!(r.redact("got ключ back"), "got [redacted] back");
+}
+
+#[test]
+fn envfile_round_trips_adversarial_values() {
+    let dir = tmp("envfile-rt");
+    let cases = [
+        "plain", "with space", "has#hash", "has\"quote", "back\\slash", "dollar$sign", "back`tick",
+        "single'quote", "=leading-eq", "trailing-eq=", " padded ", "uni-ключ", "multi\nline", "",
+    ];
+    for (i, v) in cases.iter().enumerate() {
+        let name = format!("K{i}");
+        envfile::write(&dir, ".env.local", &name, &SecretString::from(v.to_string())).unwrap();
+    }
+    let s = std::fs::read_to_string(dir.join(".env.local")).unwrap();
+    for (i, v) in cases.iter().enumerate() {
+        if v.contains('\n') { continue; } // newlines are not representable in a one-line grammar
+        let line = s.lines().find(|l| l.starts_with(&format!("K{i}="))).unwrap_or_else(|| panic!("missing K{i}"));
+        let (k, parsed) = envfile::parse_line(line).unwrap();
+        assert_eq!(k, format!("K{i}"));
+        assert_eq!(&parsed, v, "round trip failed for {v:?} (line: {line})");
+    }
+    assert!(!s.contains("export "), "we never emit export");
+}
+
+#[test]
+fn find_task_prefix_rules() {
+    let dir = tmp("find-task");
+    let db = Db::open(&dir.join("t.db")).unwrap();
+    let mk = |id: &str| db::Task {
+        id: id.into(), kind: db::TaskKind::Secret, project: "/p".into(), agent: "t".into(), name: Some("X".into()),
+        identity: "default".into(), title: "x".into(), why: None, url: None, steps: vec![], expects: "secret".into(),
+        pattern: None, names: vec![], status: db::TaskStatus::Pending, created: now(), deadline: now(), answered_at: None, note: None,
+    };
+    db.insert_task(&mk("t_abc111")).unwrap();
+    db.insert_task(&mk("t_abc222")).unwrap();
+    db.insert_task(&mk("a_zzz999")).unwrap();
+    assert_eq!(db.find_task("t_abc111").unwrap().unwrap().id, "t_abc111");
+    assert_eq!(db.find_task("abc111").unwrap().unwrap().id, "t_abc111");
+    assert_eq!(db.find_task("zzz").unwrap().unwrap().id, "a_zzz999");
+    assert!(db.find_task("abc").is_err(), "ambiguous prefix must error");
+    assert!(db.find_task("").is_err(), "empty must error");
+    assert!(db.find_task("%").is_err(), "wildcards must error");
+    assert!(db.find_task("nope").unwrap().is_none());
+}
+
+#[test]
+fn trust_roots_are_canonical() {
+    let dir = tmp("trust-canon");
+    let root = dir.join("code"); std::fs::create_dir_all(root.join("proj")).unwrap();
+    let outside = dir.join("outside"); std::fs::create_dir_all(&outside).unwrap();
+    let cfg = Config { trust_roots: vec![root.clone()], ..Default::default() };
+    // inside via a clean path
+    assert!(trust::inside_roots(&root.join("proj"), &cfg));
+    // escapes the root through `..`
+    assert!(!trust::inside_roots(&root.join("proj/../../outside"), &cfg));
+    // symlink inside the root pointing outside
+    #[cfg(unix)]
+    {
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(!trust::inside_roots(&link, &cfg), "symlink escaping the root must not be trusted");
+    }
+    // nonexistent paths are never trusted
+    assert!(!trust::inside_roots(&root.join("does-not-exist"), &cfg));
+}
+
+#[test]
+fn require_approval_gates_even_hits() {
+    let home = tmp("req-approval-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("req-approval-proj").canonicalize().unwrap();
+    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    stash.set(&stash::stash_key("GROQ_API_KEY", "default"), &SecretString::from("gsk_x".to_string())).unwrap();
+    db.upsert_secret(&db::SecretMeta { name: "GROQ_API_KEY".into(), identity: "default".into(), provider: None, sensitive: false, source_url: None, created: now(), last_used: None, stale: false }).unwrap();
+    // normal hit inside a trust root: silent
+    let out = need::need(&ctx, &proj, "t", &["GROQ_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    assert!(matches!(out[0], need::Outcome::Injected { .. }));
+    // same hit from untrusted input: must produce an approval task instead
+    let out = need::need(&ctx, &proj, "run", &["GROQ_API_KEY".to_string()], &need::NeedOpts { require_approval: true, ..Default::default() }).unwrap();
+    let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), other => panic!("expected approval, got {other:?}") };
+    assert!(tid.starts_with("a_"));
+    // after approval it is silent again, even with require_approval
+    tasks::answer_approval(&ctx, &db.get_task(&tid).unwrap().unwrap(), true).unwrap();
+    let out = need::need(&ctx, &proj, "run", &["GROQ_API_KEY".to_string()], &need::NeedOpts { require_approval: true, ..Default::default() }).unwrap();
+    assert!(matches!(out[0], need::Outcome::Injected { .. }));
+}
+
+#[test]
 fn need_end_to_end_with_file_stash() {
     let home = tmp("need-home");
     std::env::set_var("TOKENSTASH_HOME", &home);
