@@ -90,7 +90,7 @@ fn handle(app: &App, mut req: Request) -> Result<()> {
                         let v = form.get("value").cloned().unwrap_or_default();
                         let v = v.trim().to_string();
                         if v.is_empty() { anyhow::bail!("empty value"); }
-                        let skip = form.get("skip_check").is_some();
+                        let skip = form.contains_key("skip_check");
                         match tasks::answer_secret(&ctx, &task, SecretString::from(v), skip)? {
                             AnswerResult::Stored { injected_to, .. } => Ok(format!("Stored {} and wrote it to {}", task.name.clone().unwrap_or_default(), injected_to.map(|p| p.display().to_string()).unwrap_or_else(|| "the stash".into()))),
                             _ => Ok("stored".into()),

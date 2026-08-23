@@ -3,6 +3,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// (ts, project, agent, action, name, identity, detail) — never a value.
+pub type AuditRow = (String, Option<String>, Option<String>, String, Option<String>, Option<String>, Option<String>);
+
 pub struct Db {
     pub conn: Connection,
 }
@@ -390,7 +393,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn recent_audit(&self, limit: usize) -> Result<Vec<(String, Option<String>, Option<String>, String, Option<String>, Option<String>, Option<String>)>> {
+    pub fn recent_audit(&self, limit: usize) -> Result<Vec<AuditRow>> {
         let mut st = self.conn.prepare(
             "SELECT ts, project, agent, action, name, identity, detail FROM audit ORDER BY id DESC LIMIT ?1",
         )?;
