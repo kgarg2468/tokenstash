@@ -125,11 +125,14 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
             // One env file holds one value per name: the same name under two identities in
             // one request is a contradiction, not something to resolve silently.
             {
-                let mut seen: std::collections::HashMap<&str, Option<&str>> = std::collections::HashMap::new();
+                // Resolve each spec's identity the way need() will (explicit → project
+                // binding → "default") so equivalent spellings compare equal.
+                let pid = project.to_string_lossy().to_string();
+                let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
                 for s in &specs {
-                    let id = s.identity.as_deref();
-                    if let Some(prev) = seen.insert(s.name.as_str(), id) {
-                        if prev != id { anyhow::bail!("{} requested under two identities ({:?} and {:?}); a project env file can hold only one", s.name, prev.unwrap_or("default"), id.unwrap_or("default")); }
+                    let id = match &s.identity { Some(i) => i.clone(), None => app.db.binding(&pid, &s.name)?.unwrap_or_else(|| "default".into()) };
+                    if let Some(prev) = seen.insert(s.name.clone(), id.clone()) {
+                        if prev != id { anyhow::bail!("{} requested under two identities ({prev} and {id}); a project env file can hold only one", s.name); }
                     }
                 }
             }
