@@ -4,7 +4,7 @@
   "description": "Your agent asks you for a key once. Never again — in any project, in any agent.",
   "bin": { "tokenstash": "bin/tokenstash.js" },
   "scripts": { "postinstall": "node bin/install.js" },
-  "files": ["bin"],
+  "files": ["bin", "checksums.json"],
   "license": "MIT",
   "repository": "github:kgarg2468/tokenstash",
   "homepage": "https://tokenstash.sh",
