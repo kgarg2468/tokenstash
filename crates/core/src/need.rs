@@ -19,6 +19,10 @@ pub struct NeedOpts {
     pub timeout: Duration,
     /// Ask again even if the user recently denied this key for this project.
     pub force: bool,
+    /// Never inject silently: route every hit through a fresh approval task, even if this
+    /// project was approved before. Used when the request was derived from untrusted input
+    /// (a program's output in `run`) — each invocation needs its own human yes.
+    pub require_approval: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -81,7 +85,12 @@ pub fn need(ctx: &Ctx, project: &Path, agent: &str, names: &[String], opts: &Nee
         if let Some(value) = hit {
             let meta = ctx.db.get_secret(name, &identity)?;
             let sensitive = meta.as_ref().map(|m| m.sensitive).unwrap_or_else(|| provider.map(|p| p.sensitive).unwrap_or(false));
-            match trust::gate(ctx.db, ctx.cfg, project, name, sensitive)? {
+            let gate = if opts.require_approval {
+                Gate::NeedsApproval { reason: GateReason::Sensitive }
+            } else {
+                trust::gate(ctx.db, ctx.cfg, project, name, sensitive)?
+            };
+            match gate {
                 Gate::Open => {
                     let p = crate::envfile::write(project, &ctx.cfg.env_file, name, &value)?;
                     ctx.db.touch_secret(name, &identity)?;
@@ -128,7 +137,8 @@ pub fn need(ctx: &Ctx, project: &Path, agent: &str, names: &[String], opts: &Nee
         if outside {
             names_for_task.push("*".into());
         }
-        let t = tasks::create_approval_task(ctx, project, agent, &names_for_task)?;
+        // Program-derived requests never merge with another invocation's pending approval.
+        let t = tasks::create_approval_task_opts(ctx, project, agent, &names_for_task, !opts.require_approval)?;
         for o in outcomes.iter_mut() {
             if let Outcome::Pending { name, identity, task_id, title, .. } = o {
                 if task_id.is_empty() && gated.contains(&format!("{name}@{identity}")) {
