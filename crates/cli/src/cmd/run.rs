@@ -32,7 +32,11 @@ pub fn run(a: RunArgs) -> Result<i32> {
     let mut attempts = 0;
     loop {
         let extra = load_env(&env_path);
-        let (code, output) = spawn(&a.command, &extra)?;
+        // Scrub values we injected out of the child's output before it is teed or captured.
+        // (Honest scope: a child that deliberately prints a value we didn't inject, or a
+        // transformed version of one, is outside what a shim can catch.)
+        let secrets: Vec<String> = extra.values().filter(|v| v.len() >= 4).cloned().collect();
+        let (code, output) = spawn(&a.command, &extra, &secrets)?;
         if code == 0 || attempts >= a.retries {
             return Ok(code);
         }
@@ -71,24 +75,32 @@ fn load_env(path: &std::path::Path) -> HashMap<String, String> {
     m
 }
 
-/// Run, teeing output to the terminal and capturing it for diagnosis.
-fn spawn(cmd: &[String], extra: &HashMap<String, String>) -> Result<(i32, String)> {
+/// Run, teeing redacted output to the terminal and capturing it for diagnosis.
+fn spawn(cmd: &[String], extra: &HashMap<String, String>, secrets: &[String]) -> Result<(i32, String)> {
     let mut c = Command::new(&cmd[0]);
     c.args(&cmd[1..]).envs(extra).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = c.spawn()?;
     let out = child.stdout.take().unwrap();
     let err = child.stderr.take().unwrap();
-    let t1 = std::thread::spawn(move || tee(out, false));
-    let t2 = std::thread::spawn(move || tee(err, true));
+    let s1 = secrets.to_vec();
+    let s2 = secrets.to_vec();
+    let t1 = std::thread::spawn(move || tee(out, false, &s1));
+    let t2 = std::thread::spawn(move || tee(err, true, &s2));
     let status = child.wait()?;
     let mut captured = t1.join().unwrap_or_default();
     captured.push_str(&t2.join().unwrap_or_default());
     Ok((status.code().unwrap_or(1), captured))
 }
 
-fn tee<R: std::io::Read>(r: R, is_err: bool) -> String {
+fn tee<R: std::io::Read>(r: R, is_err: bool, secrets: &[String]) -> String {
     let mut buf = String::new();
     for line in BufReader::new(r).lines().map_while(Result::ok) {
+        let mut line = line;
+        for s in secrets {
+            if line.contains(s.as_str()) {
+                line = line.replace(s.as_str(), "[redacted]");
+            }
+        }
         if is_err { let _ = writeln!(std::io::stderr(), "{line}"); } else { let _ = writeln!(std::io::stdout(), "{line}"); }
         buf.push_str(&line);
         buf.push('\n');

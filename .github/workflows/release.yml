@@ -24,8 +24,16 @@ jobs:
           mkdir -p dist
           cp target/${{ matrix.target }}/release/tokenstash dist/
           tar -C dist -czf tokenstash-${{ matrix.name }}.tar.gz tokenstash
+          if command -v sha256sum >/dev/null; then
+            sha256sum tokenstash-${{ matrix.name }}.tar.gz > tokenstash-${{ matrix.name }}.tar.gz.sha256
+          else
+            shasum -a 256 tokenstash-${{ matrix.name }}.tar.gz > tokenstash-${{ matrix.name }}.tar.gz.sha256
+          fi
       - uses: softprops/action-gh-release@v2
-        with: { files: "tokenstash-${{ matrix.name }}.tar.gz" }
+        with:
+          files: |
+            tokenstash-${{ matrix.name }}.tar.gz
+            tokenstash-${{ matrix.name }}.tar.gz.sha256
   npm:
     needs: build
     runs-on: ubuntu-latest
