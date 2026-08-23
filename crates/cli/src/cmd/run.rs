@@ -52,7 +52,10 @@ pub fn run(a: RunArgs) -> Result<i32> {
         }
         attempts += 1;
         eprintln!("\ntokenstash: command failed and mentioned {} — asking you to approve it", missing.join(", "));
-        let why = format!("`{}` exited {code} and its output named this variable", a.command.join(" "));
+        // argv[0] only: arguments may carry secrets (curl -H "Authorization: ...") and `why`
+        // is persisted and shown in task views.
+        let program = std::path::Path::new(&a.command[0]).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| a.command[0].clone());
+        let why = format!("`{program}` exited {code} and its output named this variable");
         let opts = NeedOpts {
             req: SecretRequest { why: Some(why), ..Default::default() },
             blocking: false,
@@ -60,16 +63,13 @@ pub fn run(a: RunArgs) -> Result<i32> {
             require_approval: true, // program output must not authorize injection on its own
             ..Default::default()
         };
-        let outcomes = need::need(&app.ctx(), &project, &agent, &missing, &opts)?;
+        let mut outcomes = need::need(&app.ctx(), &project, &agent, &missing, &opts)?;
         if outcomes.iter().any(|o| o.is_pending()) {
             notify_pending(&app, &project, &agent, &outcomes);
             eprintln!("tokenstash: waiting for you → {}", util::inbox_url(&app.cfg, None));
+            // wait on the approval task just filed; calling need again would file another
+            need::wait(&app.ctx(), &project, &mut outcomes, opts.timeout)?;
         }
-        let outcomes = if outcomes.iter().any(|o| o.is_pending()) {
-            need::need(&app.ctx(), &project, &agent, &missing, &NeedOpts { blocking: true, ..opts })?
-        } else {
-            outcomes
-        };
         if let Some(o) = outcomes.iter().find(|o| !matches!(o, need::Outcome::Injected { .. })) {
             bail!("{} was not provided ({}); not restarting", o.name(), match o {
                 need::Outcome::Denied { .. } => "denied",
@@ -87,8 +87,14 @@ fn load_env(path: &std::path::Path) -> HashMap<String, String> {
 }
 
 /// Run, teeing output to the terminal and capturing it for diagnosis. Every line passes
-/// through a redactor seeded with the values we injected: a child that echoes its own
-/// environment must not put a secret on an agent-visible stream.
+/// through a redactor seeded with the values we injected and with inherited secret-looking
+/// env values: a child that echoes its environment or prints a stack trace must not put a
+/// secret on an agent-visible stream.
+///
+/// Limitation, on purpose: this is line-level and defends against accidental echo only. The
+/// child holds the value by design, so a hostile child can always encode or fragment it.
+/// The defense against a hostile child is upstream — program-derived requests always need
+/// a fresh human approval, so it cannot obtain a credential it was not granted.
 fn spawn(cmd: &[String], extra: &HashMap<String, String>) -> Result<(i32, String)> {
     let mut redactor = Redactor::new();
     for v in extra.values() {
