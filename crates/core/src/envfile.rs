@@ -199,15 +199,76 @@ pub fn git_root(start: &Path) -> Option<PathBuf> {
     }
 }
 
-/// If inside a git repo, make sure `.gitignore` at the root ignores the env file.
-/// `.gitignore` is repo-controlled; a symlink there is refused rather than written through.
+/// If inside a git repo, make sure the env file is ignored. We add a rule to the root
+/// `.gitignore` if our own evaluation says it is not covered, then ask git itself
+/// (`git check-ignore`) for the effective answer — a nested `.gitignore` closer to the
+/// project can re-include the file. If git says it is still not ignored, a rule is added to
+/// the project's own `.gitignore` (closest wins) and re-verified; if that still fails, the
+/// caller must not write the secret. Symlinked ignore files are refused.
 pub fn ensure_gitignore(project: &Path, env_file: &str) -> Result<bool> {
     let Some(root) = git_root(project) else { return Ok(false) };
-    let gi = root.join(".gitignore");
-    if fs::symlink_metadata(&gi).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+    let mut changed = add_rule_if_uncovered(&root.join(".gitignore"), env_file)?;
+    let target = project.join(env_file);
+    match git_check_ignore(&root, &target) {
+        Some(true) | None => Ok(changed),
+        Some(false) => {
+            // a closer .gitignore re-includes it; the project's own file is closest
+            let local = project.join(".gitignore");
+            if local != root.join(".gitignore") {
+                changed |= add_rule_if_uncovered(&local, env_file)?;
+                if !gitignore_covers(&fs::read_to_string(&local).unwrap_or_default(), env_file) {
+                    // covered-by-our-evaluation but still re-included means a later negation
+                    // in this same file; append an explicit trailing rule regardless.
+                    append_rule(&local, env_file)?;
+                    changed = true;
+                }
+            }
+            match git_check_ignore(&root, &target) {
+                Some(false) => anyhow::bail!("git still does not ignore {} after updating .gitignore (a nested rule re-includes it); refusing to write a secret there", target.display()),
+                _ => Ok(changed),
+            }
+        }
+    }
+}
+
+/// Ask git for the effective ignore decision. None if git cannot be run.
+pub fn git_check_ignore(root: &Path, path: &Path) -> Option<bool> {
+    let rel = path.strip_prefix(root).ok()?;
+    let st = std::process::Command::new("git")
+        .arg("-C").arg(root)
+        .args(["check-ignore", "-q", "--no-index", "--"])
+        .arg(rel)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+    match st.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
+}
+
+fn append_rule(gi: &Path, env_file: &str) -> Result<()> {
+    if fs::symlink_metadata(gi).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+        anyhow::bail!("{} is a symlink; refusing to modify it", gi.display());
+    }
+    let mut s = fs::read_to_string(gi).unwrap_or_default();
+    if !s.is_empty() && !s.ends_with('\n') {
+        s.push('\n');
+    }
+    s.push_str("# added by tokenstash — never commit injected secrets\n");
+    s.push_str(env_file);
+    s.push('\n');
+    crate::fsutil::write_atomic(gi, &s)
+}
+
+/// Add a rule to one ignore file if our evaluation says the name is not covered.
+fn add_rule_if_uncovered(gi: &Path, env_file: &str) -> Result<bool> {
+    if fs::symlink_metadata(gi).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
         anyhow::bail!("{} is a symlink; refusing to modify it (and cannot guarantee {env_file} stays uncommitted)", gi.display());
     }
-    let existing = if gi.exists() { fs::read_to_string(&gi)? } else { String::new() };
+    let existing = if gi.exists() { fs::read_to_string(gi)? } else { String::new() };
     if gitignore_covers(&existing, env_file) {
         return Ok(false);
     }
@@ -218,6 +279,6 @@ pub fn ensure_gitignore(project: &Path, env_file: &str) -> Result<bool> {
     s.push_str("# added by tokenstash — never commit injected secrets\n");
     s.push_str(env_file);
     s.push('\n');
-    crate::fsutil::write_atomic(&gi, &s)?;
+    crate::fsutil::write_atomic(gi, &s)?;
     Ok(true)
 }
