@@ -45,31 +45,24 @@ pub fn write_atomic_private(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
-/// Cross-process mutual exclusion for read-modify-write of a private file. A sibling
-/// `<name>.lock` is created with O_EXCL; contenders retry for up to ~5s. A lock older than
-/// 30s is treated as abandoned (crashed holder) and reclaimed.
+/// Cross-process mutual exclusion for read-modify-write of a private file, via an OS
+/// advisory lock on a sibling `<name>.lock`. The kernel releases it when the holder exits
+/// or dies, so there is no stale-lock heuristic and a live (even suspended) holder is
+/// never preempted — contenders simply wait.
 pub fn with_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
-    let lock = path.with_extension("lock");
-    let start = std::time::Instant::now();
-    loop {
-        match fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
-            Ok(_) => break,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = fs::metadata(&lock).and_then(|m| m.modified()).map(|t| t.elapsed().map(|d| d.as_secs() > 30).unwrap_or(false)).unwrap_or(true);
-                if stale {
-                    let _ = fs::remove_file(&lock);
-                    continue;
-                }
-                if start.elapsed().as_secs() > 5 {
-                    bail!("{} is locked by another tokenstash process", path.display());
-                }
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-            Err(e) => return Err(e).with_context(|| format!("creating lock {}", lock.display())),
-        }
+    let lock_path = path.with_extension("lock");
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
-    let _guard = RemoveOnDrop(lock);
-    f()
+    let lock = opts.open(&lock_path).with_context(|| format!("opening lock {}", lock_path.display()))?;
+    lock.lock().with_context(|| format!("locking {}", lock_path.display()))?;
+    let out = f();
+    let _ = lock.unlock();
+    out
 }
 
 struct RemoveOnDrop(std::path::PathBuf);
