@@ -81,7 +81,9 @@ pub fn init(a: InitArgs) -> Result<i32> {
             let mut s = fs::read_to_string(&cfg_path).unwrap_or_default();
             if !s.contains("[mcp_servers.tokenstash]") {
                 if !s.is_empty() && !s.ends_with('\n') { s.push('\n'); }
-                s.push_str(&format!("\n[mcp_servers.tokenstash]\ncommand = \"{exe_s}\"\nargs = [\"mcp\"]\n"));
+                // toml::Value renders a correctly escaped string (backslashes, quotes, unicode)
+                let cmd = toml::Value::String(exe_s.clone()).to_string();
+                s.push_str(&format!("\n[mcp_servers.tokenstash]\ncommand = {cmd}\nargs = [\"mcp\"]\n"));
                 fs::write(&cfg_path, s)?;
             }
             append_snippet(&codex.join("AGENTS.md"))?;
@@ -91,29 +93,19 @@ pub fn init(a: InitArgs) -> Result<i32> {
         // Cursor
         let cursor = home.join(".cursor");
         if cursor.is_dir() {
-            let p = cursor.join("mcp.json");
-            let mut v: serde_json::Value = fs::read_to_string(&p).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(serde_json::json!({}));
-            if !v.is_object() { v = serde_json::json!({}); }
-            let servers = v.as_object_mut().unwrap().entry("mcpServers").or_insert(serde_json::json!({}));
-            if let Some(m) = servers.as_object_mut() {
-                m.insert("tokenstash".into(), serde_json::json!({ "command": exe_s, "args": ["mcp"] }));
+            match merge_mcp_json(&cursor.join("mcp.json"), &exe_s) {
+                Ok(()) => println!("✓ Cursor: MCP server registered (~/.cursor/mcp.json)"),
+                Err(e) => println!("! Cursor: left ~/.cursor/mcp.json untouched — {e}"),
             }
-            fs::write(&p, serde_json::to_string_pretty(&v)?)?;
-            println!("✓ Cursor: MCP server registered (~/.cursor/mcp.json)");
         }
 
         // Gemini CLI
         let gemini = home.join(".gemini");
         if gemini.is_dir() {
-            let p = gemini.join("settings.json");
-            let mut v: serde_json::Value = fs::read_to_string(&p).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(serde_json::json!({}));
-            if !v.is_object() { v = serde_json::json!({}); }
-            let servers = v.as_object_mut().unwrap().entry("mcpServers").or_insert(serde_json::json!({}));
-            if let Some(m) = servers.as_object_mut() {
-                m.insert("tokenstash".into(), serde_json::json!({ "command": exe_s, "args": ["mcp"] }));
+            match merge_mcp_json(&gemini.join("settings.json"), &exe_s) {
+                Ok(()) => println!("✓ Gemini CLI: MCP server registered"),
+                Err(e) => println!("! Gemini CLI: left ~/.gemini/settings.json untouched — {e}"),
             }
-            fs::write(&p, serde_json::to_string_pretty(&v)?)?;
-            println!("✓ Gemini CLI: MCP server registered");
         }
     }
 
@@ -127,6 +119,24 @@ pub fn init(a: InitArgs) -> Result<i32> {
         println!("\nNext: from any project, run   tokenstash need OPENAI_API_KEY");
     }
     Ok(0)
+}
+
+/// Add `mcpServers.tokenstash` to a JSON config owned by another tool. If the file exists
+/// but cannot be parsed as a JSON object, refuse rather than replace it.
+fn merge_mcp_json(p: &Path, exe: &str) -> Result<()> {
+    let mut v: serde_json::Value = match fs::read_to_string(p) {
+        Ok(s) if s.trim().is_empty() => serde_json::json!({}),
+        Ok(s) => serde_json::from_str(&s).map_err(|e| anyhow::anyhow!("{} is not valid JSON ({e}); fix it or add the MCP server by hand", p.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e.into()),
+    };
+    let root = v.as_object_mut().ok_or_else(|| anyhow::anyhow!("{} root is not a JSON object", p.display()))?;
+    let servers = root.entry("mcpServers").or_insert(serde_json::json!({}));
+    let m = servers.as_object_mut().ok_or_else(|| anyhow::anyhow!("{} has a non-object mcpServers", p.display()))?;
+    m.insert("tokenstash".into(), serde_json::json!({ "command": exe, "args": ["mcp"] }));
+    if let Some(parent) = p.parent() { fs::create_dir_all(parent)?; }
+    fs::write(p, serde_json::to_string_pretty(&v)?)?;
+    Ok(())
 }
 
 const SNIPPET_MARK: &str = "<!-- tokenstash -->";
