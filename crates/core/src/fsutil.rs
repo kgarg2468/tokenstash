@@ -45,6 +45,33 @@ pub fn write_atomic_private(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+/// Cross-process mutual exclusion for read-modify-write of a private file. A sibling
+/// `<name>.lock` is created with O_EXCL; contenders retry for up to ~5s. A lock older than
+/// 30s is treated as abandoned (crashed holder) and reclaimed.
+pub fn with_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let lock = path.with_extension("lock");
+    let start = std::time::Instant::now();
+    loop {
+        match fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = fs::metadata(&lock).and_then(|m| m.modified()).map(|t| t.elapsed().map(|d| d.as_secs() > 30).unwrap_or(false)).unwrap_or(true);
+                if stale {
+                    let _ = fs::remove_file(&lock);
+                    continue;
+                }
+                if start.elapsed().as_secs() > 5 {
+                    bail!("{} is locked by another tokenstash process", path.display());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(e) => return Err(e).with_context(|| format!("creating lock {}", lock.display())),
+        }
+    }
+    let _guard = RemoveOnDrop(lock);
+    f()
+}
+
 struct RemoveOnDrop(std::path::PathBuf);
 impl Drop for RemoveOnDrop {
     fn drop(&mut self) {
