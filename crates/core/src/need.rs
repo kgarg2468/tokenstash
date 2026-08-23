@@ -5,7 +5,7 @@ use crate::stash::stash_key;
 use crate::tasks::{self, Ctx, SecretRequest};
 use crate::trust::{self, Gate, GateReason};
 use crate::registry;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use secrecy::SecretString;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -61,6 +61,9 @@ fn generate(spec: &str) -> Option<SecretString> {
 
 pub fn need(ctx: &Ctx, project: &Path, agent: &str, names: &[String], opts: &NeedOpts) -> Result<Vec<Outcome>> {
     ctx.db.expire_overdue()?;
+    // Approvals, bindings, and tasks are keyed by the resolved path, so a symlink that is
+    // later retargeted cannot inherit another project's approval.
+    let project = &project.canonicalize().with_context(|| format!("project directory {} does not exist", project.display()))?;
     let pid = project.to_string_lossy().to_string();
     let mut outcomes: Vec<Outcome> = Vec::with_capacity(names.len());
     let mut gated: Vec<String> = vec![];
