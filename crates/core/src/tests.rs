@@ -501,8 +501,9 @@ fn approval_injects_the_requested_identity() {
     let env = std::fs::read_to_string(proj.join(".env.local")).unwrap();
     assert!(env.contains("OPENAI_API_KEY=sk-workworkwork1"), "must inject the work identity, got: {env}");
     assert!(!env.contains("sk-defaultdefault"));
-    // the blocking waiter reports the requested identity too
-    std::fs::remove_file(proj.join(".env.local")).unwrap();
+    // the waiter injects the requested identity even when the file already holds another
+    // identity's value under the same name
+    std::fs::write(proj.join(".env.local"), "OPENAI_API_KEY=sk-defaultdefault\n").unwrap();
     let out = need::need(&ctx, &proj, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts { identity: Some("work".into()), blocking: true, timeout: std::time::Duration::from_millis(200), ..Default::default() }).unwrap();
     assert!(matches!(&out[0], need::Outcome::Injected { identity, .. } if identity == "work"), "{:?}", out[0]);
     assert!(std::fs::read_to_string(proj.join(".env.local")).unwrap().contains("sk-workworkwork1"));
@@ -518,6 +519,8 @@ fn gitignore_last_match_wins() {
     assert!(g(".env*\n!.env.example\n", ".env.local"), "negation of a different name is irrelevant");
     assert!(!g(".env*\n!.env.*\n", ".env.local"), "negated glob un-ignores");
     assert!(g("secrets/\n.env.local\n", ".env.local"), "directory rules are skipped, not treated as negation");
+    assert!(!g(" .env.local\n", ".env.local"), "leading whitespace is part of a git pattern");
+    assert!(g(".env.local   \n", ".env.local"), "trailing whitespace is ignored by git");
     // end to end: a negated file gets an explicit trailing rule, which wins
     let dir = tmp("gi-neg");
     std::fs::create_dir_all(dir.join(".git")).unwrap();
@@ -591,4 +594,36 @@ fn program_derived_approvals_do_not_merge() {
     assert_eq!(db.get_task(&tb).unwrap().unwrap().status, db::TaskStatus::Pending);
     let c = need::need(&ctx, &proj, "t", &["A_KEY".to_string()], &need::NeedOpts::default()).unwrap();
     assert!(matches!(c[0], need::Outcome::Injected { .. }));
+}
+
+#[test]
+fn wait_does_not_file_duplicate_program_approvals() {
+    let _env = env_lock();
+    let home = tmp("wait-dup-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("wait-dup-proj").canonicalize().unwrap();
+    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    stash.set("A_KEY@default", &SecretString::from("aaaaaaaaaa".to_string())).unwrap();
+    let ra = need::NeedOpts { require_approval: true, ..Default::default() };
+    let mut out = need::need(&ctx, &proj, "run", &["A_KEY".to_string()], &ra).unwrap();
+    let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
+    // approve from "another thread" shortly after the wait begins
+    let db2 = Db::open(&home.join("t.db")).unwrap();
+    let cfg2 = cfg.clone(); let tid2 = tid.clone(); let proj2 = proj.clone();
+    let h = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let st = stash::open(&cfg2).unwrap();
+        let c = tasks::Ctx { cfg: &cfg2, db: &db2, stash: st.as_ref() };
+        tasks::answer_approval(&c, &db2.get_task(&tid2).unwrap().unwrap(), true).unwrap();
+        let _ = proj2;
+    });
+    need::wait(&ctx, &proj, &mut out, std::time::Duration::from_secs(5)).unwrap();
+    h.join().unwrap();
+    assert!(matches!(out[0], need::Outcome::Injected { .. }), "{:?}", out[0]);
+    let open: Vec<_> = db.list_tasks(Some(&proj.to_string_lossy()), true).unwrap();
+    assert!(open.is_empty(), "waiting must not file a second approval task: {open:?}");
 }
