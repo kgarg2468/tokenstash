@@ -61,7 +61,7 @@ pub fn list(a: ListArgs) -> Result<i32> {
         println!("stash is empty. Run `tokenstash need SOME_KEY` from a project to start.");
         return Ok(0);
     }
-    println!("{:<36} {:<10} {:<18} {:<10} {}", "NAME", "IDENTITY", "PROVIDER", "FLAGS", "LAST USED");
+    println!("{:<36} {:<10} {:<18} {:<10} LAST USED", "NAME", "IDENTITY", "PROVIDER", "FLAGS");
     for s in &secrets {
         let mut flags = vec![];
         if s.sensitive { flags.push("sensitive"); }

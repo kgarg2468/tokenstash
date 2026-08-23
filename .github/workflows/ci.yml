@@ -19,4 +19,3 @@ jobs:
       - name: black-box leak test
         run: scripts/leak-test.sh target/debug/tokenstash
       - run: cargo clippy --all-targets -- -D warnings
-        continue-on-error: true

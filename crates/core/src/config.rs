@@ -63,7 +63,7 @@ impl Config {
             return Ok(Self::default());
         }
         let s = fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
-        Ok(toml::from_str(&s).with_context(|| format!("parsing {}", p.display()))?)
+        toml::from_str(&s).with_context(|| format!("parsing {}", p.display()))
     }
 
     pub fn save(&self) -> Result<()> {

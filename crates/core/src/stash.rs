@@ -1,12 +1,13 @@
 //! Stash adapter: where secret values live. Metadata lives in the DB; values live here.
 //!
 //! Backends:
-//!   - `keyring`        OS store via the `keyring` crate (macOS Keychain / Windows Credential
-//!                      Manager / Linux Secret Service). Default.
-//!   - `keyutils`       Linux kernel keyring (no daemon needed; survives logout, not reboot).
-//!                      Auto-selected on Linux when Secret Service is unavailable.
-//!   - `insecure-file`  0600 JSON file. ONLY for CI/tests. Requires explicit opt-in via
-//!                      `TOKENSTASH_STASH=insecure-file` or config. Prints a warning.
+//!
+//! - `keyring`: OS store via the `keyring` crate (macOS Keychain, Windows Credential Manager,
+//!   Linux Secret Service). Default.
+//! - `keyutils`: Linux kernel keyring (no daemon needed; survives logout, not reboot).
+//!   Auto-selected on Linux when Secret Service is unavailable.
+//! - `insecure-file`: 0600 JSON file. ONLY for CI/tests. Requires explicit opt-in via
+//!   `TOKENSTASH_STASH=insecure-file` or config. Prints a warning.
 
 use anyhow::{anyhow, Context, Result};
 use secrecy::{ExposeSecret, SecretString};
