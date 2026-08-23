@@ -172,7 +172,7 @@ fn page_index(list: &[Task], flash: Option<&str>) -> String {
     for t in list {
         let what = match t.kind {
             TaskKind::Secret => format!("<code>{}</code>", esc(&t.name.clone().unwrap_or_default())),
-            TaskKind::Approval => format!("approve {}", esc(&t.names.iter().filter(|n| n.as_str() != "*").cloned().collect::<Vec<_>>().join(", "))),
+            TaskKind::Approval => format!("approve {}", esc(&crate::util::approval_names(&t.names).join(", "))),
             TaskKind::Human => esc(&t.title),
         };
         b.push_str(&format!(
@@ -211,7 +211,7 @@ fn page_task(t: &Task, err: Option<&str>) -> String {
         }
         TaskKind::Approval => {
             b.push_str(&format!("<p>Keys: <code>{}</code></p><form method=post><div class=row><button class=p name=action value=allow>Allow for this project</button><button class=bad name=action value=deny>Deny</button></div></form>",
-                esc(&t.names.iter().filter(|n| n.as_str() != "*").cloned().collect::<Vec<_>>().join("</code>, <code>"))));
+                crate::util::approval_names(&t.names).iter().map(|n| esc(n)).collect::<Vec<_>>().join("</code>, <code>")));
         }
         TaskKind::Human => {
             let note = if t.expects == "text" {
