@@ -1994,6 +1994,7 @@ dependencies = [
  "serde_json",
  "tiny_http",
  "tokenstash-core",
+ "toml",
  "urlencoding",
 ]
 

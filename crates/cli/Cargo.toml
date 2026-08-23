@@ -22,5 +22,6 @@ rpassword = "7"
 open = "5"
 urlencoding = "2"
 secrecy.workspace = true
+toml.workspace = true
 dirs.workspace = true
 regex.workspace = true

@@ -1,5 +1,10 @@
 //! `run`: zero-config shim. Load the env file, run the command; if it fails mentioning a known
 //! env var that isn't set, file the task, wait for the human, inject, and restart.
+//!
+//! The program's own output chooses which key gets requested, and that output may be
+//! attacker-influenced. So requests that originate here are never silent: even a stash hit
+//! goes through an approval task ("<program> wants OPENAI_API_KEY — allow?"). The human
+//! authorizes the injection, not the child process.
 
 use crate::cmd::need::notify_pending;
 use crate::util::{self, App};
@@ -10,6 +15,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use tokenstash_core::need::{self, NeedOpts};
+use tokenstash_core::tasks::SecretRequest;
 
 #[derive(Args)]
 pub struct RunArgs {
@@ -41,34 +47,39 @@ pub fn run(a: RunArgs) -> Result<i32> {
             return Ok(code);
         }
         attempts += 1;
-        eprintln!("\ntokenstash: command failed and mentioned {} — asking for it", missing.join(", "));
-        let opts = NeedOpts { blocking: false, timeout: Duration::from_secs(a.timeout), ..Default::default() };
+        eprintln!("\ntokenstash: command failed and mentioned {} — asking you to approve it", missing.join(", "));
+        let why = format!("`{}` exited {code} and its output named this variable", a.command.join(" "));
+        let opts = NeedOpts {
+            req: SecretRequest { why: Some(why), ..Default::default() },
+            blocking: false,
+            timeout: Duration::from_secs(a.timeout),
+            require_approval: true, // program output must not authorize injection on its own
+            ..Default::default()
+        };
         let outcomes = need::need(&app.ctx(), &project, &agent, &missing, &opts)?;
         if outcomes.iter().any(|o| o.is_pending()) {
             notify_pending(&app, &project, &agent, &outcomes);
             eprintln!("tokenstash: waiting for you → {}", util::inbox_url(&app.cfg, None));
-            let blocking = NeedOpts { blocking: true, ..opts };
-            let outcomes = need::need(&app.ctx(), &project, &agent, &missing, &blocking)?;
-            if outcomes.iter().any(|o| !matches!(o, need::Outcome::Injected { .. })) {
-                bail!("not all keys were provided; giving up");
-            }
         }
-        eprintln!("tokenstash: injected, restarting\n");
+        let outcomes = if outcomes.iter().any(|o| o.is_pending()) {
+            need::need(&app.ctx(), &project, &agent, &missing, &NeedOpts { blocking: true, ..opts })?
+        } else {
+            outcomes
+        };
+        if let Some(o) = outcomes.iter().find(|o| !matches!(o, need::Outcome::Injected { .. })) {
+            bail!("{} was not provided ({}); not restarting", o.name(), match o {
+                need::Outcome::Denied { .. } => "denied",
+                need::Outcome::Expired { .. } => "expired",
+                _ => "pending",
+            });
+        }
+        eprintln!("tokenstash: approved and injected, restarting\n");
     }
 }
 
 fn load_env(path: &std::path::Path) -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    let Ok(s) = std::fs::read_to_string(path) else { return m };
-    for line in s.lines() {
-        let line = line.trim().strip_prefix("export ").unwrap_or(line.trim());
-        if line.starts_with('#') || line.is_empty() { continue; }
-        if let Some((k, v)) = line.split_once('=') {
-            let v = v.trim().trim_matches('"').trim_matches('\'').to_string();
-            m.insert(k.trim().to_string(), v);
-        }
-    }
-    m
+    let Ok(s) = std::fs::read_to_string(path) else { return HashMap::new() };
+    s.lines().filter_map(tokenstash_core::envfile::parse_line).collect()
 }
 
 /// Run, teeing output to the terminal and capturing it for diagnosis.
