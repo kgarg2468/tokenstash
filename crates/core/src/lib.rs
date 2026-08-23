@@ -5,10 +5,15 @@
 
 pub mod config;
 pub mod db;
+pub mod envfile;
 pub mod fsutil;
+pub mod need;
+pub mod project;
 pub mod redact;
 pub mod registry;
 pub mod stash;
+pub mod tasks;
+pub mod trust;
 pub mod validate;
 
 
