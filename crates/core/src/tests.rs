@@ -538,3 +538,57 @@ fn secret_is_not_written_when_ignore_protection_fails() {
     assert!(envfile::write(&dir, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).is_err());
     assert!(!dir.join(".env.local").exists(), "secret must not land on disk without confirmed ignore protection");
 }
+
+#[test]
+fn approval_is_final_even_if_injection_fails() {
+    let _env = env_lock();
+    let home = tmp("approval-final-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("approval-final-proj").canonicalize().unwrap();
+    let cfg = Config { trust_roots: vec![], ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    stash.set("A_KEY@default", &SecretString::from("aaaaaaaaaa".to_string())).unwrap();
+    stash.set("B_KEY@default", &SecretString::from("bbbbbbbbbb".to_string())).unwrap();
+    let out = need::need(&ctx, &proj, "t", &["A_KEY".to_string(), "B_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
+    std::os::unix::fs::symlink(proj.join("nowhere"), proj.join(".env.local")).unwrap();
+    let r = tasks::answer_approval(&ctx, &db.get_task(&tid).unwrap().unwrap(), true);
+    assert!(r.is_err(), "injection failure must be surfaced");
+    assert_eq!(db.get_task(&tid).unwrap().unwrap().status, db::TaskStatus::Answered);
+    assert!(db.is_approved(&proj.to_string_lossy(), "A_KEY").unwrap());
+    std::fs::remove_file(proj.join(".env.local")).unwrap();
+    let out = need::need(&ctx, &proj, "t", &["A_KEY".to_string(), "B_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    assert!(out.iter().all(|o| matches!(o, need::Outcome::Injected { .. })), "{out:?}");
+}
+
+#[test]
+fn program_derived_approvals_do_not_merge() {
+    let _env = env_lock();
+    let home = tmp("approval-merge-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("approval-merge-proj").canonicalize().unwrap();
+    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    stash.set("A_KEY@default", &SecretString::from("aaaaaaaaaa".to_string())).unwrap();
+    stash.set("B_KEY@default", &SecretString::from("bbbbbbbbbb".to_string())).unwrap();
+    let ra = need::NeedOpts { require_approval: true, ..Default::default() };
+    let a = need::need(&ctx, &proj, "run", &["A_KEY".to_string()], &ra).unwrap();
+    let b = need::need(&ctx, &proj, "run", &["B_KEY".to_string()], &ra).unwrap();
+    let (ta, tb) = match (&a[0], &b[0]) {
+        (need::Outcome::Pending { task_id: x, .. }, need::Outcome::Pending { task_id: y, .. }) => (x.clone(), y.clone()),
+        o => panic!("{o:?}"),
+    };
+    assert_ne!(ta, tb, "two program-derived requests must not share an approval task");
+    tasks::answer_approval(&ctx, &db.get_task(&ta).unwrap().unwrap(), true).unwrap();
+    assert!(envfile::has(&proj, ".env.local", "A_KEY"));
+    assert!(!envfile::has(&proj, ".env.local", "B_KEY"), "B must wait for its own approval");
+    assert_eq!(db.get_task(&tb).unwrap().unwrap().status, db::TaskStatus::Pending);
+    let c = need::need(&ctx, &proj, "t", &["A_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    assert!(matches!(c[0], need::Outcome::Injected { .. }));
+}
