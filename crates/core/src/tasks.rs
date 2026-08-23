@@ -5,7 +5,7 @@ use crate::db::{Task, TaskKind, TaskStatus};
 use crate::stash::{stash_key, Stash};
 use crate::validate::{self, Liveness};
 use crate::{registry, Config, Db};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use rand::Rng;
 use secrecy::SecretString;
 use std::path::{Path, PathBuf};
@@ -198,11 +198,11 @@ pub fn answer_secret(ctx: &Ctx, task: &Task, value: SecretString, skip_liveness:
             Some(sp) => validate::matches_pattern(sp, &value)?,
             None => false,
         };
-    store_and_inject(ctx, &name, &task.identity, &value, provider.map(|p| p.provider.clone()), task.url.clone(), sensitive, Path::new(&task.project), &task.agent)
-        .map(|injected_to| {
-            let _ = ctx.db.set_task_status(&task.id, TaskStatus::Answered, None);
-            AnswerResult::Stored { injected_to, sensitive, liveness }
-        })
+    let injected_to = store_and_inject(ctx, &name, &task.identity, &value, provider.map(|p| p.provider.clone()), task.url.clone(), sensitive, Path::new(&task.project), &task.agent)?;
+    // If this fails the value is stored but the task stays pending and would be asked again;
+    // surface it instead of reporting success.
+    ctx.db.set_task_status(&task.id, TaskStatus::Answered, None).with_context(|| format!("secret stored and injected, but task {} could not be marked answered", task.id))?;
+    Ok(AnswerResult::Stored { injected_to, sensitive, liveness })
 }
 
 /// Shared by `answer_secret` and auto-generated secrets.

@@ -5,10 +5,16 @@ use crate::{Config, Db};
 use anyhow::Result;
 use std::path::Path;
 
+/// Both sides are canonicalized: a project path containing `..` or a symlink that
+/// resolves outside a root must not be classified as trusted.
 pub fn inside_roots(project: &Path, cfg: &Config) -> bool {
-    cfg.trust_roots.iter().any(|r| {
-        let r = r.canonicalize().unwrap_or_else(|_| r.clone());
-        project.starts_with(&r)
+    let project = match project.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    cfg.trust_roots.iter().any(|r| match r.canonicalize() {
+        Ok(r) => project.starts_with(&r),
+        Err(_) => false,
     })
 }
 

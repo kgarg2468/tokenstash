@@ -1,4 +1,12 @@
 //! Write secrets into a project env file and make sure it can't be committed.
+//!
+//! Grammar we emit (the common subset every dotenv parser agrees on):
+//! - `NAME=value` unquoted when the value is `[A-Za-z0-9_./:@+=-]` only.
+//! - Otherwise `NAME="value"` with `\` and `"` backslash-escaped. `$` is written as-is:
+//!   dotenv expansion is opt-in in most loaders (dotenv-expand, Next.js) and escaping it
+//!   as `\$` is read literally by others (python-dotenv). Secrets containing `$` are rare;
+//!   `run --` injects into the process env and sidesteps the file entirely.
+//! - We never emit single quotes, backticks, or `export`.
 
 use anyhow::{Context, Result};
 use secrecy::{ExposeSecret, SecretString};
@@ -31,14 +39,30 @@ pub fn write(project: &Path, env_file: &str, name: &str, value: &SecretString) -
         out.push_str(&quote(value.expose_secret()));
         out.push('\n');
     }
-    fs::write(&path, out).with_context(|| format!("writing {}", path.display()))?;
+    write_private(&path, &out).with_context(|| format!("writing {}", path.display()))?;
+    ensure_gitignore(project, env_file)?;
+    Ok(path)
+}
+
+/// Create-or-truncate with 0600 from the first byte; tighten an existing file; fail loudly
+/// if permissions cannot be applied rather than leaving a readable secret behind.
+fn write_private(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        f.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-    ensure_gitignore(project, env_file)?;
-    Ok(path)
+    f.write_all(contents.as_bytes())?;
+    Ok(())
 }
 
 /// Does the env file already contain NAME= ?
@@ -50,12 +74,44 @@ pub fn has(project: &Path, env_file: &str, name: &str) -> bool {
 }
 
 fn quote(v: &str) -> String {
-    let needs = v.chars().any(|c| c.is_whitespace() || c == '#' || c == '"' || c == '\'' || c == '$');
-    if needs {
-        format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
-    } else {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "_./:@+=-".contains(c);
+    if !v.is_empty() && v.chars().all(safe) {
         v.to_string()
+    } else {
+        format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
     }
+}
+
+/// Parse a line we (or a human) wrote, for round-trip tests and the `run` shim.
+pub fn parse_line(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    let line = line.strip_prefix("export ").unwrap_or(line);
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let (k, v) = line.split_once('=')?;
+    let v = v.trim();
+    let val = if let Some(inner) = v.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        let mut out = String::new();
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some(o) => out.push(o),
+                    None => out.push('\\'),
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    } else if let Some(inner) = v.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+        inner.to_string()
+    } else {
+        v.split('#').next().unwrap_or("").trim().to_string()
+    };
+    Some((k.trim().to_string(), val))
 }
 
 /// Walk up to find a git repo root.
