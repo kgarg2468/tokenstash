@@ -114,7 +114,9 @@ pub fn parse_line(line: &str) -> Option<(String, String)> {
 pub fn gitignore_covers(contents: &str, file: &str) -> bool {
     let mut ignored = false;
     for raw in contents.lines() {
-        let l = raw.trim();
+        // git ignores TRAILING whitespace (unless escaped) but leading whitespace is part
+        // of the pattern, so " .env.local" does not match ".env.local".
+        let l = raw.trim_end_matches([' ', '\t', '\r']);
         if l.is_empty() || l.starts_with('#') {
             continue;
         }

@@ -155,8 +155,10 @@ pub fn need(ctx: &Ctx, project: &Path, agent: &str, names: &[String], opts: &Nee
     Ok(outcomes)
 }
 
-/// Poll until every pending task resolves or the timeout elapses.
-fn wait(ctx: &Ctx, project: &Path, outcomes: &mut [Outcome], timeout: Duration) -> Result<()> {
+/// Poll until every pending task resolves or the timeout elapses. Callers that already
+/// filed tasks use this instead of calling `need` again, so no duplicate tasks are created.
+pub fn wait(ctx: &Ctx, project: &Path, outcomes: &mut [Outcome], timeout: Duration) -> Result<()> {
+    let project = &project.canonicalize().unwrap_or_else(|_| project.to_path_buf());
     let start = Instant::now();
     loop {
         let mut any_pending = false;
@@ -166,17 +168,17 @@ fn wait(ctx: &Ctx, project: &Path, outcomes: &mut [Outcome], timeout: Duration) 
                 match t.status {
                     TaskStatus::Pending => any_pending = true,
                     TaskStatus::Answered => {
-                        // Answered means stored/approved; do not assume injected. Verify the env
-                        // file has it, and if not, inject from the stash now under the identity
-                        // THIS request asked for (an approval task's own identity is irrelevant).
+                        // Answered means stored/approved; do not assume injected, and do not
+                        // trust a same-named entry already in the file (it may belong to another
+                        // identity). Always inject the identity THIS request asked for; the
+                        // write is an idempotent upsert.
                         let written: PathBuf = project.join(&ctx.cfg.env_file);
-                        if !crate::envfile::has(project, &ctx.cfg.env_file, name) {
-                            let v = ctx.stash.get(&stash_key(name, identity))?
-                                .ok_or_else(|| anyhow::anyhow!("task {} is answered but {name}@{identity} is not in the stash", t.id))?;
-                            crate::envfile::write(project, &ctx.cfg.env_file, name, &v)
-                                .map_err(|e| anyhow::anyhow!("{name} is stored but could not be written to {}: {e:#}", written.display()))?;
-                            ctx.db.audit(Some(&project.to_string_lossy()), None, "inject", Some(name), Some(identity), Some("after-answer"))?;
-                        }
+                        let v = ctx.stash.get(&stash_key(name, identity))?
+                            .ok_or_else(|| anyhow::anyhow!("task {} is answered but {name}@{identity} is not in the stash", t.id))?;
+                        crate::envfile::write(project, &ctx.cfg.env_file, name, &v)
+                            .map_err(|e| anyhow::anyhow!("{name} is stored but could not be written to {}: {e:#}", written.display()))?;
+                        ctx.db.touch_secret(name, identity)?;
+                        ctx.db.audit(Some(&project.to_string_lossy()), None, "inject", Some(name), Some(identity), Some("after-answer"))?;
                         *o = Outcome::Injected { name: name.clone(), identity: identity.clone(), written_to: written.display().to_string(), generated: false };
                     }
                     TaskStatus::Denied => *o = Outcome::Denied { name: name.clone(), task_id: task_id.clone() },
