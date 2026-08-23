@@ -68,5 +68,5 @@ pub fn liveness(check: &Check, value: &SecretString) -> Liveness {
 }
 
 fn redact_err(msg: &str, v: &str) -> String {
-    if v.len() >= 4 { msg.replace(v, "[redacted]") } else { msg.to_string() }
+    crate::redact::Redactor::new().with(&SecretString::from(v.to_string())).redact(msg)
 }
