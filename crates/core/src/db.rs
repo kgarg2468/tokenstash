@@ -335,22 +335,24 @@ impl Db {
         Ok(rows)
     }
 
-    /// Open secret task for this name+project, if any (avoid duplicate tasks).
-    pub fn open_secret_task(&self, project: &str, name: &str) -> Result<Option<Task>> {
+    /// Open secret task for this project+name+identity, if any (avoid duplicate tasks).
+    /// Identity is part of the key: `OPENAI_API_KEY@work` and `@personal` are different
+    /// requests and must never share a task.
+    pub fn open_secret_task(&self, project: &str, name: &str, identity: &str) -> Result<Option<Task>> {
         let sql = format!(
-            "SELECT {} FROM tasks WHERE kind='secret' AND status='pending' AND project=?1 AND name=?2 ORDER BY created DESC",
+            "SELECT {} FROM tasks WHERE kind='secret' AND status='pending' AND project=?1 AND name=?2 AND identity=?3 ORDER BY created DESC",
             Self::TASK_COLS
         );
-        Ok(self.conn.query_row(&sql, params![project, name], Self::row_to_task).optional()?)
+        Ok(self.conn.query_row(&sql, params![project, name, identity], Self::row_to_task).optional()?)
     }
 
-    /// Most recent denied secret task for name+project, if denied after `since` (RFC3339).
-    pub fn recent_denial(&self, project: &str, name: &str, since: &str) -> Result<Option<Task>> {
+    /// Most recent denied secret task for project+name+identity, if denied after `since`.
+    pub fn recent_denial(&self, project: &str, name: &str, identity: &str, since: &str) -> Result<Option<Task>> {
         let sql = format!(
-            "SELECT {} FROM tasks WHERE kind='secret' AND status='denied' AND project=?1 AND name=?2 AND answered_at > ?3 ORDER BY answered_at DESC",
+            "SELECT {} FROM tasks WHERE kind='secret' AND status='denied' AND project=?1 AND name=?2 AND identity=?3 AND answered_at > ?4 ORDER BY answered_at DESC",
             Self::TASK_COLS
         );
-        Ok(self.conn.query_row(&sql, params![project, name, since], Self::row_to_task).optional()?)
+        Ok(self.conn.query_row(&sql, params![project, name, identity, since], Self::row_to_task).optional()?)
     }
 
     pub fn open_approval_task(&self, project: &str) -> Result<Option<Task>> {
