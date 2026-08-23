@@ -15,6 +15,8 @@ pub mod tasks;
 pub mod trust;
 pub mod validate;
 
+#[cfg(test)]
+mod tests;
 
 pub use config::Config;
 pub use db::Db;
