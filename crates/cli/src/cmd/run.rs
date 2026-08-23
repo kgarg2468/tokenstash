@@ -2,9 +2,11 @@
 //! env var that isn't set, file the task, wait for the human, inject, and restart.
 //!
 //! The program's own output chooses which key gets requested, and that output may be
-//! attacker-influenced. So requests that originate here are never silent: even a stash hit
-//! goes through an approval task ("<program> wants OPENAI_API_KEY — allow?"). The human
-//! authorizes the injection, not the child process.
+//! attacker-influenced. So requests that originate here are never silent: every stash hit
+//! goes through an approval task ("<program> wants OPENAI_API_KEY — allow?") on every
+//! invocation, regardless of earlier approvals. The human authorizes the injection, not the
+//! child process. Once approved the key is in the env file, so a later run does not fail
+//! on it and nothing is re-asked in normal use.
 
 use crate::cmd::need::notify_pending;
 use crate::util::{self, App};
