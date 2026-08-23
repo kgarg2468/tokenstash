@@ -144,10 +144,16 @@ fn should_redact_inherited(name: &str, value: &str) -> bool {
     if BENIGN_ENV.contains(&u.as_str()) || u.starts_with("LC_") || u.starts_with("XDG_") || u.starts_with("TOKENSTASH_") {
         return false;
     }
-    // No value-shape exclusions: a path-valued variable under a non-allowlisted name is
-    // redacted too. Redaction only replaces exact full-value matches, so the cost of
-    // over-redacting an echoed benign path is a "[redacted]" in the mirror; the cost of
-    // under-redacting is a leaked secret.
+    // Redaction replaces the value wherever it appears as a substring, so a variable whose
+    // value is an existing DIRECTORY (HOMEBREW_PREFIX=/opt/homebrew, JAVA_HOME, ...) would
+    // garble every longer path that starts with it (PATH itself). A secret is never an
+    // existing directory, so directories — and colon-lists whose first entry is one — are
+    // excluded. Files are not excluded: a path to a secret file is still redacted.
+    let first = value.split(':').next().unwrap_or(value);
+    let expanded = first.strip_prefix("~/").and_then(|rest| dirs::home_dir().map(|h| h.join(rest)));
+    if std::path::Path::new(first).is_dir() || expanded.map(|p| p.is_dir()).unwrap_or(false) {
+        return false;
+    }
     true
 }
 
