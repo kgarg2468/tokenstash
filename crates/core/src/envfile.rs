@@ -4,10 +4,16 @@ use anyhow::{Context, Result};
 use secrecy::{ExposeSecret, SecretString};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Upsert `NAME=value` into `<project>/<env_file>`. Preserves other lines. 0600.
+///
+/// The file is made uncommittable BEFORE the value touches disk (gitignore entry +
+/// untracking a previously committed file), so a failure here can never leave a secret
+/// in a commit-eligible file.
 pub fn write(project: &Path, env_file: &str, name: &str, value: &SecretString) -> Result<PathBuf> {
     let path = project.join(env_file);
+    enforce_uncommittable(project, env_file)?;
     let existing = if path.exists() { fs::read_to_string(&path)? } else { String::new() };
     let mut out = String::with_capacity(existing.len() + 64);
     let mut replaced = false;
@@ -37,7 +43,6 @@ pub fn write(project: &Path, env_file: &str, name: &str, value: &SecretString) -
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
     }
-    ensure_gitignore(project, env_file)?;
     Ok(path)
 }
 
@@ -96,4 +101,38 @@ pub fn ensure_gitignore(project: &Path, env_file: &str) -> Result<bool> {
     s.push('\n');
     fs::write(&gi, s)?;
     Ok(true)
+}
+
+/// Guarantee the env file cannot be committed: cover it in `.gitignore` and, if it is
+/// already tracked (ignore rules don't apply to indexed files), remove it from the index.
+fn enforce_uncommittable(project: &Path, env_file: &str) -> Result<()> {
+    ensure_gitignore(project, env_file)?;
+    untrack(project, env_file)
+}
+
+/// `git rm --cached` a tracked env file so a future `git add -A` can't pick up secrets.
+/// Missing git binary → nothing to do. Failure to untrack → hard error, value not written.
+fn untrack(project: &Path, env_file: &str) -> Result<()> {
+    let Some(root) = git_root(project) else { return Ok(()) };
+    let rel = project
+        .strip_prefix(&root)
+        .unwrap_or(Path::new(""))
+        .join(env_file);
+    let tracked = Command::new("git")
+        .args(["ls-files", "--", &*rel.to_string_lossy()])
+        .current_dir(&root)
+        .output();
+    let Ok(out) = tracked else { return Ok(()) };
+    if !out.status.success() || out.stdout.is_empty() {
+        return Ok(());
+    }
+    let removed = Command::new("git")
+        .args(["rm", "--cached", "--quiet", "--", &*rel.to_string_lossy()])
+        .current_dir(&root)
+        .status();
+    match removed {
+        Ok(s) if s.success() => eprintln!("tokenstash: {env_file} was tracked by git — untracked it so injected secrets can't be committed"),
+        _ => anyhow::bail!("could not untrack the already-committed {env_file}; refusing to write a secret into a commit-eligible file. Run: git rm --cached {env_file}"),
+    }
+    Ok(())
 }
