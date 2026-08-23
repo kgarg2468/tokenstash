@@ -60,6 +60,14 @@ chmod +x "$PROJ/echo3.sh"
 SESSION_COOKIE="$INHERITED-cookie" "$TS" run -- "$PROJ/echo3.sh" >"$OUT/run4.txt" 2>&1 || true
 grep -q "$INHERITED-cookie" "$OUT/run4.txt" && { echo "LEAK: inherited SESSION_COOKIE echoed by child"; exit 1; }
 grep -q "path=/" "$OUT/run4.txt" || { echo "benign PATH must not be redacted"; exit 1; }
+# ...and a secret that merely starts with "/" (no such path) is still redacted
+cat > "$PROJ/echo4.sh" <<'SH'
+#!/bin/sh
+echo "weird=$WEIRD_SECRET"
+SH
+chmod +x "$PROJ/echo4.sh"
+WEIRD_SECRET="/slash-secret-LEAKCANARY-$(date +%s)/x" "$TS" run -- "$PROJ/echo4.sh" >"$OUT/run5.txt" 2>&1 || true
+grep -q "slash-secret-LEAKCANARY" "$OUT/run5.txt" && { echo "LEAK: path-like secret echoed by child"; exit 1; }
 grep -q "$INHERITED" "$OUT/run2.txt" && { echo "LEAK: inherited env value echoed by child"; exit 1; }
 grep -q "\[redacted\]" "$OUT/run2.txt" || { echo "run shim did not redact inherited value"; exit 1; }
 
