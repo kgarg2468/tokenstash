@@ -5,7 +5,7 @@
 // package itself was also compromised. No runtime dependency: the binary is a static Rust
 // build. Set TOKENSTASH_BINARY to skip (brew/cargo installs). Any failure exits non-zero so
 // npm reports a failed install instead of a broken one.
-const fs = require("fs"), path = require("path"), https = require("https"), crypto = require("crypto"), { execSync } = require("child_process");
+const fs = require("fs"), path = require("path"), https = require("https"), crypto = require("crypto"), { execFileSync } = require("child_process");
 if (process.env.TOKENSTASH_BINARY) process.exit(0);
 const pkg = require("../package.json");
 const plat = { darwin: "darwin", linux: "linux" }[process.platform];
@@ -40,7 +40,8 @@ function fetch(url, n = 0) {
     if (actual !== expected) throw new Error(`checksum mismatch for ${asset}: expected ${expected}, got ${actual}`);
     const tmp = dest + ".tar.gz";
     fs.writeFileSync(tmp, archive);
-    execSync(`tar -xzf "${tmp}" -C "${__dirname}"`);
+    // argv form: no shell, so metacharacters in the install path are never interpreted
+    execFileSync("tar", ["-xzf", tmp, "-C", __dirname], { stdio: "inherit" });
     fs.unlinkSync(tmp);
     fs.chmodSync(dest, 0o755);
     console.log("tokenstash: installed (sha256 verified). Run `tokenstash init`.");
