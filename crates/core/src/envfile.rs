@@ -58,18 +58,30 @@ pub fn write(project: &Path, env_file: &str, name: &str, value: &SecretString) -
     }
     // Write to a 0600 temp file in the same directory, then atomically rename it over
     // the destination. rename() replaces (never follows) a final-component symlink and
-    // closes the check-then-write race on the file itself.
+    // closes the check-then-write race on the file itself. create_new() refuses any
+    // pre-existing temp path, so a racer can't plant a symlink there.
     #[cfg(unix)]
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let tmp = path.with_file_name(format!(
-            ".{}.tokenstash-{}.tmp",
-            path.file_name().unwrap_or_default().to_string_lossy(),
-            std::process::id()
-        ));
-        let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-        f.write_all(out.as_bytes())?;
+        let stem = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let mut handle = None;
+        for attempt in 0..8u32 {
+            let tmp = path.with_file_name(format!(".{stem}.tokenstash-{}-{attempt:x}.tmp", std::process::id()));
+            match fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp) {
+                Ok(h) => {
+                    handle = Some((h, tmp));
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e).with_context(|| format!("writing {}", path.display())),
+            }
+        }
+        let Some((mut h, tmp)) = handle else {
+            anyhow::bail!("could not create a private temp file next to {}", path.display());
+        };
+        h.write_all(out.as_bytes())?;
+        drop(h);
         fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
     }
     #[cfg(not(unix))]
