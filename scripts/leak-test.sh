@@ -68,6 +68,15 @@ SH
 chmod +x "$PROJ/echo4.sh"
 WEIRD_SECRET="/slash-secret-LEAKCANARY-$(date +%s)/x" "$TS" run -- "$PROJ/echo4.sh" >"$OUT/run5.txt" 2>&1 || true
 grep -q "slash-secret-LEAKCANARY" "$OUT/run5.txt" && { echo "LEAK: path-like secret echoed by child"; exit 1; }
+# ...and even an existing-path secret under a non-allowlisted name is redacted
+PATHSECRET="$OUT"
+cat > "$PROJ/echo5.sh" <<'SH'
+#!/bin/sh
+echo "dir=$MY_DATA_DIR"
+SH
+chmod +x "$PROJ/echo5.sh"
+MY_DATA_DIR="$PATHSECRET" "$TS" run -- "$PROJ/echo5.sh" >"$OUT/run6.txt" 2>&1 || true
+grep -q "dir=$PATHSECRET" "$OUT/run6.txt" && { echo "LEAK: existing-path secret echoed by child"; exit 1; }
 grep -q "$INHERITED" "$OUT/run2.txt" && { echo "LEAK: inherited env value echoed by child"; exit 1; }
 grep -q "\[redacted\]" "$OUT/run2.txt" || { echo "run shim did not redact inherited value"; exit 1; }
 
