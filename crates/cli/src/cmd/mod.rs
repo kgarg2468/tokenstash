@@ -1,5 +1,8 @@
 pub mod admin;
 pub mod answer;
+pub mod doctor;
 pub mod inbox;
+pub mod init;
 pub mod mcp;
 pub mod need;
+pub mod run;
