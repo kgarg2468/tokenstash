@@ -133,9 +133,17 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
             if results.iter().any(|o| o.is_pending()) {
                 notify_pending(&app, &project, agent, &results);
                 if blocking {
-                    let names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
-                    let opts = NeedOpts { blocking: true, timeout, ..Default::default() };
-                    results = need::need(&app.ctx(), &project, agent, &names, &opts)?;
+                    // Re-run per spec so each request keeps its own identity/why/url;
+                    // hits are idempotent and pending tasks are reused.
+                    let mut waited = vec![];
+                    for s in &specs {
+                        let opts = NeedOpts {
+                            req: SecretRequest { why: s.why.clone(), url: s.url.clone(), steps: s.steps.clone(), pattern: s.pattern.clone() },
+                            identity: s.identity.clone(), blocking: true, timeout, force: false,
+                        };
+                        waited.extend(need::need(&app.ctx(), &project, agent, std::slice::from_ref(&s.name), &opts)?);
+                    }
+                    results = waited;
                 }
             }
             let pending = results.iter().any(|o| o.is_pending());

@@ -204,18 +204,21 @@ fn page_task(t: &Task, err: Option<&str>) -> String {
     match t.kind {
         TaskKind::Secret => {
             b.push_str(&format!(
-                "<form method=post><label class=mut for=v>{}</label><input id=v type=password name=value autocomplete=off autofocus placeholder='paste here — never shown, never sent anywhere but your keychain'>{}<div class=row><button class=p type=submit>Store &amp; inject</button><button class=bad name=action value=deny formnovalidate>Decline</button></div></form>",
+                "<form method=post autocomplete=off><label class=mut for=v>{}</label><input id=v type=password name=value autocomplete=off autofocus placeholder='paste here — never shown, never sent anywhere but your keychain'>{}<label class=mut style='display:block;margin-top:8px'><input type=checkbox name=skip_check value=1> skip the provider check (store even if it cannot be verified)</label><div class=row><button class=p type=submit>Store &amp; inject</button><button class=bad name=action value=deny formnovalidate>Decline</button></div></form>",
                 esc(&t.name.clone().unwrap_or_default()),
                 t.pattern.as_ref().map(|p| format!("<div class=mut>must match <code>{}</code></div>", esc(p))).unwrap_or_default()
             ));
-            b.push_str("<p class=mut style='margin-top:10px'><label><input type=checkbox name=skip_check form=f2> </label>If the provider check fails you'll see it here and nothing will be stored.</p>");
         }
         TaskKind::Approval => {
             b.push_str(&format!("<p>Keys: <code>{}</code></p><form method=post><div class=row><button class=p name=action value=allow>Allow for this project</button><button class=bad name=action value=deny>Deny</button></div></form>",
                 esc(&t.names.iter().filter(|n| n.as_str() != "*").cloned().collect::<Vec<_>>().join("</code>, <code>"))));
         }
         TaskKind::Human => {
-            let note = if t.expects == "text" { "<textarea name=note rows=3 placeholder='your answer'></textarea>" } else { "<input type=text name=note placeholder='optional note'>" };
+            let note = if t.expects == "text" {
+                "<textarea name=note rows=3 placeholder='your answer'></textarea><div class=mut>This answer is sent back to the agent. Never paste a secret here — the agent should request secrets with <code>tokenstash need</code>.</div>"
+            } else {
+                "<input type=text name=note placeholder='optional note (shown to the agent)'>"
+            };
             b.push_str(&format!("<form method=post>{note}<div class=row><button class=p name=action value=done>Done</button><button class=bad name=action value=deny>Can't do this</button></div></form>"));
         }
     }
