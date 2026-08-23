@@ -9,7 +9,7 @@
 //! - `insecure-file`: 0600 JSON file. ONLY for CI/tests. Requires explicit opt-in via
 //!   `TOKENSTASH_STASH=insecure-file` or config. Prints a warning.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use secrecy::{ExposeSecret, SecretString};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -143,15 +143,26 @@ impl FileStash {
             return Ok(BTreeMap::new());
         }
         let s = std::fs::read_to_string(&self.path)?;
-        Ok(serde_json::from_str(&s).unwrap_or_default())
+        // A corrupt file must be an error, not an empty map that the next write persists.
+        serde_json::from_str(&s).with_context(|| format!("{} is not valid JSON; refusing to overwrite it", self.path.display()))
     }
     fn write(&self, m: &BTreeMap<String, String>) -> Result<()> {
-        std::fs::write(&self.path, serde_json::to_string(m)?)?;
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600); // restrictive from the first byte, not after the write
+        }
+        let mut f = opts.open(&self.path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))?;
+            // mode() only applies at creation; tighten an existing file too
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
+        f.write_all(serde_json::to_string(m)?.as_bytes())?;
         Ok(())
     }
 }
