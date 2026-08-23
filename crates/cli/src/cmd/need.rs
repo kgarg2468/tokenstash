@@ -133,7 +133,7 @@ pub struct AskArgs {
     pub url: Option<String>,
     #[arg(long = "step")]
     pub steps: Vec<String>,
-    /// confirm | text
+    /// confirm | text. A `text` answer is returned to the agent — tell the human not to paste secrets into it.
     #[arg(long, default_value = "confirm")]
     pub expects: String,
     #[arg(long)]
