@@ -85,8 +85,15 @@ pub fn split_identity(entry: &str) -> (&str, &str) {
 /// `names` are `NAME@identity` entries and may include "*" meaning "this project is
 /// outside trust roots".
 pub fn create_approval_task(ctx: &Ctx, project: &Path, agent: &str, names: &[String]) -> Result<Task> {
+    create_approval_task_opts(ctx, project, agent, names, true)
+}
+
+/// `merge=false` always files a fresh task: used for program-derived requests, where each
+/// invocation must be authorized on its own and must not piggyback on (or be granted by)
+/// another invocation's pending approval.
+pub fn create_approval_task_opts(ctx: &Ctx, project: &Path, agent: &str, names: &[String], merge: bool) -> Result<Task> {
     let pid = project.to_string_lossy().to_string();
-    if let Some(mut t) = ctx.db.open_approval_task(&pid)? {
+    if let Some(mut t) = ctx.db.open_approval_task(&pid)?.filter(|_| merge) {
         let mut merged = t.names.clone();
         for n in names {
             if !merged.contains(n) {
@@ -287,26 +294,43 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, allow: bool) -> Result<AnswerResu
         return Ok(AnswerResult::Denied);
     }
     let project = Path::new(&pid);
+    // 1. Record the decision atomically: every approval plus the task's answered status.
+    //    Once this commits the human's answer is final and nothing can ask them again.
+    {
+        let tx = ctx.db.conn.unchecked_transaction()?;
+        for entry in &task.names {
+            let n = if entry == "*" { "*" } else { split_identity(entry).0 };
+            ctx.db.approve(&pid, n)?;
+        }
+        ctx.db.set_task_status(&task.id, TaskStatus::Answered, None)?;
+        ctx.db.audit(Some(&pid), Some(&task.agent), "approve", None, None, Some(&task.names.join(",")))?;
+        tx.commit().context("recording approval")?;
+    }
+    // 2. Inject each requested identity. Failures are collected and surfaced after all
+    //    entries are attempted; the approval itself is already recorded.
     let mut injected = vec![];
+    let mut failures = vec![];
     for entry in &task.names {
         if entry == "*" {
-            ctx.db.approve(&pid, "*")?;
             continue;
         }
-        // Inject exactly the identity that was requested; approval is recorded per name.
         let (n, identity) = split_identity(entry);
-        ctx.db.approve(&pid, n)?;
         if let Some(v) = ctx.stash.get(&stash_key(n, identity))? {
             if project.is_dir() {
-                crate::envfile::write(project, &ctx.cfg.env_file, n, &v)?;
-                ctx.db.touch_secret(n, identity)?;
-                ctx.db.audit(Some(&pid), Some(&task.agent), "inject", Some(n), Some(identity), Some("after-approval"))?;
-                injected.push(n.to_string());
+                match crate::envfile::write(project, &ctx.cfg.env_file, n, &v) {
+                    Ok(_) => {
+                        ctx.db.touch_secret(n, identity)?;
+                        ctx.db.audit(Some(&pid), Some(&task.agent), "inject", Some(n), Some(identity), Some("after-approval"))?;
+                        injected.push(n.to_string());
+                    }
+                    Err(e) => failures.push(format!("{n}: {e:#}")),
+                }
             }
         }
     }
-    ctx.db.set_task_status(&task.id, TaskStatus::Answered, None)?;
-    ctx.db.audit(Some(&pid), Some(&task.agent), "approve", None, None, Some(&task.names.join(",")))?;
+    if !failures.is_empty() {
+        bail!("approval recorded, but injection failed for {}. Re-run `need`; it will inject from the stash without asking again.", failures.join("; "));
+    }
     Ok(AnswerResult::Approved { injected })
 }
 
