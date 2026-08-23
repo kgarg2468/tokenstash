@@ -1,0 +1,11 @@
+/target
+*.log
+.env
+.env.local
+.env.*.local
+/dist
+node_modules
+
+# internal, local-only planning docs — never publish
+tokenstash.md
+PRD.md

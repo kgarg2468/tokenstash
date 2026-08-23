@@ -1,0 +1,79 @@
+//! Provider registry: how to acquire a key for a given env var name.
+//! Embedded at build time from `registry/providers.json`; meant to move to its own repo.
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+const RAW: &str = include_str!("../../../registry/providers.json");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Check {
+    /// GET | POST
+    #[serde(default = "default_get")]
+    pub method: String,
+    pub url: String,
+    /// "bearer" | "header:<Name>" | "basic-user" (value as username, empty password) | "query:<param>"
+    pub auth: String,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+}
+fn default_get() -> String { "GET".into() }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Provider {
+    /// Env var name, e.g. OPENAI_API_KEY
+    pub name: String,
+    /// Human label, e.g. "OpenAI"
+    pub provider: String,
+    /// Where to sign up / create the key.
+    pub url: String,
+    #[serde(default)]
+    pub dashboard: Option<String>,
+    #[serde(default)]
+    pub steps: Vec<String>,
+    /// Regex the value must match.
+    #[serde(default)]
+    pub pattern: Option<String>,
+    /// Always prompt once per project.
+    #[serde(default)]
+    pub sensitive: bool,
+    /// Prompt once per project only if the value matches (e.g. live vs test keys).
+    #[serde(default)]
+    pub sensitive_pattern: Option<String>,
+    #[serde(default)]
+    pub check: Option<Check>,
+    /// Other env vars that usually travel with this one.
+    #[serde(default)]
+    pub companions: Vec<String>,
+    /// Local secrets that need no human: "base64:32" | "hex:32".
+    #[serde(default)]
+    pub generate: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryFile {
+    providers: Vec<Provider>,
+}
+
+fn table() -> &'static HashMap<String, Provider> {
+    static T: OnceLock<HashMap<String, Provider>> = OnceLock::new();
+    T.get_or_init(|| {
+        let f: RegistryFile = serde_json::from_str(RAW).expect("registry/providers.json is invalid");
+        f.providers.into_iter().map(|p| (p.name.clone(), p)).collect()
+    })
+}
+
+pub fn lookup(name: &str) -> Option<&'static Provider> {
+    table().get(name)
+}
+
+pub fn all() -> Vec<&'static Provider> {
+    let mut v: Vec<_> = table().values().collect();
+    v.sort_by(|a, b| a.name.cmp(&b.name));
+    v
+}
+
+pub fn count() -> usize {
+    table().len()
+}

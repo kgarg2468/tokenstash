@@ -1,0 +1,22 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked
+      - run: cargo test --locked
+      - name: registry is valid JSON
+        run: python3 -c "import json;json.load(open('registry/providers.json'))"
+      - name: black-box leak test
+        run: scripts/leak-test.sh target/debug/tokenstash
+      - run: cargo clippy --all-targets -- -D warnings
+        continue-on-error: true
