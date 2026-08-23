@@ -12,18 +12,22 @@ use std::process::Command;
 /// untracking a previously committed file), so a failure here can never leave a secret
 /// in a commit-eligible file.
 pub fn write(project: &Path, env_file: &str, name: &str, value: &SecretString) -> Result<PathBuf> {
-    let path = project.join(env_file);
+    // Anchor at the canonicalized project root so a symlinked TMPDIR-style prefix
+    // (/var/folders → /private/var/folders on macOS) doesn't look like an attack;
+    // only symlinks introduced by env_file itself should trip the guard below.
+    let base = project.canonicalize().unwrap_or_else(|_| project.to_path_buf());
+    let path = base.join(env_file);
     let real = resolve_real(&path)?;
-    // A symlink anywhere on this path (final component OR an ancestor) would route the
-    // secret outside the protected location (a tracked file, another user's config…):
-    // refuse rather than follow it.
+    // A symlink anywhere below the project root (final component OR an ancestor)
+    // would route the secret outside the protected location (a tracked file,
+    // another user's config…): refuse rather than follow it.
     if path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) || real != path {
         anyhow::bail!(
             "{} is or crosses a symlink — refusing to write a secret through it. Remove the link and re-run.",
             path.display()
         );
     }
-    enforce_uncommittable(project, env_file)?;
+    enforce_uncommittable(&base, env_file)?;
     let existing = if path.exists() { fs::read_to_string(&path)? } else { String::new() };
     let mut out = String::with_capacity(existing.len() + 64);
     let mut replaced = false;
