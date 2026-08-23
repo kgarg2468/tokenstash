@@ -126,7 +126,7 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
             for s in &specs {
                 let opts = NeedOpts {
                     req: SecretRequest { why: s.why.clone(), url: s.url.clone(), steps: s.steps.clone(), pattern: s.pattern.clone() },
-                    identity: s.identity.clone(), blocking: false, timeout, force: false,
+                    identity: s.identity.clone(), blocking: false, timeout, force: false, require_approval: false,
                 };
                 results.extend(need::need(&app.ctx(), &project, agent, std::slice::from_ref(&s.name), &opts)?);
             }
@@ -139,7 +139,7 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
                     for s in &specs {
                         let opts = NeedOpts {
                             req: SecretRequest { why: s.why.clone(), url: s.url.clone(), steps: s.steps.clone(), pattern: s.pattern.clone() },
-                            identity: s.identity.clone(), blocking: true, timeout, force: false,
+                            identity: s.identity.clone(), blocking: true, timeout, force: false, require_approval: false,
                         };
                         waited.extend(need::need(&app.ctx(), &project, agent, std::slice::from_ref(&s.name), &opts)?);
                     }
