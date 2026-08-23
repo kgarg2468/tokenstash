@@ -35,7 +35,7 @@ pub fn tasks(a: TasksArgs) -> Result<i32> {
     for t in &list {
         let what = match t.kind {
             tokenstash_core::db::TaskKind::Secret => t.name.clone().unwrap_or_default(),
-            tokenstash_core::db::TaskKind::Approval => format!("approve {}", t.names.iter().filter(|n| n.as_str() != "*").cloned().collect::<Vec<_>>().join(", ")),
+            tokenstash_core::db::TaskKind::Approval => format!("approve {}", crate::util::approval_names(&t.names).join(", ")),
             tokenstash_core::db::TaskKind::Human => t.title.clone(),
         };
         println!("{} {:<10} {:<40} {:<24} {}", status_icon(&t.status), t.id, what, util::short(&t.project), t.agent);

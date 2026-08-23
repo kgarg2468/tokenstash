@@ -43,3 +43,8 @@ pub fn inbox_url(cfg: &Config, task_id: Option<&str>) -> String {
 pub fn short(p: &str) -> String {
     tokenstash_core::project::short(std::path::Path::new(p))
 }
+
+/// Human display for approval entries: drop the "*" marker and the "@default" suffix.
+pub fn approval_names(names: &[String]) -> Vec<String> {
+    names.iter().filter(|n| n.as_str() != "*").map(|n| n.strip_suffix("@default").unwrap_or(n).to_string()).collect()
+}
