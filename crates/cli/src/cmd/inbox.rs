@@ -204,11 +204,10 @@ fn page_task(t: &Task, err: Option<&str>) -> String {
     match t.kind {
         TaskKind::Secret => {
             b.push_str(&format!(
-                "<form method=post><label class=mut for=v>{}</label><input id=v type=password name=value autocomplete=off autofocus placeholder='paste here — never shown, never sent anywhere but your keychain'>{}<div class=row><button class=p type=submit>Store &amp; inject</button><button class=bad name=action value=deny formnovalidate>Decline</button></div></form>",
+                "<form method=post><label class=mut for=v>{}</label><input id=v type=password name=value autocomplete=off autofocus placeholder='paste here — never shown, never sent anywhere but your keychain'>{}<div class=row><button class=p type=submit>Store &amp; inject</button><button class=bad name=action value=deny formnovalidate>Decline</button></div><p class=mut style='margin-top:10px'><label><input type=checkbox name=skip_check> skip the provider check</label> — if the check fails you'll see it here and nothing is stored</p></form>",
                 esc(&t.name.clone().unwrap_or_default()),
                 t.pattern.as_ref().map(|p| format!("<div class=mut>must match <code>{}</code></div>", esc(p))).unwrap_or_default()
             ));
-            b.push_str("<p class=mut style='margin-top:10px'><label><input type=checkbox name=skip_check form=f2> </label>If the provider check fails you'll see it here and nothing will be stored.</p>");
         }
         TaskKind::Approval => {
             b.push_str(&format!("<p>Keys: <code>{}</code></p><form method=post><div class=row><button class=p name=action value=allow>Allow for this project</button><button class=bad name=action value=deny>Deny</button></div></form>",
