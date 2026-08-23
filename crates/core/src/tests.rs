@@ -244,9 +244,17 @@ fn file_stash_is_atomic_and_locked() {
         assert!(st.get(&format!("T{i}@default")).unwrap().is_some(), "lost T{i}");
         assert!(st.get(&format!("M{i}@default")).unwrap().is_some(), "lost M{i}");
     }
-    // no stray temp or lock files
-    let leftovers: Vec<_> = std::fs::read_dir(&home).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).filter(|n| n.contains(".tmp") || n.ends_with(".lock")).collect();
-    assert!(leftovers.is_empty(), "leftover files: {leftovers:?}");
+    // no stray temp files. The advisory lock file persists by design (an OS lock is held on
+    // an open handle; deleting the file would race other holders) and must be empty + 0600.
+    let leftovers: Vec<_> = std::fs::read_dir(&home).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).filter(|n| n.contains(".tmp")).collect();
+    assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+    let lock = home.join("insecure-stash.lock");
+    assert_eq!(std::fs::metadata(&lock).unwrap().len(), 0, "lock file must not carry data");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777, 0o600);
+    }
 }
 
 #[test]
@@ -287,4 +295,51 @@ fn need_end_to_end_with_file_stash() {
     // nothing in the db
     let raw = std::fs::read(home.join("t.db")).unwrap();
     assert!(!String::from_utf8_lossy(&raw).contains("LEAKCANARY"), "value leaked into db");
+}
+
+#[test]
+fn text_answers_that_look_like_secrets_are_refused() {
+    use validate::looks_like_secret;
+    assert!(looks_like_secret("sk-abcdefghijklmnopqrstuvwxyz012345"));
+    assert!(looks_like_secret("re_123456789_ABCDEFGHIJKLMNOPQRSTUV"));
+    assert!(looks_like_secret("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcDEF123"));
+    assert!(looks_like_secret("postgres://user:pass@db.example.com/app"));
+    assert!(!looks_like_secret("us-east-1"));
+    assert!(!looks_like_secret("yes, the DNS record is live now"));
+    assert!(!looks_like_secret("project id is my-app-prod"));
+
+    let home = tmp("human-refuse");
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let cfg = Config::default();
+    let st = stash::FileStash::new().unwrap(); // never touched by this test
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: &st };
+    let t = tasks::create_human_task(&ctx, &home, "t", tasks::HumanRequest { title: "which region?".into(), why: None, url: None, steps: vec![], expects: "text".into() }).unwrap();
+    assert!(tasks::answer_human(&ctx, &t, Some("sk-abcdefghijklmnopqrstuvwxyz012345")).is_err());
+    assert_eq!(db.get_task(&t.id).unwrap().unwrap().status, db::TaskStatus::Pending, "refused answer must not close the task");
+    tasks::answer_human(&ctx, &t, Some("us-east-1")).unwrap();
+    assert_eq!(db.get_task(&t.id).unwrap().unwrap().status, db::TaskStatus::Answered);
+}
+
+#[test]
+fn answering_a_secret_marks_the_task_before_injection() {
+    let _env = env_lock();
+    let home = tmp("answer-tx-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("answer-tx-proj").canonicalize().unwrap();
+    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let out = need::need(&ctx, &proj, "t", &["RESEND_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), _ => unreachable!() };
+    let task = db.get_task(&tid).unwrap().unwrap();
+    // make injection fail: the env file path is a symlink → refused
+    std::os::unix::fs::symlink(proj.join("elsewhere"), proj.join(".env.local")).unwrap();
+    let r = tasks::answer_secret(&ctx, &task, SecretString::from("re_validvalue_123456".to_string()), true);
+    assert!(r.is_err(), "injection through a symlink must fail");
+    // ...but the value is stored and the task is answered, so nothing is asked twice
+    assert!(stash.get("RESEND_API_KEY@default").unwrap().is_some());
+    assert_eq!(db.get_task(&tid).unwrap().unwrap().status, db::TaskStatus::Answered);
+    assert!(db.get_secret("RESEND_API_KEY", "default").unwrap().is_some());
 }
