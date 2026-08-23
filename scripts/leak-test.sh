@@ -33,6 +33,17 @@ printf '%s\n' \
   | "$TS" mcp >"$OUT/mcp.txt" 2>&1
 "$TS" doctor >"$OUT/doctor.txt" 2>&1 || true
 
+# run shim: a child that echoes its environment must not leak the injected value
+cat > "$PROJ/echo.sh" <<'SH'
+#!/bin/sh
+echo "env dump: OPENAI_API_KEY=$OPENAI_API_KEY"
+echo "stderr: $OPENAI_API_KEY" >&2
+exit 0
+SH
+chmod +x "$PROJ/echo.sh"
+"$TS" run -- "$PROJ/echo.sh" >"$OUT/run.txt" 2>&1 || true
+grep -q "\[redacted\]" "$OUT/run.txt" || { echo "run shim did not redact"; exit 1; }
+
 # the env file is the ONE place the value is allowed to be
 grep -q "OPENAI_API_KEY=$CANARY" "$PROJ/.env.local"
 grep -q "^.env.local$" "$PROJ/.gitignore"

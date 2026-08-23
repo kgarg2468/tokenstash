@@ -507,3 +507,34 @@ fn approval_injects_the_requested_identity() {
     assert!(matches!(&out[0], need::Outcome::Injected { identity, .. } if identity == "work"), "{:?}", out[0]);
     assert!(std::fs::read_to_string(proj.join(".env.local")).unwrap().contains("sk-workworkwork1"));
 }
+
+#[test]
+fn gitignore_last_match_wins() {
+    use envfile::gitignore_covers as g;
+    assert!(g(".env.local\n", ".env.local"));
+    assert!(!g(".env.local\n!.env.local\n", ".env.local"), "later negation re-includes");
+    assert!(g(".env.local\n!.env.local\n.env.local\n", ".env.local"), "later positive wins again");
+    assert!(!g("!.env.local\n", ".env.local"));
+    assert!(g(".env*\n!.env.example\n", ".env.local"), "negation of a different name is irrelevant");
+    assert!(!g(".env*\n!.env.*\n", ".env.local"), "negated glob un-ignores");
+    assert!(g("secrets/\n.env.local\n", ".env.local"), "directory rules are skipped, not treated as negation");
+    // end to end: a negated file gets an explicit trailing rule, which wins
+    let dir = tmp("gi-neg");
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::write(dir.join(".gitignore"), ".env.local\n!.env.local\n").unwrap();
+    envfile::write(&dir, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap();
+    let gi = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+    assert!(g(&gi, ".env.local"), "after write, the file must be ignored: {gi}");
+    assert_eq!(gi.lines().last(), Some(".env.local"));
+}
+
+#[test]
+fn secret_is_not_written_when_ignore_protection_fails() {
+    let dir = tmp("gi-fail");
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    let target = dir.join("elsewhere.txt");
+    std::fs::write(&target, "keep\n").unwrap();
+    std::os::unix::fs::symlink(&target, dir.join(".gitignore")).unwrap();
+    assert!(envfile::write(&dir, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).is_err());
+    assert!(!dir.join(".env.local").exists(), "secret must not land on disk without confirmed ignore protection");
+}
