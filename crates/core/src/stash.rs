@@ -146,24 +146,13 @@ impl FileStash {
         // A corrupt file must be an error, not an empty map that the next write persists.
         serde_json::from_str(&s).with_context(|| format!("{} is not valid JSON; refusing to overwrite it", self.path.display()))
     }
+    /// Atomic: serialize to a fresh 0600 temp file (O_EXCL, so never through a pre-placed
+    /// symlink), fsync, then rename over the destination. A failure at any point leaves the
+    /// previous stash intact, and rename replaces a symlink at the destination rather than
+    /// following it.
     fn write(&self, m: &BTreeMap<String, String>) -> Result<()> {
-        use std::io::Write;
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600); // restrictive from the first byte, not after the write
-        }
-        let mut f = opts.open(&self.path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // mode() only applies at creation; tighten an existing file too
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        f.write_all(serde_json::to_string(m)?.as_bytes())?;
-        Ok(())
+        let data = serde_json::to_string(m)?;
+        crate::fsutil::write_atomic_private(&self.path, &data)
     }
 }
 
