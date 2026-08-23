@@ -38,5 +38,21 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with: { node-version: 20, registry-url: "https://registry.npmjs.org" }
+      - name: embed release checksums in the package
+        # The npm tarball carries the expected digests, so a tampered GitHub asset cannot
+        # pass verification unless npm is compromised as well.
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          mkdir -p /tmp/sums && gh release download "$GITHUB_REF_NAME" --pattern '*.sha256' --dir /tmp/sums
+          python3 - <<'PY'
+          import json, glob, os
+          sums = {}
+          for f in glob.glob('/tmp/sums/*.sha256'):
+              digest = open(f).read().split()[0]
+              sums[os.path.basename(f)[:-len('.sha256')]] = digest
+          assert len(sums) == 4, sums
+          json.dump(sums, open('npm/checksums.json', 'w'), indent=2)
+          PY
+          cat npm/checksums.json
       - run: cd npm && npm version ${GITHUB_REF_NAME#v} --no-git-tag-version && npm publish --access public
         env: { NODE_AUTH_TOKEN: "${{ secrets.NPM_TOKEN }}" }

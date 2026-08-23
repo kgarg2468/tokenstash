@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 // Download the release binary for this platform into ./bin/ and verify its SHA-256 against the
-// checksum published alongside it. No runtime dependency: the binary is a static Rust build.
-// Set TOKENSTASH_BINARY to skip (brew/cargo installs). Any failure exits non-zero so npm
-// reports a failed install instead of a broken one.
+// digest embedded in this npm package at publish time (checksums.json). The digest is NOT
+// fetched from the release, so a tampered GitHub asset fails verification unless the npm
+// package itself was also compromised. No runtime dependency: the binary is a static Rust
+// build. Set TOKENSTASH_BINARY to skip (brew/cargo installs). Any failure exits non-zero so
+// npm reports a failed install instead of a broken one.
 const fs = require("fs"), path = require("path"), https = require("https"), crypto = require("crypto"), { execSync } = require("child_process");
 if (process.env.TOKENSTASH_BINARY) process.exit(0);
 const pkg = require("../package.json");
@@ -10,8 +12,13 @@ const plat = { darwin: "darwin", linux: "linux" }[process.platform];
 const arch = { x64: "x64", arm64: "arm64" }[process.arch];
 const fail = (msg) => { console.error(`tokenstash: ${msg}\n  fallback: cargo install tokenstash`); process.exit(1); };
 if (!plat || !arch) fail(`no prebuilt binary for ${process.platform}/${process.arch}`);
-const base = `https://github.com/kgarg2468/tokenstash/releases/download/v${pkg.version}/tokenstash-${plat}-${arch}.tar.gz`;
+const asset = `tokenstash-${plat}-${arch}.tar.gz`;
+const base = `https://github.com/kgarg2468/tokenstash/releases/download/v${pkg.version}/${asset}`;
 const dest = path.join(__dirname, "tokenstash");
+let checksums = {};
+try { checksums = require("../checksums.json"); } catch { fail("checksums.json missing from package; refusing to install an unverifiable binary"); }
+const expected = checksums[asset];
+if (!/^[a-f0-9]{64}$/.test(expected || "")) fail(`no pinned checksum for ${asset} in this package version`);
 
 function fetch(url, n = 0) {
   return new Promise((resolve, reject) => {
@@ -28,11 +35,9 @@ function fetch(url, n = 0) {
 
 (async () => {
   try {
-    const [archive, sums] = await Promise.all([fetch(base), fetch(base + ".sha256")]);
-    const expected = sums.toString("utf8").trim().split(/\s+/)[0];
+    const archive = await fetch(base);
     const actual = crypto.createHash("sha256").update(archive).digest("hex");
-    if (!/^[a-f0-9]{64}$/.test(expected)) throw new Error("checksum file is malformed");
-    if (actual !== expected) throw new Error(`checksum mismatch: expected ${expected}, got ${actual}`);
+    if (actual !== expected) throw new Error(`checksum mismatch for ${asset}: expected ${expected}, got ${actual}`);
     const tmp = dest + ".tar.gz";
     fs.writeFileSync(tmp, archive);
     execSync(`tar -xzf "${tmp}" -C "${__dirname}"`);
