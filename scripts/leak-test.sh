@@ -57,7 +57,8 @@ cat > "$PROJ/echo3.sh" <<'SH'
 echo "cookie=$SESSION_COOKIE path=$PATH"
 SH
 chmod +x "$PROJ/echo3.sh"
-SESSION_COOKIE="$INHERITED-cookie" "$TS" run -- "$PROJ/echo3.sh" >"$OUT/run4.txt" 2>&1 || true
+PREFIX_DIR="$(echo "$PATH" | cut -d: -f1)"
+SESSION_COOKIE="$INHERITED-cookie" MY_TOOL_HOME="$PREFIX_DIR" "$TS" run -- "$PROJ/echo3.sh" >"$OUT/run4.txt" 2>&1 || true
 grep -q "$INHERITED-cookie" "$OUT/run4.txt" && { echo "LEAK: inherited SESSION_COOKIE echoed by child"; exit 1; }
 grep -q "path=/" "$OUT/run4.txt" || { echo "benign PATH must not be redacted"; exit 1; }
 # ...and a secret that merely starts with "/" (no such path) is still redacted
@@ -69,7 +70,7 @@ chmod +x "$PROJ/echo4.sh"
 WEIRD_SECRET="/slash-secret-LEAKCANARY-$(date +%s)/x" "$TS" run -- "$PROJ/echo4.sh" >"$OUT/run5.txt" 2>&1 || true
 grep -q "slash-secret-LEAKCANARY" "$OUT/run5.txt" && { echo "LEAK: path-like secret echoed by child"; exit 1; }
 # ...and even an existing-path secret under a non-allowlisted name is redacted
-PATHSECRET="$OUT"
+PATHSECRET="$OUT/tasks2.txt"
 cat > "$PROJ/echo5.sh" <<'SH'
 #!/bin/sh
 echo "dir=$MY_DATA_DIR"
