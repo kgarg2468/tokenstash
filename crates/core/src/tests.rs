@@ -3,6 +3,13 @@ use crate::*;
 use secrecy::SecretString;
 use std::path::PathBuf;
 
+/// Tests that point TOKENSTASH_HOME at a temp dir mutate process-global state; the test
+/// harness runs tests in parallel threads, so those tests must not overlap.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn tmp(name: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("tokenstash-test-{}-{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
@@ -168,6 +175,7 @@ fn trust_roots_are_canonical() {
 
 #[test]
 fn require_approval_gates_even_hits() {
+    let _env = env_lock();
     let home = tmp("req-approval-home");
     std::env::set_var("TOKENSTASH_HOME", &home);
     std::env::set_var("TOKENSTASH_STASH", "insecure-file");
@@ -185,14 +193,65 @@ fn require_approval_gates_even_hits() {
     let out = need::need(&ctx, &proj, "run", &["GROQ_API_KEY".to_string()], &need::NeedOpts { require_approval: true, ..Default::default() }).unwrap();
     let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), other => panic!("expected approval, got {other:?}") };
     assert!(tid.starts_with("a_"));
-    // after approval it is silent again, even with require_approval
+    // approval injects; but a later program-derived request must ask again — persisted
+    // approval never authorizes a fresh untrusted request
     tasks::answer_approval(&ctx, &db.get_task(&tid).unwrap().unwrap(), true).unwrap();
+    assert!(envfile::has(&proj, ".env.local", "GROQ_API_KEY"));
     let out = need::need(&ctx, &proj, "run", &["GROQ_API_KEY".to_string()], &need::NeedOpts { require_approval: true, ..Default::default() }).unwrap();
+    assert!(matches!(out[0], need::Outcome::Pending { .. }), "require_approval must ask every time");
+    // ordinary requests in the trusted project stay silent
+    let out = need::need(&ctx, &proj, "t", &["GROQ_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
     assert!(matches!(out[0], need::Outcome::Injected { .. }));
 }
 
 #[test]
+fn file_stash_is_atomic_and_locked() {
+    let _env = env_lock();
+    let home = tmp("stash-atomic");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let cfg = Config::default();
+    let st = stash::open(&cfg).unwrap();
+    st.set("A@default", &SecretString::from("valuevalue".to_string())).unwrap();
+    let path = home.join("insecure-stash.json");
+    // corrupt file is an error, not silently emptied
+    std::fs::write(&path, "{not json").unwrap();
+    assert!(st.get("A@default").is_err());
+    assert!(st.set("B@default", &SecretString::from("bbbbbbbb".to_string())).is_err(), "must not overwrite a corrupt stash");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json", "corrupt content preserved for recovery");
+    std::fs::write(&path, "{}").unwrap();
+    // symlinked destination is refused
+    let target = home.join("elsewhere.json");
+    std::fs::write(&target, "{}").unwrap();
+    std::fs::remove_file(&path).unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(st.set("C@default", &SecretString::from("cccccccc".to_string())).is_err(), "must not write through a symlink");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{}", "symlink target untouched");
+        std::fs::remove_file(&path).unwrap();
+    }
+    // concurrent writers (separate handles, as two processes would have) do not lose
+    // each other's updates
+    let cfg2 = cfg.clone();
+    let h = std::thread::spawn(move || {
+        let st2 = stash::open(&cfg2).unwrap();
+        for i in 0..25 { st2.set(&format!("T{i}@default"), &SecretString::from("threadval".to_string())).unwrap(); }
+    });
+    for i in 0..25 { st.set(&format!("M{i}@default"), &SecretString::from("mainvalue".to_string())).unwrap(); }
+    h.join().unwrap();
+    for i in 0..25 {
+        assert!(st.get(&format!("T{i}@default")).unwrap().is_some(), "lost T{i}");
+        assert!(st.get(&format!("M{i}@default")).unwrap().is_some(), "lost M{i}");
+    }
+    // no stray temp or lock files
+    let leftovers: Vec<_> = std::fs::read_dir(&home).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).filter(|n| n.contains(".tmp") || n.ends_with(".lock")).collect();
+    assert!(leftovers.is_empty(), "leftover files: {leftovers:?}");
+}
+
+#[test]
 fn need_end_to_end_with_file_stash() {
+    let _env = env_lock();
     let home = tmp("need-home");
     std::env::set_var("TOKENSTASH_HOME", &home);
     std::env::set_var("TOKENSTASH_STASH", "insecure-file");
