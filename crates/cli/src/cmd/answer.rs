@@ -75,8 +75,7 @@ pub fn answer(a: AnswerArgs) -> Result<i32> {
         TaskKind::Approval => {
             println!("{}", task.title);
             if let Some(w) = &task.why { println!("  {w}"); }
-            let names: Vec<&String> = task.names.iter().filter(|n| n.as_str() != "*").collect();
-            println!("  keys: {}", names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+            println!("  keys: {}", crate::util::approval_names(&task.names).join(", "));
             let allow = if a.allow {
                 true
             } else {

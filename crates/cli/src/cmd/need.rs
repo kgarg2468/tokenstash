@@ -103,6 +103,7 @@ pub fn notify_pending(app: &App, project: &std::path::Path, agent: &str, outcome
     notify::ensure_inbox(&app.cfg);
     let pending: Vec<&str> = outcomes.iter().filter(|o| o.is_pending()).map(|o| o.name()).collect();
     let first_id = outcomes.iter().find_map(|o| match o { Outcome::Pending { task_id, .. } => Some(task_id.clone()), _ => None });
+    let _ = &pending;
     notify::desktop(
         &app.cfg,
         &format!("{} needs {}", tokenstash_core::project::short(project), pending.join(", ")),
