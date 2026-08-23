@@ -399,3 +399,29 @@ fn same_name_different_identities_get_separate_tasks() {
     let work_hit = need::need(&ctx, &proj, "t", &name, &need::NeedOpts { identity: Some("work".into()), ..Default::default() }).unwrap();
     assert!(matches!(work_hit[0], need::Outcome::Injected { .. }), "work identity unaffected by personal denial");
 }
+
+#[test]
+fn tracked_env_file_is_refused_until_untracked() {
+    let dir = tmp("tracked-env");
+    let git = |args: &[&str]| {
+        let st = std::process::Command::new("git").arg("-C").arg(&dir).args(args)
+            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap();
+        assert!(st.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q", "."]);
+    // the classic mistake: the env file was committed before anyone thought about it
+    std::fs::write(dir.join(".env.local"), "OLD=1\n").unwrap();
+    git(&["add", ".env.local"]);
+    git(&["commit", "-q", "-m", "oops"]);
+    assert!(envfile::is_git_tracked(&dir, &dir.join(".env.local")));
+    let err = envfile::write(&dir, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap_err();
+    assert!(err.to_string().contains("git rm --cached"), "must tell the user how to fix it: {err}");
+    assert_eq!(std::fs::read_to_string(dir.join(".env.local")).unwrap(), "OLD=1\n", "tracked file untouched");
+    // after untracking, injection proceeds and the ignore rule is added
+    git(&["rm", "-q", "--cached", ".env.local"]);
+    assert!(!envfile::is_git_tracked(&dir, &dir.join(".env.local")));
+    envfile::write(&dir, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap();
+    assert!(envfile::has(&dir, ".env.local", "K"));
+    assert!(std::fs::read_to_string(dir.join(".gitignore")).unwrap().lines().any(|l| l == ".env.local"));
+}
