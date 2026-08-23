@@ -100,10 +100,13 @@ fn spawn(cmd: &[String], extra: &HashMap<String, String>) -> Result<(i32, String
     for v in extra.values() {
         redactor.add(&SecretString::from(v.clone()));
     }
-    // The child also inherits our own environment. Anything there under a secret-looking
-    // name (registry names, or *KEY/*TOKEN/*SECRET/*PASSWORD/*CREDENTIAL*) is redacted too.
+    // The child also inherits our own environment, and we cannot know which of those
+    // variables are secrets by name (SESSION_COOKIE, MYAPP_DSN, ...). So every inherited
+    // value is treated as redactable unless it is a well-known benign variable or looks like
+    // a filesystem path/list. Over-redacting an echoed benign value is harmless; missing a
+    // secret is not.
     for (k, v) in std::env::vars() {
-        if v.len() >= tokenstash_core::tasks::MIN_SECRET_CHARS && secret_like_name(&k) {
+        if should_redact_inherited(&k, &v) {
             redactor.add(&SecretString::from(v));
         }
     }
@@ -122,12 +125,30 @@ fn spawn(cmd: &[String], extra: &HashMap<String, String>) -> Result<(i32, String
     Ok((status.code().unwrap_or(1), captured))
 }
 
-fn secret_like_name(name: &str) -> bool {
+const BENIGN_ENV: &[&str] = &[
+    "PATH", "HOME", "PWD", "OLDPWD", "SHELL", "TERM", "TERM_PROGRAM", "COLORTERM", "LANG", "LANGUAGE", "USER", "LOGNAME",
+    "DISPLAY", "WAYLAND_DISPLAY", "TMPDIR", "TMP", "TEMP", "EDITOR", "VISUAL", "PAGER", "HOSTNAME", "SHLVL", "_",
+    "CARGO_HOME", "RUSTUP_HOME", "GOPATH", "NODE_ENV", "RUST_LOG", "RUST_BACKTRACE", "CI", "TZ", "MANPATH", "INFOPATH",
+    "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE", "XDG_DATA_DIRS", "XDG_CONFIG_DIRS", "SSH_AUTH_SOCK",
+    "TERMINFO", "LS_COLORS", "LESS", "LESSOPEN", "LESSCLOSE", "GIT_EDITOR", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT",
+];
+
+fn should_redact_inherited(name: &str, value: &str) -> bool {
+    if value.chars().count() < tokenstash_core::tasks::MIN_SECRET_CHARS {
+        return false;
+    }
     if tokenstash_core::registry::lookup(name).is_some() {
-        return true;
+        return true; // known secret names always count, whatever the value looks like
     }
     let u = name.to_ascii_uppercase();
-    ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH", "DSN", "PRIVATE"].iter().any(|m| u.contains(m))
+    if BENIGN_ENV.contains(&u.as_str()) || u.starts_with("LC_") || u.starts_with("XDG_") || u.starts_with("TOKENSTASH_") {
+        return false;
+    }
+    // path-like or list-of-paths values are not secrets
+    if value.starts_with('/') || value.starts_with("~/") || value.starts_with("./") {
+        return false;
+    }
+    true
 }
 
 fn tee<R: std::io::Read>(r: R, is_err: bool, redactor: &Redactor) -> String {
