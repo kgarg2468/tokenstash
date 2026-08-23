@@ -33,6 +33,11 @@ pub enum GateReason {
 }
 
 pub fn gate(db: &Db, cfg: &Config, project: &Path, name: &str, sensitive: bool) -> Result<Gate> {
+    // Key approvals by the resolved path; an unresolvable path is never approved.
+    let Ok(project) = project.canonicalize() else {
+        return Ok(Gate::NeedsApproval { reason: GateReason::OutsideTrustRoots });
+    };
+    let project = project.as_path();
     let pid = project.to_string_lossy();
     if sensitive && !db.is_approved(&pid, name)? {
         return Ok(Gate::NeedsApproval { reason: GateReason::Sensitive });

@@ -104,6 +104,39 @@ pub fn parse_line(line: &str) -> Option<(String, String)> {
     Some((k.trim().to_string(), val))
 }
 
+/// Does one .gitignore line cover `file` (a bare filename at any depth)? Handles exact
+/// names, a leading `/`, and `*`/`?` globs. Negations and directory rules never count.
+/// Conservative: when unsure, say "not covered" and append an explicit line.
+pub fn ignore_line_covers(line: &str, file: &str) -> bool {
+    let l = line.trim();
+    if l.is_empty() || l.starts_with('#') || l.starts_with('!') || l.ends_with('/') {
+        return false;
+    }
+    let l = l.strip_prefix('/').unwrap_or(l);
+    if l.contains('/') {
+        return false; // path-anchored rules are not evaluated
+    }
+    glob_match(l, file)
+}
+
+fn glob_match(pat: &str, s: &str) -> bool {
+    let (p, t): (Vec<char>, Vec<char>) = (pat.chars().collect(), s.chars().collect());
+    let (mut pi, mut si, mut star, mut mark) = (0usize, 0usize, None::<usize>, 0usize);
+    while si < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[si]) {
+            pi += 1; si += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi); mark = si; pi += 1;
+        } else if let Some(st) = star {
+            pi = st + 1; mark += 1; si = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' { pi += 1; }
+    pi == p.len()
+}
+
 /// Is this path in the git index? An ignore rule does nothing for a file that is already
 /// tracked. Best effort: if git cannot be run, assume not tracked (the .gitignore path
 /// still applies).
@@ -143,14 +176,7 @@ pub fn ensure_gitignore(project: &Path, env_file: &str) -> Result<bool> {
         anyhow::bail!("{} is a symlink; refusing to modify it (and cannot guarantee {env_file} stays uncommitted)", gi.display());
     }
     let existing = if gi.exists() { fs::read_to_string(&gi)? } else { String::new() };
-    let covered = existing.lines().map(str::trim).any(|l| {
-        l == env_file
-            || l == format!("/{env_file}")
-            || l == "*.local"
-            || l == ".env*"
-            || l == ".env.*"
-            || (l == "*.env" && env_file.ends_with(".env"))
-    });
+    let covered = existing.lines().map(str::trim).any(|l| ignore_line_covers(l, env_file));
     if covered {
         return Ok(false);
     }
