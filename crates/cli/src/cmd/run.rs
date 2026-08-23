@@ -144,8 +144,12 @@ fn should_redact_inherited(name: &str, value: &str) -> bool {
     if BENIGN_ENV.contains(&u.as_str()) || u.starts_with("LC_") || u.starts_with("XDG_") || u.starts_with("TOKENSTASH_") {
         return false;
     }
-    // path-like or list-of-paths values are not secrets
-    if value.starts_with('/') || value.starts_with("~/") || value.starts_with("./") {
+    // Only a value that resolves to something real on this filesystem (or a colon-separated
+    // list whose first entry does) is treated as a path and skipped. A secret that merely
+    // starts with "/" will not exist on disk and stays redactable.
+    let first = value.split(':').next().unwrap_or(value);
+    let expanded = first.strip_prefix("~/").and_then(|rest| dirs::home_dir().map(|h| h.join(rest)));
+    if std::path::Path::new(first).exists() || expanded.map(|p| p.exists()).unwrap_or(false) {
         return false;
     }
     true
