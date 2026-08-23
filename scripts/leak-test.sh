@@ -51,6 +51,15 @@ echo "MY_SERVICE_TOKEN is $MY_SERVICE_TOKEN"
 SH
 chmod +x "$PROJ/echo2.sh"
 MY_SERVICE_TOKEN="$INHERITED" "$TS" run -- "$PROJ/echo2.sh" >"$OUT/run2.txt" 2>&1 || true
+# ...including under a name with no secret-looking substring
+cat > "$PROJ/echo3.sh" <<'SH'
+#!/bin/sh
+echo "cookie=$SESSION_COOKIE path=$PATH"
+SH
+chmod +x "$PROJ/echo3.sh"
+SESSION_COOKIE="$INHERITED-cookie" "$TS" run -- "$PROJ/echo3.sh" >"$OUT/run4.txt" 2>&1 || true
+grep -q "$INHERITED-cookie" "$OUT/run4.txt" && { echo "LEAK: inherited SESSION_COOKIE echoed by child"; exit 1; }
+grep -q "path=/" "$OUT/run4.txt" || { echo "benign PATH must not be redacted"; exit 1; }
 grep -q "$INHERITED" "$OUT/run2.txt" && { echo "LEAK: inherited env value echoed by child"; exit 1; }
 grep -q "\[redacted\]" "$OUT/run2.txt" || { echo "run shim did not redact inherited value"; exit 1; }
 
