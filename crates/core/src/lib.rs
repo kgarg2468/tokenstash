@@ -5,6 +5,10 @@
 
 pub mod config;
 pub mod db;
+pub mod redact;
+pub mod registry;
+pub mod stash;
+pub mod validate;
 
 
 pub use config::Config;
