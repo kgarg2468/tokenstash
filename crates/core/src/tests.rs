@@ -627,3 +627,23 @@ fn wait_does_not_file_duplicate_program_approvals() {
     let open: Vec<_> = db.list_tasks(Some(&proj.to_string_lossy()), true).unwrap();
     assert!(open.is_empty(), "waiting must not file a second approval task: {open:?}");
 }
+
+#[test]
+fn nested_gitignore_reinclude_is_handled_via_git() {
+    let dir = tmp("gi-nested");
+    let git = |args: &[&str]| {
+        let st = std::process::Command::new("git").arg("-C").arg(&dir).args(args)
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap();
+        assert!(st.success(), "git {args:?}");
+    };
+    git(&["init", "-q", "."]);
+    let sub = dir.join("apps/web");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(dir.join(".gitignore"), ".env.local\n").unwrap();
+    std::fs::write(sub.join(".gitignore"), "!.env.local\n").unwrap();
+    assert_eq!(envfile::git_check_ignore(&dir, &sub.join(".env.local")), Some(false));
+    envfile::write(&sub, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap();
+    assert_eq!(envfile::git_check_ignore(&dir, &sub.join(".env.local")), Some(true), "must be effectively ignored after write");
+    let nested = std::fs::read_to_string(sub.join(".gitignore")).unwrap();
+    assert_eq!(nested.lines().last(), Some(".env.local"), "rule appended to the closest ignore file: {nested}");
+}
