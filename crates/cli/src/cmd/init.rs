@@ -77,17 +77,13 @@ pub fn init(a: InitArgs) -> Result<i32> {
         // Codex
         let codex = home.join(".codex");
         if codex.is_dir() {
-            let cfg_path = codex.join("config.toml");
-            let mut s = fs::read_to_string(&cfg_path).unwrap_or_default();
-            if !s.contains("[mcp_servers.tokenstash]") {
-                if !s.is_empty() && !s.ends_with('\n') { s.push('\n'); }
-                // toml::Value renders a correctly escaped string (backslashes, quotes, unicode)
-                let cmd = toml::Value::String(exe_s.clone()).to_string();
-                s.push_str(&format!("\n[mcp_servers.tokenstash]\ncommand = {cmd}\nargs = [\"mcp\"]\n"));
-                fs::write(&cfg_path, s)?;
+            match merge_codex_toml(&codex.join("config.toml"), &exe_s) {
+                Ok(()) => {
+                    append_snippet(&codex.join("AGENTS.md"))?;
+                    println!("✓ Codex: MCP server + AGENTS.md");
+                }
+                Err(e) => println!("! Codex: left ~/.codex/config.toml untouched — {e}"),
             }
-            append_snippet(&codex.join("AGENTS.md"))?;
-            println!("✓ Codex: MCP server + AGENTS.md");
         }
 
         // Cursor
@@ -119,6 +115,35 @@ pub fn init(a: InitArgs) -> Result<i32> {
         println!("\nNext: from any project, run   tokenstash need OPENAI_API_KEY");
     }
     Ok(0)
+}
+
+/// Add `[mcp_servers.tokenstash]` to Codex's config.toml. The file is parsed as TOML so an
+/// existing entry is detected whether it is a table header or an inline table; if the file
+/// cannot be parsed it is left untouched. The entry is appended as text (not re-serialized)
+/// so the user's comments and formatting survive.
+fn merge_codex_toml(p: &Path, exe: &str) -> Result<()> {
+    let existing = match fs::read_to_string(p) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let doc: toml::Value = if existing.trim().is_empty() {
+        toml::Value::Table(Default::default())
+    } else {
+        toml::from_str(&existing).map_err(|e| anyhow::anyhow!("{} is not valid TOML ({e}); fix it or add the MCP server by hand", p.display()))?
+    };
+    if doc.get("mcp_servers").and_then(|m| m.get("tokenstash")).is_some() {
+        return Ok(()); // already configured (table header or inline table)
+    }
+    let mut s = existing;
+    if !s.is_empty() && !s.ends_with('\n') { s.push('\n'); }
+    let cmd = toml::Value::String(exe.to_string()).to_string();
+    s.push_str(&format!("\n[mcp_servers.tokenstash]\ncommand = {cmd}\nargs = [\"mcp\"]\n"));
+    // the result must itself parse
+    toml::from_str::<toml::Value>(&s).map_err(|e| anyhow::anyhow!("refusing to write {}: result would not parse ({e})", p.display()))?;
+    if let Some(parent) = p.parent() { fs::create_dir_all(parent)?; }
+    fs::write(p, s)?;
+    Ok(())
 }
 
 /// Add `mcpServers.tokenstash` to a JSON config owned by another tool. If the file exists
