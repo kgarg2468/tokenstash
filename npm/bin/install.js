@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Download the release binary for this platform into ./bin/. No runtime dependency: the
 // binary is a static Rust build. Set TOKENSTASH_BINARY to skip (e.g. brew/cargo installs).
-const fs = require("fs"), path = require("path"), https = require("https"), zlib = require("zlib"), crypto = require("crypto"), { execSync } = require("child_process");
+const fs = require("fs"), path = require("path"), https = require("https"), crypto = require("crypto"), { execSync } = require("child_process");
 if (process.env.TOKENSTASH_BINARY) process.exit(0);
 const pkg = require("../package.json");
 const plat = { darwin: "darwin", linux: "linux" }[process.platform];
@@ -29,22 +29,23 @@ function timingSafeEq(a, b) {
   return crypto.timingSafeEqual(ab, bb);
 }
 get(url, (res) => {
-  const tmp = dest + ".tar";
-  const out = fs.createWriteStream(tmp);
-  res.pipe(zlib.createGunzip()).pipe(out).on("finish", () => {
+  // keep the download COMPRESSED: the published digest covers exactly these bytes
+  const gz = dest + ".tar.gz";
+  const out = fs.createWriteStream(gz);
+  res.pipe(out).on("finish", () => {
     // verify the published digest before anything extracted is ever executed
     get(`${url}.sha256`, (sumRes) => {
       let expected = "";
       sumRes.on("data", (c) => { expected += c; });
       sumRes.on("end", () => {
         expected = (expected.match(/^[a-f0-9]{64}/m) || [])[0];
-        const actual = sha256(tmp);
+        const actual = sha256(gz);
         if (!expected || !timingSafeEq(actual, expected)) {
           console.error(`tokenstash: checksum mismatch — got ${actual}, want ${expected}. Not installing.`);
-          try { fs.unlinkSync(tmp); } catch {}
+          try { fs.unlinkSync(gz); } catch {}
           process.exit(1);
         }
-        execSync(`tar -xf "${tmp}" -C "${__dirname}"`); fs.unlinkSync(tmp); fs.chmodSync(dest, 0o755);
+        execSync(`tar -xzf "${gz}" -C "${__dirname}"`); fs.unlinkSync(gz); fs.chmodSync(dest, 0o755);
         console.log("tokenstash: installed (checksum verified). Run `tokenstash init`.");
       });
     }, 0, true);
