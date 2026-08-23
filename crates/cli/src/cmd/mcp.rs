@@ -122,6 +122,17 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
         "secrets_request" => {
             let specs: Vec<SecretSpec> = serde_json::from_value(args.get("secrets").cloned().unwrap_or(json!([])))?;
             if specs.is_empty() { anyhow::bail!("secrets must not be empty"); }
+            // One env file holds one value per name: the same name under two identities in
+            // one request is a contradiction, not something to resolve silently.
+            {
+                let mut seen: std::collections::HashMap<&str, Option<&str>> = std::collections::HashMap::new();
+                for s in &specs {
+                    let id = s.identity.as_deref();
+                    if let Some(prev) = seen.insert(s.name.as_str(), id) {
+                        if prev != id { anyhow::bail!("{} requested under two identities ({:?} and {:?}); a project env file can hold only one", s.name, prev.unwrap_or("default"), id.unwrap_or("default")); }
+                    }
+                }
+            }
             let mut results = vec![];
             for s in &specs {
                 let opts = NeedOpts {
@@ -133,17 +144,8 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
             if results.iter().any(|o| o.is_pending()) {
                 notify_pending(&app, &project, agent, &results);
                 if blocking {
-                    // Re-run per spec so each request keeps its own identity/why/url;
-                    // hits are idempotent and pending tasks are reused.
-                    let mut waited = vec![];
-                    for s in &specs {
-                        let opts = NeedOpts {
-                            req: SecretRequest { why: s.why.clone(), url: s.url.clone(), steps: s.steps.clone(), pattern: s.pattern.clone() },
-                            identity: s.identity.clone(), blocking: true, timeout, force: false, require_approval: false,
-                        };
-                        waited.extend(need::need(&app.ctx(), &project, agent, std::slice::from_ref(&s.name), &opts)?);
-                    }
-                    results = waited;
+                    // wait on the tasks already filed (each carries its own identity)
+                    need::wait(&app.ctx(), &project, &mut results, timeout)?;
                 }
             }
             let pending = results.iter().any(|o| o.is_pending());
