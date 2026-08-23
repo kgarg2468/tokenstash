@@ -13,11 +13,13 @@ use std::process::Command;
 /// in a commit-eligible file.
 pub fn write(project: &Path, env_file: &str, name: &str, value: &SecretString) -> Result<PathBuf> {
     let path = project.join(env_file);
-    // A symlink here would route the secret outside the protected path (e.g. into a
-    // tracked file or another user's config): refuse rather than follow it.
-    if path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+    let real = resolve_real(&path)?;
+    // A symlink anywhere on this path (final component OR an ancestor) would route the
+    // secret outside the protected location (a tracked file, another user's config…):
+    // refuse rather than follow it.
+    if path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) || real != path {
         anyhow::bail!(
-            "{} is a symlink — refusing to write a secret through it. Remove the link and re-run.",
+            "{} is or crosses a symlink — refusing to write a secret through it. Remove the link and re-run.",
             path.display()
         );
     }
@@ -116,6 +118,17 @@ pub fn ensure_gitignore(project: &Path, env_file: &str) -> Result<bool> {
 fn enforce_uncommittable(project: &Path, env_file: &str) -> Result<()> {
     ensure_gitignore(project, env_file)?;
     untrack(project, env_file)
+}
+
+/// Fully resolve a path's existing ancestors so writes can't slip through symlinked
+/// parent directories. Errors only if the file itself exists but can't be resolved.
+fn resolve_real(path: &Path) -> Result<PathBuf> {
+    let file_name = path.file_name().ok_or_else(|| anyhow::anyhow!("bad env path {}", path.display()))?;
+    match path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Ok(PathBuf::from(file_name)),
+        Some(parent) => Ok(parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf()).join(file_name)),
+        None => Ok(PathBuf::from(file_name)),
+    }
 }
 
 /// `git rm --cached` a tracked env file so a future `git add -A` can't pick up secrets.

@@ -98,6 +98,18 @@ fn symlinked_env_file_is_refused() {
         assert!(err.to_string().contains("symlink"), "must refuse: {err}");
         let s = std::fs::read_to_string(target.join("real.env")).unwrap();
         assert!(!s.contains("K=v"), "secret must not reach the symlink target");
+
+        // a symlinked PARENT directory must be refused too
+        std::fs::create_dir_all(dir.join("realdir")).unwrap();
+        std::os::unix::fs::symlink(dir.join("realdir"), dir.join("linkdir")).unwrap();
+        let err = envfile::write(&dir, "linkdir/.env.local", "K", &SecretString::from("v".to_string())).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "must refuse parent symlink: {err}");
+        assert!(!dir.join("realdir/.env.local").exists(), "secret must not reach the redirected directory");
+
+        // a plain nested path still works
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        envfile::write(&dir, "sub/.env.local", "K", &SecretString::from("v".to_string())).unwrap();
+        assert!(std::fs::read_to_string(dir.join("sub/.env.local")).unwrap().contains("K=v"));
     }
 }
 
