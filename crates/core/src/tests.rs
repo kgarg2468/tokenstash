@@ -60,6 +60,19 @@ fn gitignore_is_enforced_in_repos() {
 }
 
 #[test]
+fn envfile_rejects_escaping_paths() {
+    let dir = tmp("env-escape");
+    for bad in ["/tmp/elsewhere/.env.local", "../.env.local", "a/.././../evil", ""] {
+        assert!(
+            envfile::write(&dir, bad, "K", &SecretString::from("v".to_string())).is_err(),
+            "must refuse '{bad}'"
+        );
+    }
+    // nothing may have been written outside
+    assert!(std::fs::read_dir(&dir).unwrap().count() == 0, "project dir must stay empty");
+}
+
+#[test]
 fn tracked_env_file_is_untracked_before_write() {
     if std::process::Command::new("git").arg("--version").output().is_err() {
         return; // no git in this environment
