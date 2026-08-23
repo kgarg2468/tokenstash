@@ -87,6 +87,21 @@ fn tracked_env_file_is_untracked_before_write() {
 }
 
 #[test]
+fn symlinked_env_file_is_refused() {
+    #[cfg(unix)]
+    {
+        let dir = tmp("symlink-env");
+        let target = tmp("symlink-target");
+        std::fs::write(target.join("real.env"), "EXISTING=1\n").unwrap();
+        std::os::unix::fs::symlink(target.join("real.env"), dir.join(".env.local")).unwrap();
+        let err = envfile::write(&dir, ".env.local", "K", &SecretString::from("v".to_string())).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "must refuse: {err}");
+        let s = std::fs::read_to_string(target.join("real.env")).unwrap();
+        assert!(!s.contains("K=v"), "secret must not reach the symlink target");
+    }
+}
+
+#[test]
 fn trust_gate_logic() {
     let dir = tmp("trust");
     let db = Db::open(&dir.join("t.db")).unwrap();

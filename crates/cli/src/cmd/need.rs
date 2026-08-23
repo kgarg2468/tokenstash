@@ -103,11 +103,12 @@ pub fn notify_pending(app: &App, project: &std::path::Path, agent: &str, outcome
     notify::ensure_inbox(&app.cfg);
     let pending: Vec<&str> = outcomes.iter().filter(|o| o.is_pending()).map(|o| o.name()).collect();
     let first_id = outcomes.iter().find_map(|o| match o { Outcome::Pending { task_id, .. } => Some(task_id.clone()), _ => None });
+    let link = crate::notify::verified_inbox_link(&app.cfg, first_id.as_deref()).unwrap_or_else(|| "start it from a terminal: `tokenstash open`".into());
     notify::desktop(
         &app.cfg,
         &format!("{} needs {}", tokenstash_core::project::short(project), pending.join(", ")),
         &format!("requested by {agent}"),
-        &util::inbox_link(&app.cfg, first_id.as_deref()),
+        &link,
     );
 }
 
@@ -159,7 +160,8 @@ pub fn ask(a: AskArgs) -> Result<i32> {
         HumanRequest { title: a.title.clone(), why: a.why.clone(), url: a.url.clone(), steps: a.steps.clone(), expects: a.expects.clone() },
     )?;
     notify::ensure_inbox(&app.cfg);
-    notify::desktop(&app.cfg, &t.title, &format!("{} · {agent}", tokenstash_core::project::short(&project)), &util::inbox_link(&app.cfg, Some(&t.id)));
+    let link = crate::notify::verified_inbox_link(&app.cfg, Some(&t.id)).unwrap_or_else(|| "start it from a terminal: `tokenstash open`".into());
+    notify::desktop(&app.cfg, &t.title, &format!("{} · {agent}", tokenstash_core::project::short(&project)), &link);
     let mut task = t;
     if a.blocking {
         let start = std::time::Instant::now();

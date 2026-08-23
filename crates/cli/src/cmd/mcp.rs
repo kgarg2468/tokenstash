@@ -156,7 +156,8 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
                 expects: args.get("expects").and_then(|v| v.as_str()).unwrap_or("confirm").to_string(),
             })?;
             crate::notify::ensure_inbox(&app.cfg);
-            crate::notify::desktop(&app.cfg, &t.title, &format!("{} · {agent}", tokenstash_core::project::short(&project)), &util::inbox_link(&app.cfg, Some(&t.id)));
+            let link = crate::notify::verified_inbox_link(&app.cfg, Some(&t.id)).unwrap_or_else(|| "start it from a terminal: `tokenstash open`".into());
+            crate::notify::desktop(&app.cfg, &t.title, &format!("{} · {agent}", tokenstash_core::project::short(&project)), &link);
             let mut task = t;
             if blocking {
                 let start = std::time::Instant::now();
