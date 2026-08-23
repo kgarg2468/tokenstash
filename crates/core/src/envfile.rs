@@ -48,10 +48,12 @@ pub fn write(project: &Path, env_file: &str, name: &str, value: &SecretString) -
         out.push_str(&quote(value.expose_secret()));
         out.push('\n');
     }
+    // Ignore protection is confirmed BEFORE the secret lands: if .gitignore cannot be
+    // safely updated, nothing is written.
+    ensure_gitignore(project, env_file)?;
     // Atomic, 0600 from the first byte, and refuses a symlinked env file so a project
     // cannot redirect secret writes to an arbitrary target.
     crate::fsutil::write_atomic_private(&path, &out).with_context(|| format!("writing {}", path.display()))?;
-    ensure_gitignore(project, env_file)?;
     Ok(path)
 }
 
@@ -104,19 +106,47 @@ pub fn parse_line(line: &str) -> Option<(String, String)> {
     Some((k.trim().to_string(), val))
 }
 
-/// Does one .gitignore line cover `file` (a bare filename at any depth)? Handles exact
-/// names, a leading `/`, and `*`/`?` globs. Negations and directory rules never count.
-/// Conservative: when unsure, say "not covered" and append an explicit line.
+/// Git semantics: rules are evaluated in order and the LAST matching rule wins, so a later
+/// `!name` re-includes the file. We fold over the lines tracking that state. Anything we
+/// cannot evaluate (directory rules, path-anchored patterns) neither covers nor uncovers.
+/// Conservative: when the final state is not "ignored", append an explicit rule at the
+/// end, which then wins.
+pub fn gitignore_covers(contents: &str, file: &str) -> bool {
+    let mut ignored = false;
+    for raw in contents.lines() {
+        let l = raw.trim();
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        let (negated, pat) = match l.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, l),
+        };
+        if let Some(m) = ignore_line_matches(pat, file) {
+            if m {
+                ignored = !negated;
+            }
+        }
+    }
+    ignored
+}
+
+/// Does one (un-negated) pattern apply to `file`, a bare filename at any depth?
+/// Returns None when the rule is not evaluable (directory rule, path-anchored pattern).
+fn ignore_line_matches(pat: &str, file: &str) -> Option<bool> {
+    if pat.ends_with('/') {
+        return None;
+    }
+    let pat = pat.strip_prefix('/').unwrap_or(pat);
+    if pat.contains('/') {
+        return None;
+    }
+    Some(glob_match(pat, file))
+}
+
+/// Convenience for a single positive line (kept for callers/tests).
 pub fn ignore_line_covers(line: &str, file: &str) -> bool {
-    let l = line.trim();
-    if l.is_empty() || l.starts_with('#') || l.starts_with('!') || l.ends_with('/') {
-        return false;
-    }
-    let l = l.strip_prefix('/').unwrap_or(l);
-    if l.contains('/') {
-        return false; // path-anchored rules are not evaluated
-    }
-    glob_match(l, file)
+    gitignore_covers(line, file)
 }
 
 fn glob_match(pat: &str, s: &str) -> bool {
@@ -176,8 +206,7 @@ pub fn ensure_gitignore(project: &Path, env_file: &str) -> Result<bool> {
         anyhow::bail!("{} is a symlink; refusing to modify it (and cannot guarantee {env_file} stays uncommitted)", gi.display());
     }
     let existing = if gi.exists() { fs::read_to_string(&gi)? } else { String::new() };
-    let covered = existing.lines().map(str::trim).any(|l| ignore_line_covers(l, env_file));
-    if covered {
+    if gitignore_covers(&existing, env_file) {
         return Ok(false);
     }
     let mut s = existing;
