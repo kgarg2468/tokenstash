@@ -7,7 +7,7 @@ const pkg = require("../package.json");
 const plat = { darwin: "darwin", linux: "linux" }[process.platform];
 const arch = { x64: "x64", arm64: "arm64" }[process.arch];
 if (!plat || !arch) { console.error(`tokenstash: no prebuilt binary for ${process.platform}/${process.arch}; install with cargo: cargo install tokenstash`); process.exit(0); }
-const url = `https://github.com/tokenstash/tokenstash/releases/download/v${pkg.version}/tokenstash-${plat}-${arch}.tar.gz`;
+const url = `https://github.com/kgarg2468/tokenstash/releases/download/v${pkg.version}/tokenstash-${plat}-${arch}.tar.gz`;
 const dest = path.join(__dirname, "tokenstash");
 function get(u, cb, n = 0) {
   https.get(u, (r) => {

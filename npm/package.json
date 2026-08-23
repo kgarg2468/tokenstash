@@ -6,7 +6,7 @@
   "scripts": { "postinstall": "node bin/install.js" },
   "files": ["bin"],
   "license": "MIT",
-  "repository": "github:tokenstash/tokenstash",
+  "repository": "github:kgarg2468/tokenstash",
   "homepage": "https://tokenstash.sh",
   "keywords": ["api-keys", "secrets", "agents", "claude-code", "codex", "cursor", "mcp"],
   "engines": { "node": ">=18" }
