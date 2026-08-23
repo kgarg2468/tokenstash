@@ -164,14 +164,18 @@ impl Stash for FileStash {
         Ok(self.read()?.remove(key).map(SecretString::from))
     }
     fn set(&self, key: &str, value: &SecretString) -> Result<()> {
-        let mut m = self.read()?;
-        m.insert(key.to_string(), value.expose_secret().to_string());
-        self.write(&m)
+        crate::fsutil::with_lock(&self.path, || {
+            let mut m = self.read()?;
+            m.insert(key.to_string(), value.expose_secret().to_string());
+            self.write(&m)
+        })
     }
     fn delete(&self, key: &str) -> Result<bool> {
-        let mut m = self.read()?;
-        let had = m.remove(key).is_some();
-        self.write(&m)?;
-        Ok(had)
+        crate::fsutil::with_lock(&self.path, || {
+            let mut m = self.read()?;
+            let had = m.remove(key).is_some();
+            self.write(&m)?;
+            Ok(had)
+        })
     }
 }
