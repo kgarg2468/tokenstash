@@ -134,11 +134,14 @@ const BENIGN_ENV: &[&str] = &[
 ];
 
 fn should_redact_inherited(name: &str, value: &str) -> bool {
-    if value.chars().count() < tokenstash_core::tasks::MIN_SECRET_CHARS {
+    if value.is_empty() {
         return false;
     }
     if tokenstash_core::registry::lookup(name).is_some() {
-        return true; // known secret names always count, whatever the value looks like
+        return true; // known secret names always count, whatever the value looks like (the Redactor handles short values as whole tokens)
+    }
+    if value.chars().count() < tokenstash_core::tasks::MIN_SECRET_CHARS {
+        return false;
     }
     let u = name.to_ascii_uppercase();
     if BENIGN_ENV.contains(&u.as_str()) || u.starts_with("LC_") || u.starts_with("XDG_") || u.starts_with("TOKENSTASH_") {
