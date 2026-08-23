@@ -19,6 +19,12 @@ pub fn write(project: &Path, env_file: &str, name: &str, value: &SecretString) -
     if fs::symlink_metadata(&path).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
         anyhow::bail!("{} is a symlink; refusing to write a secret through it", path.display());
     }
+    if is_git_tracked(project, &path) {
+        anyhow::bail!(
+            "{} is tracked by git, so .gitignore cannot keep it out of the next commit. Run `git rm --cached {}` (keeps the local file) and re-run.",
+            path.display(), env_file
+        );
+    }
     let existing = if path.exists() { fs::read_to_string(&path)? } else { String::new() };
     let mut out = String::with_capacity(existing.len() + 64);
     let mut replaced = false;
@@ -96,6 +102,23 @@ pub fn parse_line(line: &str) -> Option<(String, String)> {
         v.split('#').next().unwrap_or("").trim().to_string()
     };
     Some((k.trim().to_string(), val))
+}
+
+/// Is this path in the git index? An ignore rule does nothing for a file that is already
+/// tracked. Best effort: if git cannot be run, assume not tracked (the .gitignore path
+/// still applies).
+pub fn is_git_tracked(project: &Path, path: &Path) -> bool {
+    let Some(root) = git_root(project) else { return false };
+    let Ok(rel) = path.strip_prefix(&root) else { return false };
+    std::process::Command::new("git")
+        .arg("-C").arg(&root)
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(rel)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|st| st.success())
+        .unwrap_or(false)
 }
 
 /// Walk up to find a git repo root.
