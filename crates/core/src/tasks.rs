@@ -206,14 +206,20 @@ pub fn answer_secret(ctx: &Ctx, task: &Task, value: SecretString, skip_liveness:
             Some(sp) => validate::matches_pattern(sp, &value)?,
             None => false,
         };
-    let injected_to = store_and_inject(ctx, &name, &task.identity, &value, provider.map(|p| p.provider.clone()), task.url.clone(), sensitive, Path::new(&task.project), &task.agent)?;
-    // If this fails the value is stored but the task stays pending and would be asked again;
-    // surface it instead of reporting success.
-    ctx.db.set_task_status(&task.id, TaskStatus::Answered, None).with_context(|| format!("secret stored and injected, but task {} could not be marked answered", task.id))?;
+    let injected_to = store_and_inject(
+        ctx, &name, &task.identity, &value, provider.map(|p| p.provider.clone()), task.url.clone(), sensitive,
+        Path::new(&task.project), &task.agent, Some(&task.id),
+    )?;
     Ok(AnswerResult::Stored { injected_to, sensitive, liveness })
 }
 
 /// Shared by `answer_secret` and auto-generated secrets.
+///
+/// Order matters: keychain first (the value's home), then ONE transaction that records the
+/// index entry, the project approval, the audit row, and — when answering a task — the
+/// task's answered status. Injection into the env file happens last; if it fails the task
+/// is already answered and the value already stored, so a re-run of `need` hits and
+/// injects rather than asking the human again.
 #[allow(clippy::too_many_arguments)]
 pub fn store_and_inject(
     ctx: &Ctx,
@@ -225,8 +231,11 @@ pub fn store_and_inject(
     sensitive: bool,
     project: &Path,
     agent: &str,
+    answering_task: Option<&str>,
 ) -> Result<Option<PathBuf>> {
     ctx.stash.set(&stash_key(name, identity), value)?;
+    let pid = project.to_string_lossy().to_string();
+    let tx = ctx.db.conn.unchecked_transaction()?;
     ctx.db.upsert_secret(&crate::db::SecretMeta {
         name: name.into(),
         identity: identity.into(),
@@ -237,10 +246,13 @@ pub fn store_and_inject(
         last_used: Some(crate::now()),
         stale: false,
     })?;
-    let pid = project.to_string_lossy().to_string();
     ctx.db.audit(Some(&pid), Some(agent), "store", Some(name), Some(identity), None)?;
     // The human just handled this key for this project: that is the approval.
     ctx.db.approve(&pid, name)?;
+    if let Some(tid) = answering_task {
+        ctx.db.set_task_status(tid, TaskStatus::Answered, None)?;
+    }
+    tx.commit().context("recording the stored secret")?;
     let injected_to = if project.is_dir() {
         let p = crate::envfile::write(project, &ctx.cfg.env_file, name, value)?;
         ctx.db.audit(Some(&pid), Some(agent), "inject", Some(name), Some(identity), None)?;
@@ -289,6 +301,13 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, allow: bool) -> Result<AnswerResu
 pub fn answer_human(ctx: &Ctx, task: &Task, note: Option<&str>) -> Result<AnswerResult> {
     if task.kind != TaskKind::Human {
         bail!("task {} is not a human task", task.id);
+    }
+    // Text answers are returned to the agent and shown in task history. A credential must
+    // never travel that path; refuse it here rather than trying to redact it later.
+    if let Some(n) = note {
+        if validate::looks_like_secret(n) {
+            bail!("that answer looks like a credential; it would be shown to the agent. Decline this task and have the agent request it with `tokenstash need NAME` instead.");
+        }
     }
     ctx.db.set_task_status(&task.id, TaskStatus::Answered, note)?;
     ctx.db.audit(Some(&task.project), Some(&task.agent), "human.done", None, None, Some(&task.title))?;

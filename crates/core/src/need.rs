@@ -100,7 +100,7 @@ pub fn need(ctx: &Ctx, project: &Path, agent: &str, names: &[String], opts: &Nee
         // Miss. Generate locally if the registry says so.
         if let Some(spec) = provider.and_then(|p| p.generate.as_deref()) {
             if let Some(v) = generate(spec) {
-                let p = tasks::store_and_inject(ctx, name, &identity, &v, provider.map(|p| p.provider.clone()), None, false, project, agent)?;
+                let p = tasks::store_and_inject(ctx, name, &identity, &v, provider.map(|p| p.provider.clone()), None, false, project, agent, None)?;
                 outcomes.push(Outcome::Injected { name: name.clone(), identity, written_to: p.map(|p| p.display().to_string()).unwrap_or_default(), generated: true });
                 continue;
             }

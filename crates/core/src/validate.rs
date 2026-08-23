@@ -70,3 +70,27 @@ pub fn liveness(check: &Check, value: &SecretString) -> Liveness {
 fn redact_err(msg: &str, v: &str) -> String {
     crate::redact::Redactor::new().with(&SecretString::from(v.to_string())).redact(msg)
 }
+
+/// Heuristic used to refuse a free-text human answer that is actually a credential. Matches
+/// any registry key pattern, or a single long token with no whitespace (API keys, JWTs,
+/// connection strings). Free-text answers are returned to the agent; secrets must go
+/// through the secret flow where they are never emitted.
+pub fn looks_like_secret(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    for p in crate::registry::all() {
+        if let Some(pat) = &p.pattern {
+            if regex::Regex::new(pat).map(|re| re.is_match(t)).unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+    let single_token = !t.chars().any(char::is_whitespace);
+    let long = t.chars().count() >= 24;
+    let has_digit = t.chars().any(|c| c.is_ascii_digit());
+    let has_alpha = t.chars().any(|c| c.is_ascii_alphabetic());
+    let url_with_creds = t.contains("://") && t.contains('@');
+    (single_token && long && has_digit && has_alpha) || url_with_creds
+}
