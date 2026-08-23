@@ -425,3 +425,56 @@ fn tracked_env_file_is_refused_until_untracked() {
     assert!(envfile::has(&dir, ".env.local", "K"));
     assert!(std::fs::read_to_string(dir.join(".gitignore")).unwrap().lines().any(|l| l == ".env.local"));
 }
+
+#[test]
+fn gitignore_coverage_is_glob_matched_not_assumed() {
+    use envfile::ignore_line_covers as c;
+    assert!(c(".env.local", ".env.local"));
+    assert!(c("/.env.local", ".env.local"));
+    assert!(c(".env*", ".env.local"));
+    assert!(c("*.local", ".env.local"));
+    assert!(c(".env.*", ".env.local"));
+    assert!(c("*", ".env.local"));
+    assert!(!c(".env*", "credentials.txt"), "pattern must actually match the configured name");
+    assert!(!c("*.local", "secrets.env"));
+    assert!(!c("!.env.local", ".env.local"), "negation is not coverage");
+    assert!(!c(".env.local/", ".env.local"), "directory rule is not coverage");
+    assert!(!c("config/.env.local", ".env.local"), "path-anchored rules are not evaluated");
+    assert!(!c("# .env.local", ".env.local"));
+    assert!(c(".env.?ocal", ".env.local"));
+    // end to end with a non-default name and a misleading existing rule
+    let dir = tmp("gi-glob");
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::write(dir.join(".gitignore"), ".env*\n").unwrap();
+    envfile::write(&dir, "credentials.txt", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap();
+    let gi = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+    assert!(gi.lines().any(|l| l == "credentials.txt"), "explicit rule must be appended: {gi}");
+}
+
+#[test]
+fn approvals_follow_the_resolved_project_not_the_symlink() {
+    let _env = env_lock();
+    let home = tmp("approval-link-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let base = tmp("approval-link");
+    let a = base.join("a"); let b = base.join("b"); std::fs::create_dir_all(&a).unwrap(); std::fs::create_dir_all(&b).unwrap();
+    let link = base.join("current");
+    std::os::unix::fs::symlink(&a, &link).unwrap();
+    let cfg = Config { trust_roots: vec![], ..Default::default() }; // nothing trusted: every project needs approval
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    stash.set(&stash::stash_key("OPENAI_API_KEY", "default"), &SecretString::from("sk-aaaaaaaaaaaa".to_string())).unwrap();
+    // approve via the symlink while it points at a
+    let out = need::need(&ctx, &link, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
+    tasks::answer_approval(&ctx, &db.get_task(&tid).unwrap().unwrap(), true).unwrap();
+    assert!(envfile::has(&a, ".env.local", "OPENAI_API_KEY"));
+    // retarget the symlink at b: the approval must not carry over
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&b, &link).unwrap();
+    let out = need::need(&ctx, &link, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    assert!(matches!(out[0], need::Outcome::Pending { .. }), "retargeted symlink must need its own approval");
+    assert!(!envfile::has(&b, ".env.local", "OPENAI_API_KEY"));
+}
