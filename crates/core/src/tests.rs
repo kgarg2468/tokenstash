@@ -60,6 +60,33 @@ fn gitignore_is_enforced_in_repos() {
 }
 
 #[test]
+fn tracked_env_file_is_untracked_before_write() {
+    if std::process::Command::new("git").arg("--version").output().is_err() {
+        return; // no git in this environment
+    }
+    let dir = tmp("tracked-env");
+    let git = |args: &[&str]| {
+        std::process::Command::new("git").args(args).current_dir(&dir).output().unwrap();
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(dir.join(".env.local"), "EXISTING=1\n").unwrap();
+    git(&["add", ".env.local"]);
+    git(&["commit", "-qm", "tracked env file"]);
+    let tracked = || {
+        String::from_utf8(
+            std::process::Command::new("git").args(["ls-files", "--", ".env.local"]).current_dir(&dir).output().unwrap().stdout,
+        ).unwrap()
+    };
+    assert!(!tracked().trim().is_empty(), "precondition: file is tracked");
+    envfile::write(&dir, ".env.local", "K", &SecretString::from("v".to_string())).unwrap();
+    assert!(tracked().trim().is_empty(), "env file must be untracked before a secret is written");
+    let s = std::fs::read_to_string(dir.join(".env.local")).unwrap();
+    assert!(s.contains("K=v"));
+}
+
+#[test]
 fn trust_gate_logic() {
     let dir = tmp("trust");
     let db = Db::open(&dir.join("t.db")).unwrap();
