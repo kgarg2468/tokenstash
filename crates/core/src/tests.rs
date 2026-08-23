@@ -478,3 +478,32 @@ fn approvals_follow_the_resolved_project_not_the_symlink() {
     assert!(matches!(out[0], need::Outcome::Pending { .. }), "retargeted symlink must need its own approval");
     assert!(!envfile::has(&b, ".env.local", "OPENAI_API_KEY"));
 }
+
+#[test]
+fn approval_injects_the_requested_identity() {
+    let _env = env_lock();
+    let home = tmp("approval-ident-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("approval-ident-proj").canonicalize().unwrap();
+    let cfg = Config { trust_roots: vec![], ..Default::default() }; // untrusted → approval needed
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    stash.set("OPENAI_API_KEY@default", &SecretString::from("sk-defaultdefault".to_string())).unwrap();
+    stash.set("OPENAI_API_KEY@work", &SecretString::from("sk-workworkwork1".to_string())).unwrap();
+    let opts = need::NeedOpts { identity: Some("work".into()), ..Default::default() };
+    let out = need::need(&ctx, &proj, "t", &["OPENAI_API_KEY".to_string()], &opts).unwrap();
+    let tid = match &out[0] { need::Outcome::Pending { task_id, identity, .. } => { assert_eq!(identity, "work"); task_id.clone() } o => panic!("{o:?}") };
+    let t = db.get_task(&tid).unwrap().unwrap();
+    assert!(t.names.contains(&"OPENAI_API_KEY@work".to_string()), "approval must record the identity: {:?}", t.names);
+    tasks::answer_approval(&ctx, &t, true).unwrap();
+    let env = std::fs::read_to_string(proj.join(".env.local")).unwrap();
+    assert!(env.contains("OPENAI_API_KEY=sk-workworkwork1"), "must inject the work identity, got: {env}");
+    assert!(!env.contains("sk-defaultdefault"));
+    // the blocking waiter reports the requested identity too
+    std::fs::remove_file(proj.join(".env.local")).unwrap();
+    let out = need::need(&ctx, &proj, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts { identity: Some("work".into()), blocking: true, timeout: std::time::Duration::from_millis(200), ..Default::default() }).unwrap();
+    assert!(matches!(&out[0], need::Outcome::Injected { identity, .. } if identity == "work"), "{:?}", out[0]);
+    assert!(std::fs::read_to_string(proj.join(".env.local")).unwrap().contains("sk-workworkwork1"));
+}
