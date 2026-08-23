@@ -57,7 +57,10 @@ cat > "$PROJ/echo3.sh" <<'SH'
 echo "cookie=$SESSION_COOKIE path=$PATH"
 SH
 chmod +x "$PROJ/echo3.sh"
-PREFIX_DIR="$(echo "$PATH" | cut -d: -f1)"
+# an EXISTING directory that is a prefix of PATH (a nonexistent one is rightly redacted)
+PREFIX_DIR=""; IFS=: ; for d in $PATH; do [ -d "$d" ] && { PREFIX_DIR="$d"; break; }; done; unset IFS
+# and the echoed PATH must begin with that existing entry for the assertion to be meaningful
+export PATH="$PREFIX_DIR:$PATH"
 SESSION_COOKIE="$INHERITED-cookie" MY_TOOL_HOME="$PREFIX_DIR" "$TS" run -- "$PROJ/echo3.sh" >"$OUT/run4.txt" 2>&1 || true
 grep -q "$INHERITED-cookie" "$OUT/run4.txt" && { echo "LEAK: inherited SESSION_COOKIE echoed by child"; exit 1; }
 grep -q "path=/" "$OUT/run4.txt" || { echo "benign PATH must not be redacted"; exit 1; }
