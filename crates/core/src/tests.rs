@@ -51,12 +51,26 @@ fn gitignore_is_enforced_in_repos() {
     std::fs::create_dir_all(&sub).unwrap();
     envfile::write(&sub, ".env.local", "K", &SecretString::from("v".to_string())).unwrap();
     let gi = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
-    assert!(gi.lines().any(|l| l == ".env.local"));
+    assert!(gi.lines().any(|l| l == "packages/app/.env.local"), "{gi}");
     // idempotent
     assert!(!envfile::ensure_gitignore(&sub, ".env.local").unwrap());
     // already covered by a glob
     std::fs::write(dir.join(".gitignore"), ".env*\n").unwrap();
     assert!(!envfile::ensure_gitignore(&sub, ".env.local").unwrap());
+}
+
+#[test]
+fn gitignore_covers_nested_env_files_from_subprojects() {
+    // a nested env_file below a subproject must be ignored relative to the REPO root,
+    // or `git add -A` would still stage it (rules with a slash are root-anchored)
+    let dir = tmp("git-nested");
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::write(dir.join(".gitignore"), "").unwrap();
+    let proj = dir.join("packages/app/sub");
+    std::fs::create_dir_all(&proj).unwrap();
+    envfile::write(&proj, "inner.env.local", "K", &SecretString::from("v".to_string())).unwrap();
+    let gi = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+    assert!(gi.lines().any(|l| l == "packages/app/sub/inner.env.local"), "{gi}");
 }
 
 #[test]

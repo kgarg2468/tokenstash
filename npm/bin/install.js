@@ -7,7 +7,7 @@
 // substituted binary that passes verification. A checksum fetched from the same place as
 // the archive would prove nothing, so none is downloaded. Set TOKENSTASH_BINARY to skip
 // (e.g. brew/cargo installs).
-const fs = require("fs"), path = require("path"), https = require("https"), crypto = require("crypto"), { execSync } = require("child_process");
+const fs = require("fs"), path = require("path"), https = require("https"), crypto = require("crypto"), { execFileSync } = require("child_process");
 if (process.env.TOKENSTASH_BINARY) process.exit(0);
 const pkg = require("../package.json");
 const plat = { darwin: "darwin", linux: "linux" }[process.platform];
@@ -39,7 +39,8 @@ get(url, (res) => {
       try { fs.unlinkSync(gz); } catch {}
       process.exit(1);
     }
-    execSync(`tar -xzf "${gz}" -C "${__dirname}"`);
+    // no shell interpolation: __dirname may contain characters the shell would eat
+    execFileSync("tar", ["-xzf", gz, "-C", __dirname]);
     fs.unlinkSync(gz);
     fs.chmodSync(dest, 0o755);
     console.log("tokenstash: installed (checksum verified against the digest pinned in this package). Run `tokenstash init`.");

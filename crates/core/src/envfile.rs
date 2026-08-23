@@ -122,13 +122,18 @@ pub fn git_root(start: &Path) -> Option<PathBuf> {
 }
 
 /// If inside a git repo, make sure `.gitignore` at the root ignores the env file.
+/// The entry is written relative to the repo root (where Git anchors rules containing
+/// a slash), so subproject installs like `packages/app` + `sub/.env.local` are covered.
 pub fn ensure_gitignore(project: &Path, env_file: &str) -> Result<bool> {
     let Some(root) = git_root(project) else { return Ok(false) };
+    let rel = project.strip_prefix(&root).unwrap_or(Path::new("")).join(env_file);
+    let rel = rel.to_string_lossy().to_string();
     let gi = root.join(".gitignore");
     let existing = if gi.exists() { fs::read_to_string(&gi)? } else { String::new() };
     let covered = existing.lines().map(str::trim).any(|l| {
         l == env_file
             || l == format!("/{env_file}")
+            || (rel != env_file && (l == rel || l == format!("/{rel}")))
             || l == "*.local"
             || l == ".env*"
             || l == ".env.*"
@@ -142,7 +147,7 @@ pub fn ensure_gitignore(project: &Path, env_file: &str) -> Result<bool> {
         s.push('\n');
     }
     s.push_str("# added by tokenstash — never commit injected secrets\n");
-    s.push_str(env_file);
+    s.push_str(&rel);
     s.push('\n');
     fs::write(&gi, s)?;
     Ok(true)
