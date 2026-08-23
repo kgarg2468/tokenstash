@@ -94,6 +94,13 @@ fn spawn(cmd: &[String], extra: &HashMap<String, String>) -> Result<(i32, String
     for v in extra.values() {
         redactor.add(&SecretString::from(v.clone()));
     }
+    // The child also inherits our own environment. Anything there under a secret-looking
+    // name (registry names, or *KEY/*TOKEN/*SECRET/*PASSWORD/*CREDENTIAL*) is redacted too.
+    for (k, v) in std::env::vars() {
+        if v.len() >= tokenstash_core::tasks::MIN_SECRET_CHARS && secret_like_name(&k) {
+            redactor.add(&SecretString::from(v));
+        }
+    }
     let redactor = std::sync::Arc::new(redactor);
     let mut c = Command::new(&cmd[0]);
     c.args(&cmd[1..]).envs(extra).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -107,6 +114,14 @@ fn spawn(cmd: &[String], extra: &HashMap<String, String>) -> Result<(i32, String
     let mut captured = t1.join().unwrap_or_default();
     captured.push_str(&t2.join().unwrap_or_default());
     Ok((status.code().unwrap_or(1), captured))
+}
+
+fn secret_like_name(name: &str) -> bool {
+    if tokenstash_core::registry::lookup(name).is_some() {
+        return true;
+    }
+    let u = name.to_ascii_uppercase();
+    ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH", "DSN", "PRIVATE"].iter().any(|m| u.contains(m))
 }
 
 fn tee<R: std::io::Read>(r: R, is_err: bool, redactor: &Redactor) -> String {
