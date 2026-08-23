@@ -12,6 +12,11 @@ use std::process::Command;
 /// untracking a previously committed file), so a failure here can never leave a secret
 /// in a commit-eligible file.
 pub fn write(project: &Path, env_file: &str, name: &str, value: &SecretString) -> Result<PathBuf> {
+    // The env file must live inside the project: an absolute path would silently
+    // bypass every git protection below (and could point anywhere on disk).
+    if Path::new(env_file).is_absolute() || env_file.split('/').any(|c| c == "..") || env_file.is_empty() {
+        anyhow::bail!("env file must be a relative path inside the project, got '{env_file}'");
+    }
     // Anchor at the canonicalized project root so a symlinked TMPDIR-style prefix
     // (/var/folders → /private/var/folders on macOS) doesn't look like an attack;
     // only symlinks introduced by env_file itself should trip the guard below.
@@ -51,11 +56,25 @@ pub fn write(project: &Path, env_file: &str, name: &str, value: &SecretString) -
         out.push_str(&quote(value.expose_secret()));
         out.push('\n');
     }
-    fs::write(&path, out).with_context(|| format!("writing {}", path.display()))?;
+    // Write to a 0600 temp file in the same directory, then atomically rename it over
+    // the destination. rename() replaces (never follows) a final-component symlink and
+    // closes the check-then-write race on the file itself.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let tmp = path.with_file_name(format!(
+            ".{}.tokenstash-{}.tmp",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            std::process::id()
+        ));
+        let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        f.write_all(out.as_bytes())?;
+        fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(&path, out).with_context(|| format!("writing {}", path.display()))?;
     }
     Ok(path)
 }
