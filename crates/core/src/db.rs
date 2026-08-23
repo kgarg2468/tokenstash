@@ -10,6 +10,26 @@ pub struct Db {
     pub conn: Connection,
 }
 
+/// The index holds no values, but task/approval/binding metadata is still private.
+#[cfg(unix)]
+fn restrict_dir(p: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+#[cfg(unix)]
+fn restrict_file(p: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if p.exists() {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+#[cfg(not(unix))]
+fn restrict_dir(_p: &Path) -> Result<()> { Ok(()) }
+#[cfg(not(unix))]
+fn restrict_file(_p: &Path) -> Result<()> { Ok(()) }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretMeta {
     pub name: String,
@@ -104,8 +124,10 @@ impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            restrict_dir(parent)?;
         }
         let conn = Connection::open(path)?;
+        restrict_file(path)?;
         conn.execute_batch(
             r#"
             PRAGMA journal_mode=WAL;
@@ -264,17 +286,36 @@ impl Db {
         Ok(self.conn.query_row(&sql, params![id], Self::row_to_task).optional()?)
     }
 
-    /// Resolve a task id prefix (e.g. "7fa2" or "t_7fa2").
+    /// Resolve a task id: exact match, else a prefix of the id with or without its kind
+    /// prefix ("7fa2" and "t_7fa2" both resolve `t_7fa2xx`). An empty or ambiguous prefix
+    /// is an error rather than a silent guess — callers answer, approve, or deny by id.
     pub fn find_task(&self, id_or_prefix: &str) -> Result<Option<Task>> {
-        if let Some(t) = self.get_task(id_or_prefix)? {
+        let q = id_or_prefix.trim();
+        if q.is_empty() {
+            anyhow::bail!("task id is empty");
+        }
+        if !q.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            anyhow::bail!("task id '{q}' contains invalid characters");
+        }
+        if let Some(t) = self.get_task(q)? {
             return Ok(Some(t));
         }
-        let sql = format!("SELECT {} FROM tasks WHERE id LIKE ?1 OR id LIKE ?2 ORDER BY created DESC", Self::TASK_COLS);
+        let sql = format!("SELECT {} FROM tasks ORDER BY created DESC", Self::TASK_COLS);
         let mut st = self.conn.prepare(&sql)?;
-        let rows: Vec<Task> = st
-            .query_map(params![format!("{}%", id_or_prefix), format!("%_{}%", id_or_prefix)], Self::row_to_task)?
-            .collect::<std::result::Result<_, _>>()?;
-        Ok(rows.into_iter().next())
+        let matches: Vec<Task> = st
+            .query_map([], Self::row_to_task)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|t| t.id.starts_with(q) || t.id.get(2..).map(|rest| rest.starts_with(q)).unwrap_or(false))
+            .collect();
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(matches.into_iter().next()),
+            n => anyhow::bail!(
+                "task id '{q}' is ambiguous ({n} matches: {}). Use a longer prefix.",
+                matches.iter().take(5).map(|t| t.id.as_str()).collect::<Vec<_>>().join(", ")
+            ),
+        }
     }
 
     pub fn list_tasks(&self, project: Option<&str>, only_open: bool) -> Result<Vec<Task>> {
