@@ -7,8 +7,11 @@ use crate::validate::{self, Liveness};
 use crate::{registry, Config, Db};
 use anyhow::{anyhow, bail, Context, Result};
 use rand::Rng;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use std::path::{Path, PathBuf};
+
+/// Minimum accepted length for a pasted secret.
+pub const MIN_SECRET_CHARS: usize = 6;
 
 pub struct Ctx<'a> {
     pub cfg: &'a Config,
@@ -177,6 +180,11 @@ pub fn answer_secret(ctx: &Ctx, task: &Task, value: SecretString, skip_liveness:
         bail!("task {} is already {}", task.id, task.status.as_str());
     }
     let name = task.name.clone().ok_or_else(|| anyhow!("secret task without name"))?;
+    // No real credential is this short. Refusing here keeps trivially short strings out of
+    // the stash entirely, so the redactor never has to special-case them.
+    if value.expose_secret().chars().count() < MIN_SECRET_CHARS {
+        bail!("value is shorter than {MIN_SECRET_CHARS} characters; that is not a credential. Not stored.");
+    }
     if let Some(p) = &task.pattern {
         if !validate::matches_pattern(p, &value)? {
             bail!("value does not match the expected pattern for {name} ({p}). Not stored.");

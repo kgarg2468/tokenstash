@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 /// Upsert `NAME=value` into `<project>/<env_file>`. Preserves other lines. 0600.
 pub fn write(project: &Path, env_file: &str, name: &str, value: &SecretString) -> Result<PathBuf> {
     let path = project.join(env_file);
+    if fs::symlink_metadata(&path).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+        anyhow::bail!("{} is a symlink; refusing to write a secret through it", path.display());
+    }
     let existing = if path.exists() { fs::read_to_string(&path)? } else { String::new() };
     let mut out = String::with_capacity(existing.len() + 64);
     let mut replaced = false;
@@ -39,30 +42,11 @@ pub fn write(project: &Path, env_file: &str, name: &str, value: &SecretString) -
         out.push_str(&quote(value.expose_secret()));
         out.push('\n');
     }
-    write_private(&path, &out).with_context(|| format!("writing {}", path.display()))?;
+    // Atomic, 0600 from the first byte, and refuses a symlinked env file so a project
+    // cannot redirect secret writes to an arbitrary target.
+    crate::fsutil::write_atomic_private(&path, &out).with_context(|| format!("writing {}", path.display()))?;
     ensure_gitignore(project, env_file)?;
     Ok(path)
-}
-
-/// Create-or-truncate with 0600 from the first byte; tighten an existing file; fail loudly
-/// if permissions cannot be applied rather than leaving a readable secret behind.
-fn write_private(path: &Path, contents: &str) -> Result<()> {
-    use std::io::Write;
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(fs::Permissions::from_mode(0o600))?;
-    }
-    f.write_all(contents.as_bytes())?;
-    Ok(())
 }
 
 /// Does the env file already contain NAME= ?
