@@ -8,7 +8,7 @@ Coding agents stall on the same line every new project:
 Please provide: OPENAI_API_KEY= RESEND_API_KEY= STRIPE_SECRET_KEY=
 ```
 
-tokenstash gives the agent one command instead. If you already have the key, it's written into the project's env file instantly. If you don't, you get a desktop notification, click through to the vendor's page, paste once, and the agent resumes. **Secret values never enter the agent's context, its output, or any log.**
+tokenstash gives the agent one command instead. If you already have the key, it's written into the project's env file instantly. If you don't, the agent shows you a link (and you get a desktop notification); click it, follow the link to the vendor's page, paste once, and the agent resumes. **Secret values never enter the agent's context, its output, or any log.**
 
 ```
 agent › tokenstash need OPENAI_API_KEY RESEND_API_KEY TAVUS_API_KEY
@@ -66,7 +66,7 @@ Not a vault (use 1Password/Infisical; backends coming). Not a proxy — never in
 
 ## Security in one paragraph
 
-Values go clipboard → keychain → env file, 0600, `.gitignore` enforced on every write. CLI output, MCP results, the SQLite index, the audit log, and errors are all value-free, and CI proves it with a canary ([`scripts/leak-test.sh`](scripts/leak-test.sh)). The inbox binds `127.0.0.1` and, because loopback is not authentication, requires a 32-byte session token (`$TOKENSTASH_HOME/inbox.token`, 0600): it arrives as `?t=` on the link you click, becomes an `HttpOnly; SameSite=Strict` cookie, and every form posts it back as a CSRF double-submit. Anything without it gets an empty 404. The token goes to *you* — the notification, `tokenstash open`, a terminal — and never to the agent, so a model can request a key but cannot answer its own request or approve its own trust gate. A stash miss always involves you; a stash hit is silent only inside your trust roots for non-sensitive keys.
+Values go clipboard → keychain → env file, 0600, `.gitignore` enforced on every write. CLI output, MCP results, the SQLite index, the audit log, and errors are all value-free, and CI proves it with a canary ([`scripts/leak-test.sh`](scripts/leak-test.sh)). The inbox binds `127.0.0.1` and, because loopback is not authentication, every request needs a session: a 32-byte token arrives as `?t=` on the link you click, becomes an `HttpOnly; SameSite=Strict` cookie, and every form posts it back as a CSRF double-submit. Anything without one gets an empty 404. There are two sessions. The link the agent shows you carries the **paste-scope** token: it can answer a missing-key card and human tasks, so you click straight from the chat — but it cannot approve, so a model can request a key yet never approve its own request. The **full-scope** token (approvals too) reaches you only through channels you trigger — the desktop notification, `tokenstash open`, a terminal — and once your browser holds it, every agent link is fully capable (`inbox_links = "full"` in config hands agents the full link outright). A stash miss always involves you; a stash hit is silent only inside your trust roots for non-sensitive keys.
 
 ## Adding a provider
 
