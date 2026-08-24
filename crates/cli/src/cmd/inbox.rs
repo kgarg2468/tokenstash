@@ -1,11 +1,18 @@
 //! Localhost inbox: the human surface. One click from the notification to the vendor's page,
 //! paste, submit. Binds 127.0.0.1 only. Exits after 30 idle minutes with no open tasks.
+//!
+//! Loopback is not authentication — see `crate::inbox_auth` for the threat model. Every route
+//! except `/verify` requires the session token: presented as `?t=` on the first visit, then
+//! held as an `HttpOnly; SameSite=Strict` cookie. POSTs additionally carry it in a hidden form
+//! field (double submit), so a cross-site form post cannot ride the cookie into an answer.
 
+use crate::inbox_auth;
 use crate::util::App;
 use anyhow::Result;
 use clap::Args;
 use secrecy::SecretString;
 use std::collections::HashMap;
+use std::io::Read;
 use std::time::{Duration, Instant};
 use tiny_http::{Header, Request, Response, Server};
 use tokenstash_core::db::{Task, TaskKind, TaskStatus};
@@ -22,9 +29,15 @@ pub struct InboxArgs {
 
 const IDLE_EXIT: Duration = Duration::from_secs(30 * 60);
 
+/// Cap on a form post. Answers are pasted API keys, not uploads.
+const MAX_BODY: u64 = 64 * 1024;
+
 pub fn serve(a: InboxArgs) -> Result<i32> {
     let app = App::open()?;
     let port = a.port.unwrap_or(app.cfg.inbox_port);
+    // Minted here on the first ever start and reused afterwards, so a notification the human
+    // has not clicked yet still opens after the inbox has idled out and been respawned.
+    let token = inbox_auth::ensure_token()?;
     let server = match Server::http(format!("127.0.0.1:{port}")) {
         Ok(s) => s,
         Err(_) => { eprintln!("inbox already running on {port}"); return Ok(0); }
@@ -35,7 +48,7 @@ pub fn serve(a: InboxArgs) -> Result<i32> {
         match server.recv_timeout(Duration::from_secs(1)) {
             Ok(Some(req)) => {
                 last_activity = Instant::now();
-                if let Err(e) = handle(&app, req) {
+                if let Err(e) = handle(&app, req, &token) {
                     eprintln!("inbox: {e:#}");
                 }
             }
@@ -53,10 +66,66 @@ pub fn serve(a: InboxArgs) -> Result<i32> {
     }
 }
 
-fn handle(app: &App, mut req: Request) -> Result<()> {
+fn handle(app: &App, mut req: Request, token: &str) -> Result<()> {
     let url = req.url().to_string();
-    let path = url.split('?').next().unwrap_or("/").to_string();
+    let (path, query) = match url.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (url.clone(), String::new()),
+    };
+    let q = parse_form(&query);
     let method = req.method().as_str().to_string();
+
+    // The one unauthenticated route, and deliberately ahead of every other check: it is how a
+    // CLI that has not yet decided to trust this listener asks "are you the tokenstash inbox
+    // for my TOKENSTASH_HOME?" without handing over the token to find out. We answer a fresh
+    // nonce with HMAC(token, nonce); a process squatting the port cannot.
+    if path == "/verify" {
+        return match q.get("c") {
+            Some(c) if !c.is_empty() && c.len() <= inbox_auth::MAX_CHALLENGE => {
+                respond(req, 200, "text/plain", inbox_auth::verify_response(token, c))
+            }
+            _ => not_found(req),
+        };
+    }
+
+    // Defence in depth against DNS rebinding: a hostname that resolves to 127.0.0.1 carries
+    // the attacker's origin (so none of our cookies), but there is no reason to serve it.
+    if !host_is_loopback(&req) {
+        return not_found(req);
+    }
+
+    let cookie_ok = cookie(&req, inbox_auth::COOKIE).map(|c| inbox_auth::ct_eq(&c, token)).unwrap_or(false);
+    let mut body = String::new();
+    let form = if method == "POST" {
+        req.as_reader().take(MAX_BODY).read_to_string(&mut body)?;
+        parse_form(&body)
+    } else {
+        HashMap::new()
+    };
+
+    // GET: the cookie alone (SameSite=Strict stops a foreign page from making the browser
+    // send it). POST: the cookie AND a matching hidden field — double submit, so even a
+    // bypassed or unsupported SameSite cannot turn a cross-site form post into an answer.
+    let authed = match method.as_str() {
+        "POST" => cookie_ok && form.get("t").map(|t| inbox_auth::ct_eq(t, token)).unwrap_or(false),
+        _ => cookie_ok,
+    };
+    if !authed {
+        // First visit: the human clicked a `?t=<token>` URL from the notification or from
+        // `tokenstash open`. Swap it for a cookie and bounce to a clean path so the token
+        // stops appearing in the address bar, in history, and in any Referer we might send.
+        if method == "GET" {
+            if let Some(t) = q.get("t") {
+                if inbox_auth::ct_eq(t, token) {
+                    let rest: Vec<&str> = query.split('&').filter(|kv| !kv.is_empty() && !kv.starts_with("t=")).collect();
+                    let dest = if rest.is_empty() { path.clone() } else { format!("{path}?{}", rest.join("&")) };
+                    return redirect_authed(req, &dest, token);
+                }
+            }
+        }
+        return not_found(req);
+    }
+
     app.db.expire_overdue()?;
 
     if path == "/health" {
@@ -68,19 +137,16 @@ fn handle(app: &App, mut req: Request) -> Result<()> {
     }
     if path == "/" {
         let list = app.db.list_tasks(None, true)?;
-        let flash = url.split('?').nth(1).and_then(|q| parse_form(q).remove("m"));
+        let flash = q.get("m").cloned();
         return respond(req, 200, "text/html; charset=utf-8", page_index(&list, flash.as_deref()));
     }
     if let Some(id) = path.strip_prefix("/t/") {
         let id = id.trim_end_matches('/').to_string();
         let Some(task) = app.db.find_task(&id)? else { return respond(req, 404, "text/plain", "no such task".into()) };
         if method == "GET" {
-            return respond(req, 200, "text/html; charset=utf-8", page_task(&task, None));
+            return respond(req, 200, "text/html; charset=utf-8", page_task(&task, None, token));
         }
         if method == "POST" {
-            let mut body = String::new();
-            req.as_reader().read_to_string(&mut body)?;
-            let form = parse_form(&body);
             let action = form.get("action").cloned().unwrap_or_default();
             let ctx = app.ctx();
             let msg: Result<String> = (|| {
@@ -107,11 +173,42 @@ fn handle(app: &App, mut req: Request) -> Result<()> {
             })();
             return match msg {
                 Ok(m) => redirect(req, &format!("/?m={}", urlencoding::encode(&m))),
-                Err(e) => respond(req, 200, "text/html; charset=utf-8", page_task(&task, Some(&format!("{e:#}")))),
+                Err(e) => respond(req, 200, "text/html; charset=utf-8", page_task(&task, Some(&format!("{e:#}")), token)),
             };
         }
     }
-    respond(req, 404, "text/plain", "not found".into())
+    not_found(req)
+}
+
+/// Anything the caller is not authorised for looks like nothing at all: bare 404, empty body.
+/// A local process or a foreign page probing the port learns neither that an inbox is here nor
+/// that a given task id exists.
+fn not_found(req: Request) -> Result<()> {
+    let r = Response::from_string("")
+        .with_status_code(404)
+        .with_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
+    req.respond(r)?;
+    Ok(())
+}
+
+fn header<'a>(req: &'a Request, name: &'static str) -> Option<&'a str> {
+    req.headers().iter().find(|h| h.field.equiv(name)).map(|h| h.value.as_str())
+}
+
+fn cookie(req: &Request, name: &'static str) -> Option<String> {
+    header(req, "Cookie")?.split(';').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k.trim() == name).then(|| v.trim().to_string())
+    })
+}
+
+fn host_is_loopback(req: &Request) -> bool {
+    let Some(v) = header(req, "Host") else { return false };
+    let host = match v.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or_default(), // [::1]:7433
+        None => v.split(':').next().unwrap_or_default(),          // 127.0.0.1:7433
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
 fn respond(req: Request, code: u16, ctype: &str, body: String) -> Result<()> {
@@ -120,6 +217,20 @@ fn respond(req: Request, code: u16, ctype: &str, body: String) -> Result<()> {
         .with_header(Header::from_bytes("Content-Type", ctype).unwrap())
         .with_header(Header::from_bytes("Cache-Control", "no-store").unwrap())
         .with_header(Header::from_bytes("X-Frame-Options", "DENY").unwrap());
+    req.respond(r)?;
+    Ok(())
+}
+
+/// 303 that also installs the session cookie. No `Secure` attribute: this is plain HTTP on the
+/// loopback interface and `Secure` would make the browser drop the cookie outright. No
+/// `Max-Age` either — it dies with the browser session.
+fn redirect_authed(req: Request, to: &str, token: &str) -> Result<()> {
+    let set_cookie = format!("{}={token}; Path=/; HttpOnly; SameSite=Strict", inbox_auth::COOKIE);
+    let r = Response::from_string("")
+        .with_status_code(303)
+        .with_header(Header::from_bytes("Location", to).unwrap())
+        .with_header(Header::from_bytes("Set-Cookie", set_cookie.as_str()).unwrap())
+        .with_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
     req.respond(r)?;
     Ok(())
 }
@@ -158,7 +269,7 @@ ol{padding-left:20px}.row{display:flex;gap:10px;align-items:center;flex-wrap:wra
 "#;
 
 fn layout(title: &str, body: String) -> String {
-    format!("<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>{} · tokenstash</title><style>{CSS}</style></head><body><main><h1>tokenstash inbox</h1>{body}</main></body></html>", esc(title))
+    format!("<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><meta name=referrer content=no-referrer><title>{} · tokenstash</title><style>{CSS}</style></head><body><main><h1>tokenstash inbox</h1>{body}</main></body></html>", esc(title))
 }
 
 fn page_index(list: &[Task], flash: Option<&str>) -> String {
@@ -183,7 +294,14 @@ fn page_index(list: &[Task], flash: Option<&str>) -> String {
     layout("Inbox", b)
 }
 
-fn page_task(t: &Task, err: Option<&str>) -> String {
+/// The second half of the double submit. A hidden field rather than a header because these
+/// are plain HTML forms with no JavaScript.
+fn csrf_field(token: &str) -> String {
+    format!("<input type=hidden name=t value=\"{}\">", esc(token))
+}
+
+fn page_task(t: &Task, err: Option<&str>, token: &str) -> String {
+    let csrf = csrf_field(token);
     let mut b = String::new();
     b.push_str("<p><a href='/'>← all tasks</a></p>");
     if let Some(e) = err {
@@ -204,13 +322,13 @@ fn page_task(t: &Task, err: Option<&str>) -> String {
     match t.kind {
         TaskKind::Secret => {
             b.push_str(&format!(
-                "<form method=post autocomplete=off><label class=mut for=v>{}</label><input id=v type=password name=value autocomplete=off autofocus placeholder='paste here — never shown, never sent anywhere but your keychain'>{}<label class=mut style='display:block;margin-top:8px'><input type=checkbox name=skip_check value=1> skip the provider check (store even if it cannot be verified)</label><div class=row><button class=p type=submit>Store &amp; inject</button><button class=bad name=action value=deny formnovalidate>Decline</button></div></form>",
+                "<form method=post autocomplete=off>{csrf}<label class=mut for=v>{}</label><input id=v type=password name=value autocomplete=off autofocus placeholder='paste here — never shown, never sent anywhere but your keychain'>{}<label class=mut style='display:block;margin-top:8px'><input type=checkbox name=skip_check value=1> skip the provider check (store even if it cannot be verified)</label><div class=row><button class=p type=submit>Store &amp; inject</button><button class=bad name=action value=deny formnovalidate>Decline</button></div></form>",
                 esc(&t.name.clone().unwrap_or_default()),
                 t.pattern.as_ref().map(|p| format!("<div class=mut>must match <code>{}</code></div>", esc(p))).unwrap_or_default()
             ));
         }
         TaskKind::Approval => {
-            b.push_str(&format!("<p>Keys: <code>{}</code></p><form method=post><div class=row><button class=p name=action value=allow>Allow for this project</button><button class=bad name=action value=deny>Deny</button></div></form>",
+            b.push_str(&format!("<p>Keys: <code>{}</code></p><form method=post>{csrf}<div class=row><button class=p name=action value=allow>Allow for this project</button><button class=bad name=action value=deny>Deny</button></div></form>",
                 crate::util::approval_names(&t.names).iter().map(|n| esc(n)).collect::<Vec<_>>().join("</code>, <code>")));
         }
         TaskKind::Human => {
@@ -219,9 +337,30 @@ fn page_task(t: &Task, err: Option<&str>) -> String {
             } else {
                 "<input type=text name=note placeholder='optional note (shown to the agent)'>"
             };
-            b.push_str(&format!("<form method=post>{note}<div class=row><button class=p name=action value=done>Done</button><button class=bad name=action value=deny>Can't do this</button></div></form>"));
+            b.push_str(&format!("<form method=post>{csrf}{note}<div class=row><button class=p name=action value=done>Done</button><button class=bad name=action value=deny>Can't do this</button></div></form>"));
         }
     }
     b.push_str("</div>");
     layout(&t.title, b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csrf_field_carries_the_token_and_escapes_it() {
+        assert_eq!(csrf_field("abc123"), "<input type=hidden name=t value=\"abc123\">");
+        // The token is hex so this cannot happen, but the field must never be an injection point.
+        assert_eq!(csrf_field("\"><script>"), "<input type=hidden name=t value=\"&quot;&gt;&lt;script&gt;\">");
+    }
+
+    #[test]
+    fn parse_form_reads_the_csrf_field_out_of_a_body() {
+        let f = parse_form("value=sk-abc&t=deadbeef&skip_check=1");
+        assert_eq!(f.get("t").map(String::as_str), Some("deadbeef"));
+        assert_eq!(f.get("value").map(String::as_str), Some("sk-abc"));
+        // A body with no token at all authenticates nothing.
+        assert!(!parse_form("value=sk-abc").contains_key("t"));
+    }
 }
