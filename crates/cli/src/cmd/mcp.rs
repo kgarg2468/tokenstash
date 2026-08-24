@@ -175,8 +175,10 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
                 steps: args.get("steps").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default(),
                 expects: args.get("expects").and_then(|v| v.as_str()).unwrap_or("confirm").to_string(),
             })?;
-            crate::notify::ensure_inbox(&app.cfg);
-            crate::notify::desktop(&app.cfg, &t.title, &format!("{} · {agent}", tokenstash_core::project::short(&project)), &util::inbox_url(&app.cfg, Some(&t.id)));
+            let state = crate::notify::ensure_inbox(&app.cfg);
+            // The desktop notification is the human's copy, so it may be tokened (subject to
+            // the ownership proof). The tool result below stays bare.
+            crate::notify::desktop(&app.cfg, &t.title, &format!("{} · {agent}", tokenstash_core::project::short(&project)), &util::inbox_notice(&app.cfg, Some(&t.id), state));
             let mut task = t;
             if blocking {
                 let start = std::time::Instant::now();

@@ -38,7 +38,12 @@ pub fn doctor() -> Result<i32> {
     // "Not running" is normal — it starts on demand. Someone else holding the port is not:
     // that is the case where a human could be sent to paste a key into another process.
     let inbox = notify::inbox_state(&cfg);
-    ok &= check("inbox", inbox != notify::Inbox::Foreign, format!("{}  {}", crate::util::inbox_url_tty(&cfg, None), notify::describe(inbox)));
+    ok &= check(
+        "inbox",
+        inbox != notify::Inbox::Foreign,
+        // `check` prints to stdout, so the TTY check is stdout's.
+        format!("{}  {}", crate::util::inbox_url_tty(&cfg, None, inbox, crate::util::Stream::Stdout), notify::describe(inbox)),
+    );
 
     let home = dirs::home_dir().unwrap_or_default();
     let claude_skill = home.join(".claude/skills/tokenstash/SKILL.md").exists();
