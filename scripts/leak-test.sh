@@ -132,9 +132,40 @@ grep -q "hf token: abc ok" "$OUT/run7.txt" && { echo "LEAK: short registry-named
 grep -q "OPENAI_API_KEY=$CANARY" "$PROJ/.env.local"
 grep -q "^.env.local$" "$PROJ/.gitignore"
 
+# ── inbox authentication ──────────────────────────────────────────────────────
+# Browser-facing responses legitimately contain the session token (the hidden CSRF
+# field), so every curl body lands in $WEB, never in $OUT. $OUT is the agent/CLI-facing
+# surface and must never contain the token (assertion (d) below).
+WEB="$(mktemp -d)"
+TOKEN_FILE="$TOKENSTASH_HOME/inbox.token"
+[ -s "$TOKEN_FILE" ] || { echo "FAIL: no session token at $TOKEN_FILE — the inbox is unauthenticated"; exit 1; }
+TOKEN="$(cat "$TOKEN_FILE")"
+MODE="$(stat -c '%a' "$TOKEN_FILE" 2>/dev/null || stat -f '%Lp' "$TOKEN_FILE")"
+[ "$MODE" = 600 ] || { echo "FAIL: $TOKEN_FILE is $MODE, expected 600"; exit 1; }
+
+# (a) the live exploit: an unauthenticated POST from any local process — or a loopback
+# CSRF from any page the user visits — must not be able to store a value.
+"$TS" need EVIL_TARGET_KEY --agent ci --why "inbox auth test" >"$OUT/need-evil.txt" 2>&1 || true
+ETID=$("$TS" tasks --json | python3 -c "import json,sys;print([t for t in json.load(sys.stdin) if t.get('name')=='EVIL_TARGET_KEY'][0]['id'])")
+code=$(curl -s -o "$WEB/exploit.txt" -w '%{http_code}' -X POST --data 'value=sk-EVIL-INJECTED&skip_check=1' "http://127.0.0.1:$PORT/t/$ETID")
+[ "$code" = 404 ] || { echo "FAIL: unauthenticated POST /t/<id> returned $code, expected 404"; exit 1; }
+[ -s "$WEB/exploit.txt" ] && { echo "FAIL: the 404 body is not empty — it reveals the inbox"; exit 1; }
+grep -q "sk-EVIL-INJECTED" "$PROJ/.env.local" && { echo "FAIL: an unauthenticated POST stored a value"; exit 1; }
+code=$(curl -s -o "$WEB/unauth-index.html" -w '%{http_code}' "http://127.0.0.1:$PORT/")
+[ "$code" = 404 ] || { echo "FAIL: unauthenticated GET / returned $code, expected 404"; exit 1; }
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data "action=allow" "http://127.0.0.1:$PORT/t/$ETID?t=$TOKEN")
+[ "$code" = 404 ] || { echo "FAIL: POST with a query token but no cookie/CSRF field returned $code, expected 404"; exit 1; }
+grep -q "sk-EVIL-INJECTED" "$PROJ/.env.local" && { echo "FAIL: a POST without the CSRF field stored a value"; exit 1; }
+
 fail=0
 if grep -rl "$CANARY" "$OUT"; then echo "LEAK: canary found in CLI/MCP output"; fail=1; fi
 if grep -q "$CANARY" "$TOKENSTASH_HOME/config.toml" 2>/dev/null; then echo "LEAK: canary in config"; fail=1; fi
+# (d) the inbox session token is a human credential: it must never reach a surface the
+# model reads — MCP tool results, the audit log, or any other CLI output.
+if grep -q "$TOKEN" "$OUT/mcp.txt"; then echo "LEAK: session token in MCP tool output"; fail=1; fi
+if grep -q "$TOKEN" "$OUT/audit.txt"; then echo "LEAK: session token in the audit log"; fail=1; fi
+if grep -rl "$TOKEN" "$OUT"; then echo "LEAK: session token found in agent-facing output"; fail=1; fi
+if strings "$TOKENSTASH_HOME/tokenstash.db"* | grep -q "$TOKEN"; then echo "LEAK: session token in database"; fail=1; fi
 if strings "$TOKENSTASH_HOME/tokenstash.db"* | grep -q "$CANARY"; then echo "LEAK: canary in database"; fail=1; fi
 # env_file is configuration, not a trusted path: an absolute value would put the secret
 # outside the project, where neither .gitignore nor the tracked-file check can protect it.
