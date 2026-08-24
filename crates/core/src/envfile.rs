@@ -11,11 +11,44 @@
 use anyhow::{Context, Result};
 use secrecy::{ExposeSecret, SecretString};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+/// Resolve `<project>/<env_file>` for writing, refusing any value that lands the secret
+/// outside the project directory.
+///
+/// `env_file` is configuration, and every protection below (gitignore coverage, the
+/// tracked-file check) is anchored on the project, so a path that escapes it is a secret
+/// written with no protection at all. Three ways out, all closed here: an absolute path, a
+/// `..` component, and a parent directory that is a symlink pointing out of the project.
+pub fn resolve(project: &Path, env_file: &str) -> Result<PathBuf> {
+    let rel = Path::new(env_file);
+    if env_file.is_empty() || rel.is_absolute() || rel.has_root() {
+        anyhow::bail!("env_file must be a relative path inside the project, but is '{env_file}'");
+    }
+    if rel.components().any(|c| !matches!(c, Component::Normal(_))) {
+        anyhow::bail!("env_file must be a plain relative path inside the project (no '..', no leading '/'), but is '{env_file}'");
+    }
+    // Anchor on the canonical project so a symlinked prefix of the project itself
+    // (/tmp → /private/tmp on macOS) is not mistaken for an escape.
+    let base = project.canonicalize().unwrap_or_else(|_| project.to_path_buf());
+    let path = base.join(rel);
+    // The parent may not exist yet; the deepest existing ancestor is where a symlink could
+    // redirect the write, and it is the only part we can resolve.
+    let mut anchor = path.parent().unwrap_or(&base).to_path_buf();
+    while !anchor.exists() && anchor.pop() {}
+    let real = anchor.canonicalize().with_context(|| format!("resolving {}", anchor.display()))?;
+    if !real.starts_with(&base) {
+        anyhow::bail!(
+            "env_file '{env_file}' resolves outside the project: {} is not inside {}; refusing to write a secret there",
+            real.display(), base.display()
+        );
+    }
+    Ok(path)
+}
 
 /// Upsert `NAME=value` into `<project>/<env_file>`. Preserves other lines. 0600.
 pub fn write(project: &Path, env_file: &str, name: &str, value: &SecretString) -> Result<PathBuf> {
-    let path = project.join(env_file);
+    let path = resolve(project, env_file)?;
     if fs::symlink_metadata(&path).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
         anyhow::bail!("{} is a symlink; refusing to write a secret through it", path.display());
     }
@@ -59,7 +92,7 @@ pub fn write(project: &Path, env_file: &str, name: &str, value: &SecretString) -
 
 /// Does the env file already contain NAME= ?
 pub fn has(project: &Path, env_file: &str, name: &str) -> bool {
-    let path = project.join(env_file);
+    let Ok(path) = resolve(project, env_file) else { return false };
     let Ok(s) = fs::read_to_string(path) else { return false };
     let p = format!("{name}=");
     s.lines().any(|l| l.starts_with(&p) || l.starts_with(&format!("export {p}")))
