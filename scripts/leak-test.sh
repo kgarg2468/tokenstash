@@ -2,7 +2,11 @@
 # Black-box leak test: drive the real binary with a canary secret and assert the canary never
 # appears on stdout/stderr, in the database, the config, the audit log, or MCP output.
 set -euo pipefail
-TS="$(cd "$(dirname "${1:-target/debug/tokenstash}")" && pwd)/$(basename "${1:-target/debug/tokenstash}")"
+TS="$(cd "$(dirname "${1:-target/debug/tokenstash}")" 2>/dev/null && pwd)/$(basename "${1:-target/debug/tokenstash}")"
+# `cargo test` does not build the CLI binary, so a default path can be missing or STALE (a
+# debug binary from an older commit passed for a "flake" once). Refuse rather than test the
+# wrong thing; the gate passes the freshly built release binary explicitly.
+[ -x "$TS" ] || { echo "leak test: no binary at $TS — build it, or pass the path as \$1"; exit 2; }
 export TOKENSTASH_HOME="$(mktemp -d)"
 export TOKENSTASH_STASH=insecure-file
 PROJ="$(mktemp -d)"; cd "$PROJ"; git init -q .
@@ -21,6 +25,7 @@ CANARY="sk-LEAKCANARY-$(date +%s)-0123456789abcdef"
 #      anything until the binary itself confirms that is the backend in use;
 #   2. forget everything this run stashed, and delete the dirs holding the canary, on exit.
 cleanup() {
+  [ -n "${UNTRUSTED:-}" ] && rm -rf "$(dirname "$UNTRUSTED")"
     kill "${INBOX_PID:-}" "${SQUAT_PID:-}" 2>/dev/null || true
     cd / || true
     # every secret the isolated stash knows about is a canary this run created
@@ -146,6 +151,12 @@ TOKEN_FILE="$TOKENSTASH_HOME/inbox.token"
 TOKEN="$(cat "$TOKEN_FILE")"
 MODE="$(stat -c '%a' "$TOKEN_FILE" 2>/dev/null || stat -f '%Lp' "$TOKEN_FILE")"
 [ "$MODE" = 600 ] || { echo "FAIL: $TOKEN_FILE is $MODE, expected 600"; exit 1; }
+PASTE_FILE="$TOKENSTASH_HOME/inbox.paste.token"
+[ -s "$PASTE_FILE" ] || { echo "FAIL: no paste-scope token at $PASTE_FILE"; exit 1; }
+PASTE="$(cat "$PASTE_FILE")"
+[ "$PASTE" != "$TOKEN" ] || { echo "FAIL: paste-scope and full-scope tokens are identical"; exit 1; }
+PMODE="$(stat -c '%a' "$PASTE_FILE" 2>/dev/null || stat -f '%Lp' "$PASTE_FILE")"
+[ "$PMODE" = 600 ] || { echo "FAIL: $PASTE_FILE is $PMODE, expected 600"; exit 1; }
 
 # (a) the live exploit: an unauthenticated POST from any local process — or a loopback
 # CSRF from any page the user visits — must not be able to store a value.
@@ -212,6 +223,50 @@ GOOD="sk-GOODCANARY-$(date +%s)-0123456789abcdef"
 curl -fsS -c "$JAR" -b "$JAR" -L -o "$WEB/answered.html" \
   --data-urlencode "value=$GOOD" --data "skip_check=1" --data-urlencode "t=$TOKEN" "http://127.0.0.1:$PORT/t/$ETID"
 grep -q "EVIL_TARGET_KEY=$GOOD" "$PROJ/.env.local" || { echo "FAIL: the authenticated answer did not store the value"; exit 1; }
+# ── paste-scope session: the link the agent hands the human ─────────────────────
+# It must (1) open and answer a missing-key card straight from the chat, (2) never carry or
+# reveal the full token, (3) be unable to approve, and (4) never downgrade a full session.
+PJAR="$WEB/paste.jar"; : >"$PJAR"
+"$TS" need PASTE_TARGET_KEY --agent ci --why "paste-scope test" >"$OUT/need-paste.txt" 2>&1 || true
+grep -q "t=$PASTE" "$OUT/need-paste.txt" || { echo "FAIL: the agent-facing need output does not carry the paste-scope link"; exit 1; }
+PTID=$("$TS" tasks --json | python3 -c "import json,sys;print([t for t in json.load(sys.stdin) if t.get('name')=='PASTE_TARGET_KEY'][0]['id'])")
+curl -fsS -c "$PJAR" -b "$PJAR" -L -o "$WEB/paste-task.html" "http://127.0.0.1:$PORT/t/$PTID?t=$PASTE"
+grep -q "tokenstash_inbox" "$PJAR" || { echo "FAIL: the paste-scope link did not open a session"; exit 1; }
+grep -q "$TOKEN" "$WEB/paste-task.html" && { echo "LEAK: the paste-scope page contains the full token"; exit 1; }
+grep -q "name=t value=\"$PASTE\"" "$WEB/paste-task.html" || { echo "FAIL: the paste-scope form carries no CSRF field of its own"; exit 1; }
+PGOOD="sk-PASTECANARY-$(date +%s)-0123456789abcdef"
+curl -fsS -c "$PJAR" -b "$PJAR" -L -o "$WEB/paste-answered.html" \
+  --data-urlencode "value=$PGOOD" --data "skip_check=1" --data-urlencode "t=$PASTE" "http://127.0.0.1:$PORT/t/$PTID"
+grep -q "PASTE_TARGET_KEY=$PGOOD" "$PROJ/.env.local" || { echo "FAIL: the paste-scope session could not answer a missing-key card"; exit 1; }
+# a paste-scope CSRF field does not authenticate a full-scope cookie, and vice versa
+code=$(curl -s -b "$JAR" -o /dev/null -w '%{http_code}' --data "value=sk-EVIL4&skip_check=1&t=$PASTE" "http://127.0.0.1:$PORT/t/$BTID")
+[ "$code" = 404 ] || { echo "FAIL: a paste CSRF field with a full cookie returned $code, expected 404"; exit 1; }
+# an approval task: a stash hit for a project outside every trust root
+# (a project dir that is NOT under $OUT: $OUT is the agent-facing surface and is grepped for
+# values, and the env file written here legitimately holds one)
+UNTRUSTED="$(mktemp -d)/untrusted"; mkdir -p "$UNTRUSTED"
+"$TS" need EVIL_TARGET_KEY --project "$UNTRUSTED" --agent ci >"$OUT/need-untrusted.txt" 2>&1 || true
+ATID=$("$TS" tasks --all --json | python3 -c "import json,sys;l=[t for t in json.load(sys.stdin) if t.get('kind')=='approval' and t['status']=='pending'];print(l[0]['id'] if l else '')")
+[ -n "$ATID" ] || { echo "FAIL: a stash hit outside the trust roots did not create an approval task"; sed -n 1,5p "$OUT/need-untrusted.txt"; exit 1; }
+curl -fsS -c "$PJAR" -b "$PJAR" -L -o "$WEB/paste-approval.html" "http://127.0.0.1:$PORT/t/$ATID"
+grep -q "value=allow" "$WEB/paste-approval.html" && { echo "FAIL: the paste-scope session was offered an Allow button"; exit 1; }
+grep -q "full inbox session" "$WEB/paste-approval.html" || { echo "FAIL: the paste-scope approval page does not explain how to get the full session"; exit 1; }
+curl -s -c "$PJAR" -b "$PJAR" -o "$WEB/paste-approve-try.html" --data "action=allow&t=$PASTE" "http://127.0.0.1:$PORT/t/$ATID"
+"$TS" tasks --all --json | ATID="$ATID" python3 -c "import json,sys,os;sys.exit(0 if [t for t in json.load(sys.stdin) if t['id']==os.environ['ATID'] and t['status']=='pending'] else 1)" \
+  || { echo "FAIL: a paste-scope POST approved a trust gate"; exit 1; }
+grep -q "EVIL_TARGET_KEY=" "$UNTRUSTED/.env.local" 2>/dev/null && { echo "FAIL: a paste-scope approval attempt injected a key"; exit 1; }
+# the full session approves it
+curl -fsS -c "$JAR" -b "$JAR" -L -o "$WEB/full-approved.html" --data "action=allow" --data-urlencode "t=$TOKEN" "http://127.0.0.1:$PORT/t/$ATID"
+grep -q "EVIL_TARGET_KEY=$GOOD" "$UNTRUSTED/.env.local" 2>/dev/null || { echo "FAIL: the full session could not approve"; echo "--- response:"; sed 's/<[^>]*>/ /g' "$WEB/full-approved.html" | tr -s ' \n' | head -c 400; echo; echo "--- tasks:"; "$TS" tasks --all --history --json | python3 -c "import json,sys;[print(t['id'],t['kind'],t['status'],t.get('project')) for t in json.load(sys.stdin)]"; echo "--- audit:"; "$TS" audit | head -5; echo "--- untrusted dir:"; ls -la "$UNTRUSTED"; exit 1; }
+# no downgrade: a full-scope browser that follows an agent (paste) link keeps full scope
+curl -fsS -c "$JAR" -b "$JAR" -L -o /dev/null "http://127.0.0.1:$PORT/?t=$PASTE"
+grep -q "$TOKEN" "$JAR" || { echo "FAIL: following a paste-scope link downgraded a full-scope session"; exit 1; }
+# a fresh browser that follows a paste link, then a full link, ends up full
+UJAR="$WEB/upgrade.jar"; : >"$UJAR"
+curl -fsS -c "$UJAR" -b "$UJAR" -L -o /dev/null "http://127.0.0.1:$PORT/?t=$PASTE"
+curl -fsS -c "$UJAR" -b "$UJAR" -L -o /dev/null "http://127.0.0.1:$PORT/?t=$TOKEN"
+grep -q "$TOKEN" "$UJAR" || { echo "FAIL: a full-scope link did not upgrade a paste-scope session"; exit 1; }
+
 # once the cookie is held, the index needs no token in the URL at all
 curl -fsS -b "$JAR" -o "$WEB/index.html" "http://127.0.0.1:$PORT/"
 grep -q "tokenstash inbox" "$WEB/index.html" || { echo "FAIL: the cookie alone did not authenticate a GET"; exit 1; }
