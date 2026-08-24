@@ -25,7 +25,7 @@ pub fn resolve(project: &Path, env_file: &str) -> Result<PathBuf> {
     if env_file.is_empty() || rel.is_absolute() || rel.has_root() {
         anyhow::bail!("env_file must be a relative path inside the project, but is '{env_file}'");
     }
-    if rel.components().any(|c| !matches!(c, Component::Normal(_))) {
+    if rel.components().any(|c| !matches!(c, Component::Normal(_) | Component::CurDir)) {
         anyhow::bail!("env_file must be a plain relative path inside the project (no '..', no leading '/'), but is '{env_file}'");
     }
     // Anchor on the canonical project so a symlinked prefix of the project itself
