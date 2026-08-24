@@ -712,3 +712,12 @@ fn tracked_env_file_is_still_refused_when_project_path_is_a_symlink() {
     assert_eq!(std::fs::read_to_string(real.join(".env.local")).unwrap(), "OLD=1\n");
     let _ = std::fs::remove_file(&link);
 }
+
+#[test]
+fn env_file_with_leading_dot_slash_is_accepted() {
+    let dir = tmp("envfile-curdir");
+    std::process::Command::new("git").arg("-C").arg(&dir).args(["init", "-q", "."]).status().unwrap();
+    let p = envfile::write(&dir, "./.env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap();
+    assert!(p.starts_with(&dir));
+    assert!(envfile::has(&dir, "./.env.local", "K"));
+}
