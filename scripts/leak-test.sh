@@ -112,6 +112,17 @@ fail=0
 if grep -rl "$CANARY" "$OUT"; then echo "LEAK: canary found in CLI/MCP output"; fail=1; fi
 if grep -q "$CANARY" "$TOKENSTASH_HOME/config.toml" 2>/dev/null; then echo "LEAK: canary in config"; fail=1; fi
 if strings "$TOKENSTASH_HOME/tokenstash.db"* | grep -q "$CANARY"; then echo "LEAK: canary in database"; fail=1; fi
+# env_file is configuration, not a trusted path: an absolute value would put the secret
+# outside the project, where neither .gitignore nor the tracked-file check can protect it.
+ESCAPE_DIR="$(mktemp -d)"; ESCAPE="$ESCAPE_DIR/ESCAPE-TARGET.env"
+cp "$TOKENSTASH_HOME/config.toml" "$OUT/config.before-escape"
+sed -i.bak -e "s|^env_file = .*|env_file = \"$ESCAPE\"|" "$TOKENSTASH_HOME/config.toml"
+rc=0; "$TS" need OPENAI_API_KEY --agent ci >"$OUT/escape.txt" 2>&1 || rc=$?
+cp "$OUT/config.before-escape" "$TOKENSTASH_HOME/config.toml"
+if [ -e "$ESCAPE" ]; then echo "LEAK: absolute env_file wrote a secret outside the project"; fail=1; fi
+if [ $rc -eq 0 ]; then echo "an escaping env_file must fail, not inject (got exit 0)"; fail=1; fi
+grep -q "relative path inside the project" "$OUT/escape.txt" || { echo "escaping env_file must say why it was refused"; fail=1; }
+rm -rf "$ESCAPE_DIR"
 # exit-code contract
 rc=0; "$TS" need OPENAI_API_KEY --agent ci >/dev/null 2>&1 || rc=$?; [ $rc -eq 0 ] || { echo "hit should exit 0 (got $rc)"; fail=1; }
 rc=0; "$TS" need NEVER_SEEN_KEY --agent ci >/dev/null 2>&1 || rc=$?; [ $rc -eq 10 ] || { echo "miss should exit 10 (got $rc)"; fail=1; }
