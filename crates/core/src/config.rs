@@ -23,7 +23,13 @@ pub struct Config {
     /// Whether to show desktop notifications.
     #[serde(default = "default_true")]
     pub notifications: bool,
+    /// Which inbox session agent-facing links carry: "paste" (default: the link can answer
+    /// missing-key cards but not approve) or "full" (the link can do everything).
+    #[serde(default = "default_links")]
+    pub inbox_links: String,
 }
+
+fn default_links() -> String { "paste".into() }
 
 fn default_env_file() -> String { ".env.local".into() }
 fn default_port() -> u16 { 7433 }
@@ -39,6 +45,7 @@ impl Default for Config {
             task_ttl_hours: default_ttl(),
             stash_backend: None,
             notifications: true,
+            inbox_links: default_links(),
         }
     }
 }

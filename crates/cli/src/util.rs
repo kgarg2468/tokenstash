@@ -37,15 +37,9 @@ pub fn agent_from(arg: &Option<String>) -> String {
 /// The inbox URL with NO session token. Every place an inbox link is built goes through here
 /// or through [`inbox_url_human`] — there is no third spelling.
 ///
-/// This is the agent-facing form. MCP tool results, `need --json`, `need`/`ask` stdout: all of
-/// it is read by the model, so none of it may carry the token. The model already sees the
-/// project's env file, so the token would not reveal a secret — but it would let the model
-/// *answer* tasks, and answering is the human's yes: "store this value under this key name",
-/// "trust this project with sensitive keys". An agent that could answer could inject a value
-/// of its own choosing and self-approve the gate that exists to ask a person. See
-/// `crate::inbox_auth`. A bare URL is still useful to the agent: it is what it tells the human
-/// to open, and the human's own click (from the notification or `tokenstash open`) carries the
-/// token.
+/// The bare inbox URL, no session. Only ever shown when nothing better is available; every
+/// link a person is expected to click carries a session (see `inbox_url_agent`,
+/// `inbox_url_human`).
 pub fn inbox_url(cfg: &Config, task_id: Option<&str>) -> String {
     match task_id {
         Some(id) => format!("http://127.0.0.1:{}/t/{}", cfg.inbox_port, id),
@@ -109,17 +103,26 @@ pub fn inbox_url_tty(cfg: &Config, task_id: Option<&str>, state: Inbox, stream: 
     if is_terminal(stream) {
         inbox_url_human(cfg, task_id, state)
     } else {
-        inbox_url(cfg, task_id)
+        inbox_url_agent(cfg, task_id, state)
     }
 }
 
-/// Agent-facing: the bare URL (never the token) when the inbox is proved ours; otherwise the
-/// notice and no link, because the agent relays this line to a person.
+/// Agent-facing: a link that WORKS when the person clicks it from the chat. It carries the
+/// paste-scope session (answer missing-key cards and human tasks; cannot approve), or the
+/// full session when `inbox_links = "full"`. See `crate::inbox_auth` for why the scopes are
+/// split. Not a link at all unless the inbox is proved ours: the agent relays this line to a
+/// person, and a link to a squatter is an invitation to paste a key into its form.
 pub fn inbox_url_agent(cfg: &Config, task_id: Option<&str>, state: Inbox) -> String {
     if !matches!(state, Inbox::Ours) {
-        inbox_notice(cfg, task_id, state)
-    } else {
-        inbox_url(cfg, task_id)
+        return inbox_notice(cfg, task_id, state);
+    }
+    let url = inbox_url(cfg, task_id);
+    match crate::inbox_auth::Tokens::ensure() {
+        Ok(t) => {
+            let scope = if cfg.inbox_links == "full" { crate::inbox_auth::Scope::Full } else { crate::inbox_auth::Scope::Paste };
+            format!("{url}?t={}", t.for_scope(scope))
+        }
+        Err(_) => url,
     }
 }
 
@@ -214,6 +217,20 @@ mod tests {
     }
 
     #[test]
+    fn agent_links_carry_paste_scope_unless_config_says_full() {
+        with_home("links-scope", |cfg| {
+            let t = crate::inbox_auth::Tokens::ensure().unwrap();
+            let url = inbox_url_agent(&cfg, Some("t_abc"), Inbox::Ours);
+            assert!(url.ends_with(&format!("?t={}", t.paste)), "{url}");
+            assert!(!url.contains(&t.full));
+            let mut full = cfg.clone();
+            full.inbox_links = "full".into();
+            let url = inbox_url_agent(&full, Some("t_abc"), Inbox::Ours);
+            assert!(url.ends_with(&format!("?t={}", t.full)), "{url}");
+        });
+    }
+
+    #[test]
     fn an_unproved_inbox_gets_no_link_on_any_surface() {
         with_home("unproved", |cfg| {
             for state in [Inbox::Foreign, Inbox::Down] {
@@ -237,8 +254,10 @@ mod tests {
             for stream in [Stream::Stdout, Stream::Stderr] {
                 if !is_terminal(stream) {
                     let url = inbox_url_tty(&cfg, None, Inbox::Ours, stream);
-                    assert_eq!(url, inbox_url(&cfg, None), "{stream:?} tokened a captured stream");
-                    assert!(!url.contains(&token));
+                    assert_eq!(url, inbox_url_agent(&cfg, None, Inbox::Ours), "{stream:?} must hand a captured stream the agent link");
+                    assert!(!url.contains(&token), "the FULL token must never reach a captured stream");
+                    let paste = crate::inbox_auth::ensure_paste_token().unwrap();
+                    assert!(url.contains(&paste), "the agent link carries the paste-scope session");
                 }
             }
         });

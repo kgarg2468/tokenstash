@@ -11,20 +11,22 @@
 //! can store a value of its choosing under a real key name and approve its own trust
 //! gates. The session token closes that.
 //!
-//! # Who the token is for: the human, not the agent
+//! # Two sessions: paste-scope for the agent's link, full-scope for the human's
 //!
-//! The token is a *human* credential. The coding agent can already read the project's env
-//! file, so handing it the token would not reveal secrets it cannot already see — but it
-//! would let the agent *answer* tasks, and answering is precisely how the human says "yes,
-//! store this value" and "yes, trust this project with sensitive keys". An agent holding
-//! the token could inject an attacker-supplied value under `OPENAI_API_KEY` and then
-//! self-approve the trust gate that was supposed to ask a person.
+//! The agent is the one who tells the human "you need to paste OPENAI_API_KEY" — so the
+//! most useful thing it can hand over is a link that works. But a link that can *approve*
+//! ("yes, this project may use my Stripe key") must not sit in the agent's hands: an agent
+//! manipulated by something in a repo could open it and approve its own request.
 //!
-//! So the split is: agent-facing surfaces (MCP tool results, `need --json`, `need`/`ask`
-//! stdout — all of which are read by the model) get the *bare* inbox URL, and only
-//! surfaces a person reads directly (the desktop notification, `tokenstash open`, and
-//! `tokenstash tasks`/`doctor` when stdout is a terminal) get `?t=<token>`. The token is
-//! also never written to the audit log or the database. See `crate::util::inbox_url*`.
+//! So there are two tokens. The **paste-scope** token (`inbox.paste.token`) can answer
+//! missing-key cards and human tasks — self-answering is useless to an attacker, who has no
+//! real key to paste. It is what agent surfaces (MCP results, `need` output) carry, so the
+//! human can click straight from the chat. The **full-scope** token (`inbox.token`) can also
+//! approve; it travels only over channels a person triggers (the desktop notification,
+//! `tokenstash open`, a terminal). A full-scope cookie is never downgraded by a later
+//! paste-scope link, so one `tokenstash open` per browser makes every agent link fully
+//! capable from then on. `inbox_links = "full"` in config opts into handing the full token to
+//! agent surfaces on machines where that trade-off is wanted.
 //!
 //! # Why /verify is a challenge, not a token check
 //!
@@ -58,6 +60,52 @@ pub fn token_path() -> PathBuf {
     tokenstash_core::config::config_dir().join("inbox.token")
 }
 
+/// The paste-scope token file. Separate random bytes, not derived from the full token, so
+/// holding one says nothing about the other.
+pub fn paste_token_path() -> PathBuf {
+    tokenstash_core::config::config_dir().join("inbox.paste.token")
+}
+
+/// What a presented credential is allowed to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Answer missing-key cards and human tasks. Cannot approve.
+    Paste,
+    /// Everything, including approvals.
+    Full,
+}
+
+/// Both tokens, read or created together.
+#[derive(Debug, Clone)]
+pub struct Tokens {
+    pub full: String,
+    pub paste: String,
+}
+
+impl Tokens {
+    pub fn ensure() -> Result<Self> {
+        Ok(Self { full: ensure_token()?, paste: ensure_paste_token()? })
+    }
+
+    /// Classify a presented credential (cookie value, `?t=`, or CSRF field), constant-time.
+    pub fn scope_of(&self, presented: &str) -> Option<Scope> {
+        if ct_eq(presented, &self.full) {
+            Some(Scope::Full)
+        } else if ct_eq(presented, &self.paste) {
+            Some(Scope::Paste)
+        } else {
+            None
+        }
+    }
+
+    pub fn for_scope(&self, scope: Scope) -> &str {
+        match scope {
+            Scope::Full => &self.full,
+            Scope::Paste => &self.paste,
+        }
+    }
+}
+
 /// The session token for this `TOKENSTASH_HOME`, creating it on first use.
 ///
 /// The token is persisted rather than regenerated per inbox process on purpose: the inbox
@@ -66,8 +114,17 @@ pub fn token_path() -> PathBuf {
 /// It lives at `$TOKENSTASH_HOME/inbox.token`, written 0600 and atomically, like every
 /// other file in this project that holds a credential.
 pub fn ensure_token() -> Result<String> {
-    let path = token_path();
-    if let Some(t) = read_token() {
+    ensure_token_at(&token_path())
+}
+
+/// The paste-scope token, same lifecycle as [`ensure_token`].
+pub fn ensure_paste_token() -> Result<String> {
+    ensure_token_at(&paste_token_path())
+}
+
+fn ensure_token_at(path: &std::path::Path) -> Result<String> {
+    let path = path.to_path_buf();
+    if let Some(t) = read_token_at(&path) {
         return Ok(t);
     }
     if let Some(dir) = path.parent() {
@@ -76,7 +133,7 @@ pub fn ensure_token() -> Result<String> {
     // Two commands can race to create the token; the loser must adopt the winner's value,
     // not overwrite it, or URLs already printed stop working.
     fsutil::with_lock(&path, || {
-        if let Some(t) = read_token() {
+        if let Some(t) = read_token_at(&path) {
             return Ok(t);
         }
         let mut bytes = [0u8; TOKEN_BYTES];
@@ -87,9 +144,9 @@ pub fn ensure_token() -> Result<String> {
     })
 }
 
-/// The token as already stored, or `None` if there is no well-formed one yet.
-pub fn read_token() -> Option<String> {
-    let s = std::fs::read_to_string(token_path()).ok()?;
+/// A token as already stored, or `None` if there is no well-formed one yet.
+fn read_token_at(path: &std::path::Path) -> Option<String> {
+    let s = std::fs::read_to_string(path).ok()?;
     let s = s.trim().to_string();
     (s.len() == TOKEN_CHARS && s.bytes().all(|b| b.is_ascii_hexdigit())).then_some(s)
 }
@@ -157,7 +214,7 @@ mod tests {
         // A second call adopts the stored token instead of minting a new one: URLs already
         // handed to a human must keep working.
         assert_eq!(ensure_token().unwrap(), t);
-        assert_eq!(read_token().unwrap(), t);
+        assert_eq!(read_token_at(&token_path()).unwrap(), t);
         assert_eq!(std::fs::read_to_string(token_path()).unwrap(), t, "no trailing newline");
 
         #[cfg(unix)]
@@ -178,6 +235,34 @@ mod tests {
     }
 
     #[test]
+    fn paste_and_full_tokens_are_distinct_and_classified_in_constant_time() {
+        let _g = env_lock();
+        let home = tmp_home("scopes");
+        std::env::set_var("TOKENSTASH_HOME", &home);
+
+        let t = Tokens::ensure().unwrap();
+        assert_ne!(t.full, t.paste, "the paste token must not be derivable from the full one");
+        assert_eq!(t.paste.len(), 64);
+        assert_eq!(t.scope_of(&t.full), Some(Scope::Full));
+        assert_eq!(t.scope_of(&t.paste), Some(Scope::Paste));
+        assert_eq!(t.scope_of(""), None);
+        assert_eq!(t.scope_of(&t.full[..63]), None);
+        // Stable across calls: links already handed out keep working.
+        let again = Tokens::ensure().unwrap();
+        assert_eq!(again.full, t.full);
+        assert_eq!(again.paste, t.paste);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(paste_token_path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        std::env::remove_var("TOKENSTASH_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn read_token_rejects_a_malformed_file() {
         let _g = env_lock();
         let home = tmp_home("malformed");
@@ -185,7 +270,7 @@ mod tests {
 
         for junk in ["", "   ", "not-hex-at-all", &"a".repeat(63), &"z".repeat(64)] {
             std::fs::write(token_path(), junk).unwrap();
-            assert!(read_token().is_none(), "should reject {junk:?}");
+            assert!(read_token_at(&token_path()).is_none(), "should reject {junk:?}");
         }
         // ...and a malformed file is replaced with a real token rather than trusted.
         let t = ensure_token().unwrap();
