@@ -95,7 +95,7 @@ pub fn need(a: NeedArgs) -> Result<i32> {
             }
         }
         if outcomes.iter().any(|o| o.is_pending()) {
-            eprintln!("\nThe human has been notified. Continue with other work; re-run this command or `tokenstash tasks` to check.");
+            eprintln!("\nThe human has been notified and opens the inbox from the notification or with `tokenstash open` (the link above is for reference; a fresh browser needs the session the notification carries). Continue with other work; re-run this command or `tokenstash tasks` to check.");
         }
     }
     Ok(code_for(&outcomes))
