@@ -96,8 +96,8 @@ pub fn ensure_inbox(cfg: &Config) {
 }
 
 /// Human-readable inbox status for `doctor`.
-pub fn inbox_status(cfg: &Config) -> &'static str {
-    match inbox_state(cfg) {
+pub fn describe(state: Inbox) -> &'static str {
+    match state {
         Inbox::Ours => "running (ownership verified)",
         Inbox::Foreign => "PORT HELD BY ANOTHER PROCESS — it failed the ownership check",
         Inbox::Down => "not running (starts on demand)",
