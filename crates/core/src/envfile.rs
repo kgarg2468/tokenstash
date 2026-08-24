@@ -20,14 +20,31 @@ use std::path::{Component, Path, PathBuf};
 /// tracked-file check) is anchored on the project, so a path that escapes it is a secret
 /// written with no protection at all. Three ways out, all closed here: an absolute path, a
 /// `..` component, and a parent directory that is a symlink pointing out of the project.
-pub fn resolve(project: &Path, env_file: &str) -> Result<PathBuf> {
+/// Validate the configured `env_file` spelling and return it normalized (`./` components
+/// dropped) so the gitignore rule and the on-disk path agree. Refuses absolute paths,
+/// roots, and `..`.
+pub fn normalize(env_file: &str) -> Result<String> {
     let rel = Path::new(env_file);
     if env_file.is_empty() || rel.is_absolute() || rel.has_root() {
         anyhow::bail!("env_file must be a relative path inside the project, but is '{env_file}'");
     }
-    if rel.components().any(|c| !matches!(c, Component::Normal(_) | Component::CurDir)) {
-        anyhow::bail!("env_file must be a plain relative path inside the project (no '..', no leading '/'), but is '{env_file}'");
+    let mut parts = Vec::new();
+    for c in rel.components() {
+        match c {
+            Component::Normal(p) => parts.push(p.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            _ => anyhow::bail!("env_file must be a plain relative path inside the project (no '..', no leading '/'), but is '{env_file}'"),
+        }
     }
+    if parts.is_empty() {
+        anyhow::bail!("env_file must name a file inside the project, but is '{env_file}'");
+    }
+    Ok(parts.join("/"))
+}
+
+pub fn resolve(project: &Path, env_file: &str) -> Result<PathBuf> {
+    let norm = normalize(env_file)?;
+    let rel = Path::new(&norm);
     // Anchor on the canonical project so a symlinked prefix of the project itself
     // (/tmp → /private/tmp on macOS) is not mistaken for an escape.
     let base = project.canonicalize().unwrap_or_else(|_| project.to_path_buf());
@@ -52,6 +69,7 @@ pub fn resolve(project: &Path, env_file: &str) -> Result<PathBuf> {
 
 /// Upsert `NAME=value` into `<project>/<env_file>`. Preserves other lines. 0600.
 pub fn write(project: &Path, env_file: &str, name: &str, value: &SecretString) -> Result<PathBuf> {
+    let env_file = &normalize(env_file)?;
     let path = resolve(project, env_file)?;
     if fs::symlink_metadata(&path).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
         anyhow::bail!("{} is a symlink; refusing to write a secret through it", path.display());
