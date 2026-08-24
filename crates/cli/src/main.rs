@@ -82,8 +82,10 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Inbox(a) => cmd::inbox::serve(a),
         Cmd::Open => {
             let cfg = tokenstash_core::Config::load()?;
-            let url = util::inbox_url(&cfg, None);
             notify::ensure_inbox(&cfg);
+            // `open` exists to put a person in front of the inbox, so it is one of the two
+            // surfaces that always carries the session token.
+            let url = util::inbox_url_human(&cfg, None);
             let _ = open::that(&url);
             println!("{url}");
             Ok(0)

@@ -40,7 +40,7 @@ pub fn tasks(a: TasksArgs) -> Result<i32> {
         };
         println!("{} {:<10} {:<40} {:<24} {}", status_icon(&t.status), t.id, what, util::short(&t.project), t.agent);
     }
-    println!("\ninbox: {}", util::inbox_url(&app.cfg, None));
+    println!("\ninbox: {}", util::inbox_url_tty(&app.cfg, None));
     Ok(0)
 }
 

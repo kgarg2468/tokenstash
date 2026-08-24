@@ -66,7 +66,7 @@ pub fn run(a: RunArgs) -> Result<i32> {
         let mut outcomes = need::need(&app.ctx(), &project, &agent, &missing, &opts)?;
         if outcomes.iter().any(|o| o.is_pending()) {
             notify_pending(&app, &project, &agent, &outcomes);
-            eprintln!("tokenstash: waiting for you → {}", util::inbox_url(&app.cfg, None));
+            eprintln!("tokenstash: waiting for you → {}", util::inbox_url_tty(&app.cfg, None));
             // wait on the approval task just filed; calling need again would file another
             need::wait(&app.ctx(), &project, &mut outcomes, opts.timeout)?;
         }

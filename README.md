@@ -66,7 +66,7 @@ Not a vault (use 1Password/Infisical; backends coming). Not a proxy — never in
 
 ## Security in one paragraph
 
-Values go clipboard → keychain → env file, 0600, `.gitignore` enforced on every write. CLI output, MCP results, the SQLite index, the audit log, and errors are all value-free, and CI proves it with a canary ([`scripts/leak-test.sh`](scripts/leak-test.sh)). The inbox binds `127.0.0.1` only. A stash miss always involves you; a stash hit is silent only inside your trust roots for non-sensitive keys.
+Values go clipboard → keychain → env file, 0600, `.gitignore` enforced on every write. CLI output, MCP results, the SQLite index, the audit log, and errors are all value-free, and CI proves it with a canary ([`scripts/leak-test.sh`](scripts/leak-test.sh)). The inbox binds `127.0.0.1` and, because loopback is not authentication, requires a 32-byte session token (`$TOKENSTASH_HOME/inbox.token`, 0600): it arrives as `?t=` on the link you click, becomes an `HttpOnly; SameSite=Strict` cookie, and every form posts it back as a CSRF double-submit. Anything without it gets an empty 404. The token goes to *you* — the notification, `tokenstash open`, a terminal — and never to the agent, so a model can request a key but cannot answer its own request or approve its own trust gate. A stash miss always involves you; a stash hit is silent only inside your trust roots for non-sensitive keys.
 
 ## Adding a provider
 
