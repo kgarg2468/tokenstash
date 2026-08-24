@@ -17,6 +17,12 @@ pub struct Check {
     pub auth: String,
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// Extra statuses that mean "this credential was rejected", for providers whose
+    /// documented auth-failure code is not 401/403. Google returns 400
+    /// INVALID_ARGUMENT for a bad API key, Brave returns 422. Without this the probe
+    /// is decorative: `liveness` treats every other status as "accept".
+    #[serde(default)]
+    pub reject_status: Vec<u16>,
 }
 fn default_get() -> String { "GET".into() }
 

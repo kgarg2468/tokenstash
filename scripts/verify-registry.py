@@ -161,17 +161,23 @@ def classify_url(url: str, r: dict) -> str:
     return "REDIRECTED"
 
 
-def classify_check(r: dict) -> str:
+def classify_check(r: dict, declared_reject: list | None = None) -> str:
     if r["error"]:
         return "UNREACHABLE"
     s = r["status"]
     if s in (401, 403):
         return "OK"
+    if s in (declared_reject or []):
+        # The provider's documented auth-failure code is not 401/403, and the
+        # registry says so via `reject_status`, so the probe does reject.
+        return "OK-DECLARED"
     if s == 200:
-        # Some APIs answer 200 with an error envelope (Slack, Algolia...).
+        # Some APIs answer 200 with an error envelope (Slack's Web API always
+        # does). liveness() only ever sees the status, so a 200 is accepted no
+        # matter what the body says: the probe cannot reject anything.
         low = r["body"].lower().replace(" ", "")
         if '"ok":false' in low or '"error"' in low:
-            return "OK-BODY"
+            return "NO-AUTH-STATUS"
         return "NO-AUTH"
     if s == 404:
         return "BAD-ENDPOINT"
@@ -219,7 +225,8 @@ def sweep_checks(providers: list[dict]) -> list[dict]:
         out.append({
             "name": p["name"], "url": c["url"], "auth": c.get("auth"),
             "method": method, "status": r["status"], "error": r["error"],
-            "body": r["body"][:300], "verdict": classify_check(r),
+            "body": r["body"][:300],
+            "verdict": classify_check(r, c.get("reject_status")),
         })
         print(f"  chk  {p['name']:36} {str(r['status'] or r['error'])[:28]:30} "
               f"{out[-1]['verdict']:14} {r['body'][:70]!r}", file=sys.stderr)
@@ -264,7 +271,7 @@ def main() -> int:
 
     print(table(urls, checks))
     bad = sum(1 for u in urls if u["verdict"] == "BROKEN")
-    bad += sum(1 for c in checks if c["verdict"] not in ("OK", "OK-BODY"))
+    bad += sum(1 for c in checks if c["verdict"] not in ("OK", "OK-DECLARED"))
     print(f"\n{len(urls)} urls, {len(checks)} checks, {bad} needing attention",
           file=sys.stderr)
     return 0
