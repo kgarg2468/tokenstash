@@ -83,20 +83,17 @@ impl Config {
 
     pub fn exists() -> bool { config_path().exists() }
 
-    /// Sensible defaults for trust roots: common code dirs that exist, plus cwd.
+    /// Guessed trust roots: common code dirs under $HOME that exist. Never the current
+    /// directory — `init` is run from wherever the binary happens to be (a clone of this
+    /// repo, a scratch dir, an agent's worktree), and a guess must not turn that into a
+    /// place secrets flow silently.
     pub fn default_trust_roots() -> Vec<PathBuf> {
         let home = dirs::home_dir().unwrap_or_default();
-        let mut v: Vec<PathBuf> = ["code", "projects", "dev", "src", "repos", "work"]
+        ["code", "projects", "dev", "src", "repos", "work"]
             .iter()
             .map(|d| home.join(d))
             .filter(|p| p.is_dir())
-            .collect();
-        if let Ok(cwd) = std::env::current_dir() {
-            if !v.iter().any(|r| cwd.starts_with(r)) {
-                v.push(cwd);
-            }
-        }
-        v
+            .collect()
     }
 }
 
