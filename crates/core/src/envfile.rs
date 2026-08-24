@@ -31,10 +31,14 @@ pub fn resolve(project: &Path, env_file: &str) -> Result<PathBuf> {
     // Anchor on the canonical project so a symlinked prefix of the project itself
     // (/tmp → /private/tmp on macOS) is not mistaken for an escape.
     let base = project.canonicalize().unwrap_or_else(|_| project.to_path_buf());
-    let path = base.join(rel);
+    // The containment check runs on canonical paths, but the returned path stays under the
+    // caller's `project` spelling: `is_git_tracked` / `git check-ignore` run with `project` as
+    // cwd, and a canonical spelling (/private/var/... on macOS) would look like a path outside
+    // the repo to git and silently defeat the tracked-file refusal.
+    let path = project.join(rel);
     // The parent may not exist yet; the deepest existing ancestor is where a symlink could
     // redirect the write, and it is the only part we can resolve.
-    let mut anchor = path.parent().unwrap_or(&base).to_path_buf();
+    let mut anchor = base.join(rel).parent().unwrap_or(&base).to_path_buf();
     while !anchor.exists() && anchor.pop() {}
     let real = anchor.canonicalize().with_context(|| format!("resolving {}", anchor.display()))?;
     if !real.starts_with(&base) {
