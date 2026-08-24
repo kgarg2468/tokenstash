@@ -56,7 +56,7 @@ pub fn liveness(check: &Check, value: &SecretString) -> Liveness {
     match resp {
         Ok(_) => Liveness::Ok,
         Err(ureq::Error::Status(code, _)) => {
-            if code == 401 || code == 403 {
+            if code == 401 || code == 403 || check.reject_status.contains(&code) {
                 Liveness::Rejected(code)
             } else {
                 // 400/404/429 etc. usually mean the key was accepted but the probe was imperfect.

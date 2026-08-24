@@ -24,7 +24,23 @@ fn registry_is_sane() {
         assert!(p.url.starts_with("https://"), "{} url", p.name);
         if let Some(pat) = &p.pattern { regex::Regex::new(pat).unwrap_or_else(|_| panic!("bad pattern for {}", p.name)); }
         if let Some(pat) = &p.sensitive_pattern { regex::Regex::new(pat).unwrap(); }
-        if let Some(c) = &p.check { assert!(c.url.starts_with("https://"), "{} check url", p.name); }
+        if let Some(c) = &p.check {
+            assert!(c.url.starts_with("https://"), "{} check url", p.name);
+            assert!(matches!(c.method.as_str(), "GET" | "POST"), "{} check method {}", p.name, c.method);
+            // An auth style validate::liveness does not understand falls into its
+            // catch-all arm and sends the probe with no credential at all, which
+            // makes the check silently meaningless. Typos must fail here instead.
+            let known = c.auth == "bearer"
+                || c.auth == "basic-user"
+                || c.auth.strip_prefix("header:").is_some_and(|s| !s.is_empty())
+                || c.auth.strip_prefix("prefix:").is_some_and(|s| !s.is_empty())
+                || c.auth.strip_prefix("query:").is_some_and(|s| !s.is_empty());
+            assert!(known, "{} unsupported check auth {:?}", p.name, c.auth);
+            for s in &c.reject_status {
+                assert!((400..600).contains(s), "{} reject_status {}", p.name, s);
+                assert!(*s != 401 && *s != 403, "{} reject_status {} is already implied", p.name, s);
+            }
+        }
         assert!(p.name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'), "{} name", p.name);
     }
 }
