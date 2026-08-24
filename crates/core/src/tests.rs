@@ -688,3 +688,27 @@ fn env_file_under_a_symlinked_parent_outside_the_project_is_refused() {
     envfile::write(&proj, "config/.env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap();
     assert!(envfile::has(&proj, "config/.env.local", "K"));
 }
+
+#[test]
+fn tracked_env_file_is_still_refused_when_project_path_is_a_symlink() {
+    // macOS hands out /var/folders/... while the canonical path is /private/var/...; a
+    // resolver that hands git a canonical path defeats the tracked-file check.
+    let real = tmp("tracked-env-symlink-real");
+    let link = std::env::temp_dir().join(format!("tokenstash-test-tracked-env-symlink-link-{}", std::process::id()));
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let git = |args: &[&str]| {
+        let st = std::process::Command::new("git").arg("-C").arg(&real).args(args)
+            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap();
+        assert!(st.success(), "git {args:?} failed");
+    };
+    git(&["init", "-q", "."]);
+    std::fs::write(real.join(".env.local"), "OLD=1\n").unwrap();
+    git(&["add", ".env.local"]);
+    git(&["commit", "-q", "-m", "oops"]);
+    let err = envfile::write(&link, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap_err();
+    assert!(err.to_string().contains("git rm --cached"), "tracked file must be refused through a symlinked project path: {err}");
+    assert_eq!(std::fs::read_to_string(real.join(".env.local")).unwrap(), "OLD=1\n");
+    let _ = std::fs::remove_file(&link);
+}
