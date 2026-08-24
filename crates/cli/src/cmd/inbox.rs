@@ -95,13 +95,17 @@ fn handle(app: &App, mut req: Request, token: &str) -> Result<()> {
     }
 
     let cookie_ok = cookie(&req, inbox_auth::COOKIE).map(|c| inbox_auth::ct_eq(&c, token)).unwrap_or(false);
-    let mut body = String::new();
-    let form = if method == "POST" {
-        req.as_reader().take(MAX_BODY).read_to_string(&mut body)?;
-        parse_form(&body)
-    } else {
-        HashMap::new()
-    };
+    // Read one byte past the limit so "exactly at the limit" and "too long" are
+    // distinguishable. Truncating instead would be worse than refusing: the CSRF field sits at
+    // the front of the body, so a cut-off form still authenticates, and parse_form would hand
+    // a half-copied API key or note to answer_secret as though the human had typed it.
+    let mut raw = Vec::new();
+    if method == "POST" {
+        req.as_reader().take(MAX_BODY + 1).read_to_end(&mut raw)?;
+    }
+    let oversized = raw.len() as u64 > MAX_BODY;
+    let body = String::from_utf8_lossy(&raw);
+    let form = if method == "POST" { parse_form(&body) } else { HashMap::new() };
 
     // GET: the cookie alone (SameSite=Strict stops a foreign page from making the browser
     // send it). POST: the cookie AND a matching hidden field — double submit, so even a
@@ -124,6 +128,12 @@ fn handle(app: &App, mut req: Request, token: &str) -> Result<()> {
             }
         }
         return not_found(req);
+    }
+
+    // Checked after authentication so an unauthenticated caller still learns nothing (it gets
+    // the same bare 404 as everything else), and before any task lookup so nothing is stored.
+    if oversized {
+        return respond(req, 413, "text/plain", "answer too large; nothing was stored".into());
     }
 
     app.db.expire_overdue()?;
