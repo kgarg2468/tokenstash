@@ -1,5 +1,12 @@
 //! Minimal MCP server over stdio (newline-delimited JSON-RPC 2.0).
 //! Hand-rolled on purpose: five tools, no SDK version churn. Tool results never contain values.
+//!
+//! Nor do they contain the inbox session token. Everything written here lands in the model's
+//! context, and the token is the credential that lets its holder ANSWER a task — store a value
+//! under a real key name, approve a trust gate. Giving that to the model would let it answer
+//! its own requests and self-approve the gates that exist to ask a person. So every `inbox`
+//! field below uses `util::inbox_url` (bare); the tokened form goes to the desktop
+//! notification and `tokenstash open`, which only a human reads. See `crate::inbox_auth`.
 
 use crate::cmd::need::notify_pending;
 use crate::util::{self, App};

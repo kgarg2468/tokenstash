@@ -108,7 +108,8 @@ pub fn notify_pending(app: &App, project: &std::path::Path, agent: &str, outcome
         &app.cfg,
         &format!("{} needs {}", tokenstash_core::project::short(project), pending.join(", ")),
         &format!("requested by {agent}"),
-        &util::inbox_url(&app.cfg, first_id.as_deref()),
+        // The notification is read by the human and nothing else: tokened.
+        &util::inbox_url_human(&app.cfg, first_id.as_deref()),
     );
 }
 
@@ -160,7 +161,7 @@ pub fn ask(a: AskArgs) -> Result<i32> {
         HumanRequest { title: a.title.clone(), why: a.why.clone(), url: a.url.clone(), steps: a.steps.clone(), expects: a.expects.clone() },
     )?;
     notify::ensure_inbox(&app.cfg);
-    notify::desktop(&app.cfg, &t.title, &format!("{} · {agent}", tokenstash_core::project::short(&project)), &util::inbox_url(&app.cfg, Some(&t.id)));
+    notify::desktop(&app.cfg, &t.title, &format!("{} · {agent}", tokenstash_core::project::short(&project)), &util::inbox_url_human(&app.cfg, Some(&t.id)));
     let mut task = t;
     if a.blocking {
         let start = std::time::Instant::now();
