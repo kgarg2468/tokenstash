@@ -9,14 +9,38 @@ PROJ="$(mktemp -d)"; cd "$PROJ"; git init -q .
 OUT="$(mktemp -d)"
 CANARY="sk-LEAKCANARY-$(date +%s)-0123456789abcdef"
 
+# A temp TOKENSTASH_HOME isolates the config and the database but NOT the OS credential
+# store: the Linux kernel keyring is per-USER, so a canary stashed there outlives the run
+# and turns up in the developer's next real session. Two defences, in this order:
+#   1. pin the insecure-file backend (environment above, config below) and refuse to store
+#      anything until the binary itself confirms that is the backend in use;
+#   2. forget everything this run stashed, and delete the dirs holding the canary, on exit.
+cleanup() {
+    kill "${INBOX_PID:-}" 2>/dev/null || true
+    cd / || true
+    # every secret the isolated stash knows about is a canary this run created
+    "$TS" list 2>/dev/null | awk '$1 != "NAME" && $1 ~ /^[A-Z][A-Z0-9_]*$/ { print $1, $2 }' \
+        | while read -r n i; do "$TS" forget "$n" --identity "$i" >/dev/null 2>&1 || true; done
+    rm -rf "$TOKENSTASH_HOME" "$PROJ" || true
+    # keep $OUT for debugging unless it turns out to hold the canary itself
+    if grep -rq "$CANARY" "$OUT" 2>/dev/null; then rm -rf "$OUT" || true; fi
+    return 0
+}
+trap cleanup EXIT
+
 "$TS" init --no-agents --trust "$PROJ" >"$OUT/init.txt" 2>&1 || true
 # Own the inbox for this run: a dedicated port, started by us, killed by PID. Never touch
 # whatever real inbox the developer may have running.
 PORT=$(( 20000 + RANDOM % 20000 ))
 sed -i.bak -e "s/^inbox_port = .*/inbox_port = $PORT/" -e "s/^notifications = .*/notifications = false/" "$TOKENSTASH_HOME/config.toml"
+printf 'stash_backend = "insecure-file"\n' >> "$TOKENSTASH_HOME/config.toml"
+"$TS" doctor >"$OUT/doctor-pre.txt" 2>&1 || true
+grep -qE "stash backend +insecure-file" "$OUT/doctor-pre.txt" || {
+    echo "refusing to run: the stash backend is not isolated, a canary would land in the real keyring"
+    sed -n 's/^.*stash backend/stash backend/p' "$OUT/doctor-pre.txt"; exit 1
+}
 "$TS" inbox --port "$PORT" --keep >"$OUT/inbox.txt" 2>&1 &
 INBOX_PID=$!
-trap 'kill "$INBOX_PID" 2>/dev/null || true' EXIT
 for _ in $(seq 1 30); do curl -fs "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break; sleep 0.1; done
 "$TS" need OPENAI_API_KEY AUTH_SECRET --agent ci --why "leak test" >"$OUT/need1.txt" 2>&1 || true
 TID=$("$TS" tasks --json | python3 -c "import json,sys;print([t for t in json.load(sys.stdin) if t.get('name')=='OPENAI_API_KEY'][0]['id'])")
@@ -129,5 +153,13 @@ rc=0; "$TS" need NEVER_SEEN_KEY --agent ci >/dev/null 2>&1 || rc=$?; [ $rc -eq 1
 # inbox page must not contain the value either
 curl -fs "http://127.0.0.1:$PORT/" >"$OUT/inbox-index.html" 2>/dev/null || true
 if grep -q "$CANARY" "$OUT/inbox-index.html"; then echo "LEAK: canary in inbox page"; fail=1; fi
+# The user kernel keyring is the one store a temp TOKENSTASH_HOME cannot isolate: check
+# that nothing tokenstash owns there carries this run's canary. Values are piped straight
+# into grep and never printed.
+if command -v keyctl >/dev/null 2>&1; then
+  for kid in $(keyctl list @u 2>/dev/null | awk -F: '/tokenstash/ { gsub(/ /, "", $1); print $1 }'); do
+    if keyctl pipe "$kid" 2>/dev/null | grep -q "LEAKCANARY"; then echo "LEAK: canary in the user kernel keyring (key $kid)"; fail=1; fi
+  done
+fi
 if [ $fail -eq 0 ]; then echo "leak test passed"; fi
 exit $fail
