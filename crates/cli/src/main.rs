@@ -82,10 +82,16 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Inbox(a) => cmd::inbox::serve(a),
         Cmd::Open => {
             let cfg = tokenstash_core::Config::load()?;
-            notify::ensure_inbox(&cfg);
-            // `open` exists to put a person in front of the inbox, so it is one of the two
-            // surfaces that always carries the session token.
-            let url = util::inbox_url_human(&cfg, None);
+            let state = notify::ensure_inbox(&cfg);
+            // `open` exists to put a person in front of the inbox, so it carries the session
+            // token — but only once ownership is proved. If something else holds the port we
+            // launch no browser and print no URL: doing either would hand the squatter the
+            // token (in the query string) and the human (into its paste form).
+            if let Some(why) = util::inbox_unavailable(&cfg, state) {
+                eprintln!("tokenstash: {why}");
+                return Ok(tokenstash_core::exit::ERROR);
+            }
+            let url = util::inbox_url_human(&cfg, None, state);
             let _ = open::that(&url);
             println!("{url}");
             Ok(0)

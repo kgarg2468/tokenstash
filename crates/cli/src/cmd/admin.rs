@@ -40,7 +40,12 @@ pub fn tasks(a: TasksArgs) -> Result<i32> {
         };
         println!("{} {:<10} {:<40} {:<24} {}", status_icon(&t.status), t.id, what, util::short(&t.project), t.agent);
     }
-    println!("\ninbox: {}", util::inbox_url_tty(&app.cfg, None));
+    // Printed to stdout, so the TTY check must be stdout's.
+    let state = crate::notify::inbox_state(&app.cfg);
+    println!("\ninbox: {}", util::inbox_url_tty(&app.cfg, None, state, util::Stream::Stdout));
+    if let Some(why) = util::inbox_unavailable(&app.cfg, state) {
+        println!("       {why}");
+    }
     Ok(0)
 }
 

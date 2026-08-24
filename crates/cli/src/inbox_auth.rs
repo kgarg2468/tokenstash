@@ -126,15 +126,16 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
+/// `TOKENSTASH_HOME` is process-global, so every test that sets it shares this lock.
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `TOKENSTASH_HOME` is process-global, so token tests take a lock like the core tests do.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     fn tmp_home(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("tokenstash-inbox-auth-{name}-{}", std::process::id()));
