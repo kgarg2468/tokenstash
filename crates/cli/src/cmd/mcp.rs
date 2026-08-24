@@ -162,7 +162,7 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
             Ok((json!({
                 "results": results,
                 "env_file": project.join(&app.cfg.env_file),
-                "inbox": util::inbox_url(&app.cfg, None),
+                "inbox": util::inbox_url_agent(&app.cfg, None, if pending { crate::notify::inbox_state(&app.cfg) } else { crate::notify::Inbox::Down }),
                 "next": if pending { "The user has been notified. Continue other work; call task_check with the task_id later." } else { "Done." }
             }), false))
         }
@@ -188,7 +188,7 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
                     task = app.db.get_task(&task.id)?.unwrap_or(task);
                 }
             }
-            Ok((json!({ "task_id": task.id, "status": task.status, "note": task.note, "inbox": util::inbox_url(&app.cfg, Some(&task.id)) }), false))
+            Ok((json!({ "task_id": task.id, "status": task.status, "note": task.note, "inbox": util::inbox_url_agent(&app.cfg, Some(&task.id), crate::notify::inbox_state(&app.cfg)) }), false))
         }
         "task_check" => {
             let id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -203,7 +203,7 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
             let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
             let pid = project.to_string_lossy().to_string();
             let list = app.db.list_tasks(if all { None } else { Some(&pid) }, true)?;
-            Ok((json!({ "tasks": list, "inbox": util::inbox_url(&app.cfg, None) }), false))
+            Ok((json!({ "tasks": list, "inbox": util::inbox_url_agent(&app.cfg, None, crate::notify::inbox_state(&app.cfg)) }), false))
         }
         "secrets_list" => {
             let list = app.db.list_secrets()?;

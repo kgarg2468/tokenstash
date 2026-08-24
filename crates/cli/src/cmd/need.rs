@@ -70,11 +70,13 @@ pub fn need(a: NeedArgs) -> Result<i32> {
         }
     }
 
+    // Only probed when something is pending: a hit never needs the inbox.
+    let state = if outcomes.iter().any(|o| o.is_pending()) { notify::inbox_state(&app.cfg) } else { notify::Inbox::Down };
     if a.json {
         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
             "project": project,
             "env_file": app.cfg.env_file,
-            "inbox": util::inbox_url(&app.cfg, None),
+            "inbox": util::inbox_url_agent(&app.cfg, None, state),
             "results": outcomes,
         }))?);
     } else {
@@ -86,7 +88,7 @@ pub fn need(a: NeedArgs) -> Result<i32> {
                     println!("✓ {name} {} → {rel}", if *generated { "generated and injected" } else { "injected" });
                 }
                 Outcome::Pending { name, task_id, .. } => {
-                    println!("⏳ {name} pending — task {task_id} → {}", util::inbox_url(&app.cfg, Some(task_id)));
+                    println!("⏳ {name} pending — task {task_id} → {}", util::inbox_url_agent(&app.cfg, Some(task_id), state));
                 }
                 Outcome::Denied { name, .. } => println!("✗ {name} denied by the user — do not ask again; work around it"),
                 Outcome::Expired { name, .. } => println!("✗ {name} expired unanswered"),
@@ -173,10 +175,11 @@ pub fn ask(a: AskArgs) -> Result<i32> {
             task = app.db.get_task(&task.id)?.unwrap_or(task);
         }
     }
+    let state = notify::inbox_state(&app.cfg);
     if a.json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "task": task, "inbox": util::inbox_url(&app.cfg, Some(&task.id)) }))?);
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "task": task, "inbox": util::inbox_url_agent(&app.cfg, Some(&task.id), state) }))?);
     } else {
-        println!("{} {} — task {} → {}", status_icon(&task.status), task.title, task.id, util::inbox_url(&app.cfg, Some(&task.id)));
+        println!("{} {} — task {} → {}", status_icon(&task.status), task.title, task.id, util::inbox_url_agent(&app.cfg, Some(&task.id), state));
         if let Some(n) = &task.note {
             println!("  note: {n}");
         }

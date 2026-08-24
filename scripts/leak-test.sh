@@ -309,6 +309,10 @@ for f in "$OUT"/squat-*.txt; do
 done
 grep -q "held by another process" "$OUT/squat-open.txt" || { echo "FAIL: open did not say why it refused"; fail=1; }
 grep -q "http://" "$OUT/squat-open.txt" && { echo "FAIL: open printed a URL for an unverified listener"; fail=1; }
+for f in "$OUT"/squat-tasks*.txt "$OUT"/squat-doctor*.txt "$OUT"/squat-need.txt; do
+  [ -f "$f" ] || continue
+  grep -q "http://127.0.0.1:$PORT" "$f" && { echo "FAIL: $(basename "$f") linked a human to an unverified listener"; fail=1; }
+done
 kill "$SQUAT_PID" 2>/dev/null || true
 
 if [ $fail -eq 0 ]; then echo "leak test passed"; fi
