@@ -98,11 +98,12 @@ pub fn inbox_url_human(cfg: &Config, task_id: Option<&str>, state: Inbox) -> Str
 /// the token here — that is the known limit of a TTY heuristic, and the reason no
 /// unconditional surface ever prints it.
 ///
-/// A listener that *failed* the proof never gets a link at all, bare or tokened, on any
-/// stream: a bare loopback URL in front of a person is an invitation to paste a key into an
-/// impostor's form, and an agent would relay it to the person verbatim.
+/// Only a *proved* inbox gets a link at all, bare or tokened, on any stream: a loopback URL
+/// in front of a person is an invitation to paste a key into whatever answers there, and an
+/// agent relays the line verbatim. `Down` gets no link either — a squatter can bind the port
+/// between our probe and the click.
 pub fn inbox_url_tty(cfg: &Config, task_id: Option<&str>, state: Inbox, stream: Stream) -> String {
-    if matches!(state, Inbox::Foreign) {
+    if !matches!(state, Inbox::Ours) {
         return inbox_notice(cfg, task_id, state);
     }
     if is_terminal(stream) {
@@ -112,10 +113,10 @@ pub fn inbox_url_tty(cfg: &Config, task_id: Option<&str>, state: Inbox, stream: 
     }
 }
 
-/// Agent-facing: the bare URL (never the token) — except for a listener that failed the
-/// ownership proof, which gets no link at all, because the agent relays this line to a person.
+/// Agent-facing: the bare URL (never the token) when the inbox is proved ours; otherwise the
+/// notice and no link, because the agent relays this line to a person.
 pub fn inbox_url_agent(cfg: &Config, task_id: Option<&str>, state: Inbox) -> String {
-    if matches!(state, Inbox::Foreign) {
+    if !matches!(state, Inbox::Ours) {
         inbox_notice(cfg, task_id, state)
     } else {
         inbox_url(cfg, task_id)
@@ -213,13 +214,17 @@ mod tests {
     }
 
     #[test]
-    fn a_foreign_listener_gets_no_link_on_any_stream() {
-        with_home("foreign-tty", |cfg| {
-            for stream in [Stream::Stdout, Stream::Stderr] {
-                let out = inbox_url_tty(&cfg, Some("t_abc"), Inbox::Foreign, stream);
-                assert!(!out.contains("http"), "{stream:?} linked to an unverified listener: {out}");
-                assert!(out.contains("held by another process"), "{out}");
+    fn an_unproved_inbox_gets_no_link_on_any_surface() {
+        with_home("unproved", |cfg| {
+            for state in [Inbox::Foreign, Inbox::Down] {
+                for stream in [Stream::Stdout, Stream::Stderr] {
+                    let out = inbox_url_tty(&cfg, Some("t_abc"), state, stream);
+                    assert!(!out.contains("http"), "{state:?}/{stream:?} linked to an unproved inbox: {out}");
+                }
+                let out = inbox_url_agent(&cfg, Some("t_abc"), state);
+                assert!(!out.contains("http"), "agent surface linked to an unproved inbox: {out}");
             }
+            assert!(inbox_url_agent(&cfg, None, Inbox::Ours).starts_with("http://127.0.0.1:"));
         });
     }
 
