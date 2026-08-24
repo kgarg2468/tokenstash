@@ -61,9 +61,15 @@ fn challenge(s: &mut TcpStream, addr: &SocketAddr, nonce: &str) -> Option<String
 }
 
 /// Spawn `tokenstash inbox` detached unless our own, verified inbox is already up.
-pub fn ensure_inbox(cfg: &Config) {
+///
+/// Returns what is on the port when we are done, and callers must act on it: this is the
+/// single point where the rest of the CLI learns whether it may hand out a tokened URL.
+/// Warning and carrying on is not enough — a caller that then prints `?t=` has given the
+/// squatter the session token, and the human a link straight to it.
+#[must_use]
+pub fn ensure_inbox(cfg: &Config) -> Inbox {
     match inbox_state(cfg) {
-        Inbox::Ours => return,
+        Inbox::Ours => return Inbox::Ours,
         Inbox::Foreign => {
             // Do not spawn (the bind would fail) and, more importantly, do not send a human
             // to a URL owned by someone else. Nothing secret was disclosed getting here.
@@ -73,11 +79,11 @@ pub fn ensure_inbox(cfg: &Config) {
                 cfg.inbox_port,
                 tokenstash_core::config::config_path().display()
             );
-            return;
+            return Inbox::Foreign;
         }
         Inbox::Down => {}
     }
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = std::env::current_exe() else { return Inbox::Down };
     let mut c = std::process::Command::new(exe);
     c.arg("inbox").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     #[cfg(unix)]
@@ -87,12 +93,16 @@ pub fn ensure_inbox(cfg: &Config) {
     }
     let _ = c.spawn();
     for _ in 0..20 {
-        if inbox_state(cfg) == Inbox::Ours {
-            return;
+        let state = inbox_state(cfg);
+        if state == Inbox::Ours {
+            return state;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     eprintln!("tokenstash: the inbox did not come up on port {}", cfg.inbox_port);
+    // Whatever ended up there, we could not prove it is ours, so nobody downstream may
+    // treat it as ours.
+    inbox_state(cfg)
 }
 
 /// Human-readable inbox status for `doctor`.
@@ -104,14 +114,16 @@ pub fn describe(state: Inbox) -> &'static str {
     }
 }
 
-pub fn desktop(cfg: &Config, title: &str, body: &str, url: &str) {
+/// `where_to` is whatever `util::inbox_notice` produced: a tokened URL when we proved the
+/// inbox is ours, or a sentence explaining why there is no link. Never build it here.
+pub fn desktop(cfg: &Config, title: &str, body: &str, where_to: &str) {
     if !cfg.notifications {
         return;
     }
     let _ = notify_rust::Notification::new()
         .appname("tokenstash")
         .summary(title)
-        .body(&format!("{body}\n{url}"))
+        .body(&if where_to.is_empty() { body.to_string() } else { format!("{body}\n{where_to}") })
         .timeout(notify_rust::Timeout::Milliseconds(15000))
         .show();
 }
