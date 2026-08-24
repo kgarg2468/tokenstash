@@ -97,9 +97,26 @@ pub fn inbox_url_human(cfg: &Config, task_id: Option<&str>, state: Inbox) -> Str
 /// agent's capture buffer) they get the bare URL. An agent that allocates a PTY can still see
 /// the token here — that is the known limit of a TTY heuristic, and the reason no
 /// unconditional surface ever prints it.
+///
+/// A listener that *failed* the proof never gets a link at all, bare or tokened, on any
+/// stream: a bare loopback URL in front of a person is an invitation to paste a key into an
+/// impostor's form, and an agent would relay it to the person verbatim.
 pub fn inbox_url_tty(cfg: &Config, task_id: Option<&str>, state: Inbox, stream: Stream) -> String {
+    if matches!(state, Inbox::Foreign) {
+        return inbox_notice(cfg, task_id, state);
+    }
     if is_terminal(stream) {
         inbox_url_human(cfg, task_id, state)
+    } else {
+        inbox_url(cfg, task_id)
+    }
+}
+
+/// Agent-facing: the bare URL (never the token) — except for a listener that failed the
+/// ownership proof, which gets no link at all, because the agent relays this line to a person.
+pub fn inbox_url_agent(cfg: &Config, task_id: Option<&str>, state: Inbox) -> String {
+    if matches!(state, Inbox::Foreign) {
+        inbox_notice(cfg, task_id, state)
     } else {
         inbox_url(cfg, task_id)
     }
@@ -192,6 +209,17 @@ mod tests {
 
             // Verified: the notice IS the tokened link.
             assert_eq!(inbox_notice(&cfg, None, Inbox::Ours), inbox_url_human(&cfg, None, Inbox::Ours));
+        });
+    }
+
+    #[test]
+    fn a_foreign_listener_gets_no_link_on_any_stream() {
+        with_home("foreign-tty", |cfg| {
+            for stream in [Stream::Stdout, Stream::Stderr] {
+                let out = inbox_url_tty(&cfg, Some("t_abc"), Inbox::Foreign, stream);
+                assert!(!out.contains("http"), "{stream:?} linked to an unverified listener: {out}");
+                assert!(out.contains("held by another process"), "{out}");
+            }
         });
     }
 
