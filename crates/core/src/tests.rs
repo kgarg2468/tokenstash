@@ -647,3 +647,44 @@ fn nested_gitignore_reinclude_is_handled_via_git() {
     let nested = std::fs::read_to_string(sub.join(".gitignore")).unwrap();
     assert_eq!(nested.lines().last(), Some(".env.local"), "rule appended to the closest ignore file: {nested}");
 }
+
+/// `env_file` is configuration, not a trusted path. Every protection in this module
+/// (gitignore coverage, the tracked-file check) is anchored on the project directory, so a
+/// value that resolves outside it is a secret written with no protection at all.
+#[test]
+fn absolute_env_file_is_refused() {
+    let dir = tmp("envfile-abs");
+    let outside = tmp("envfile-abs-outside").join("ESCAPE-TARGET.env");
+    let target = outside.to_string_lossy().to_string();
+    let err = envfile::write(&dir, &target, "K", &SecretString::from("vvvvvvvv".to_string())).unwrap_err();
+    assert!(err.to_string().contains("relative"), "must name the problem: {err}");
+    assert!(!outside.exists(), "an absolute env_file must not write a secret outside the project");
+    assert!(!envfile::has(&dir, &target, "K"));
+}
+
+#[test]
+fn env_file_escaping_with_dotdot_is_refused() {
+    let base = tmp("envfile-dotdot");
+    let proj = base.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let err = envfile::write(&proj, "../ESCAPE-TARGET.env", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap_err();
+    assert!(err.to_string().contains(".."), "must name the problem: {err}");
+    assert!(!base.join("ESCAPE-TARGET.env").exists(), "'..' must not write a secret outside the project");
+}
+
+#[test]
+fn env_file_under_a_symlinked_parent_outside_the_project_is_refused() {
+    let base = tmp("envfile-linked-parent");
+    let proj = base.join("proj");
+    let outside = base.join("outside");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, proj.join("linked")).unwrap();
+    let err = envfile::write(&proj, "linked/.env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap_err();
+    assert!(err.to_string().contains("outside the project"), "must name the problem: {err}");
+    assert!(!outside.join(".env.local").exists(), "a symlinked parent must not route the secret out of the project");
+    // ...while a genuine subdirectory of the project still works
+    std::fs::create_dir_all(proj.join("config")).unwrap();
+    envfile::write(&proj, "config/.env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap();
+    assert!(envfile::has(&proj, "config/.env.local", "K"));
+}
