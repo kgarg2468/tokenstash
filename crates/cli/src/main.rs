@@ -1,6 +1,7 @@
 //! tokenstash — Your agent asks you for a key once. Never again.
 
 mod cmd;
+mod inbox_auth;
 mod notify;
 mod util;
 
