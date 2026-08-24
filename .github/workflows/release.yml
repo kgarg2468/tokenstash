@@ -54,5 +54,20 @@ jobs:
           json.dump(sums, open('npm/checksums.json', 'w'), indent=2)
           PY
           cat npm/checksums.json
-      - run: cd npm && npm version ${GITHUB_REF_NAME#v} --no-git-tag-version && npm publish --access public
+      - name: brew formula
+        # Generated from the same release digests; paste into the tap repo
+        # (kgarg2468/homebrew-tokenstash, Formula/tokenstash.rb) or let a later job push it.
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          bash scripts/brew-formula.sh "$GITHUB_REF_NAME" > tokenstash.rb
+          cat tokenstash.rb
+          gh release upload "$GITHUB_REF_NAME" tokenstash.rb --clobber
+      - name: npm publish gate
+        # No NPM_TOKEN secret → the release still ships binaries + formula, npm is just skipped.
+        id: gate
+        env: { T: "${{ secrets.NPM_TOKEN }}" }
+        run: |
+          if [ -n "$T" ]; then echo "publish=true" >> "$GITHUB_OUTPUT"; else echo "publish=false" >> "$GITHUB_OUTPUT"; echo "::notice::NPM_TOKEN not set; skipping npm publish"; fi
+      - if: steps.gate.outputs.publish == 'true'
+        run: cd npm && npm version ${GITHUB_REF_NAME#v} --no-git-tag-version && npm publish --access public
         env: { NODE_AUTH_TOKEN: "${{ secrets.NPM_TOKEN }}" }

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Print a Homebrew formula for a published release, with per-platform sha256 taken from the
+# release's *.sha256 assets (never recomputed locally). Usage: scripts/brew-formula.sh v0.1.0
+set -euo pipefail
+tag="${1:?usage: brew-formula.sh vX.Y.Z}"
+repo="${REPO:-kgarg2468/tokenstash}"
+version="${tag#v}"
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+gh release download "$tag" --repo "$repo" --pattern '*.sha256' --dir "$tmp" >/dev/null
+sum() { awk '{print $1}' "$tmp/tokenstash-$1.tar.gz.sha256"; }
+base="https://github.com/$repo/releases/download/$tag"
+cat <<RUBY
+class Tokenstash < Formula
+  desc "Your agent asks you for a key once. Never again - in any project, in any agent."
+  homepage "https://github.com/$repo"
+  version "$version"
+  license "MIT"
+
+  on_macos do
+    on_arm do
+      url "$base/tokenstash-darwin-arm64.tar.gz"
+      sha256 "$(sum darwin-arm64)"
+    end
+    on_intel do
+      url "$base/tokenstash-darwin-x64.tar.gz"
+      sha256 "$(sum darwin-x64)"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "$base/tokenstash-linux-arm64.tar.gz"
+      sha256 "$(sum linux-arm64)"
+    end
+    on_intel do
+      url "$base/tokenstash-linux-x64.tar.gz"
+      sha256 "$(sum linux-x64)"
+    end
+  end
+
+  def install
+    bin.install "tokenstash"
+  end
+
+  test do
+    assert_match "tokenstash", shell_output("#{bin}/tokenstash --help")
+  end
+end
+RUBY
