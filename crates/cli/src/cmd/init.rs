@@ -46,10 +46,16 @@ impl Manifest {
         tokenstash_core::fsutil::write_atomic_private(&manifest_path(), &serde_json::to_string_pretty(self)?)?;
         Ok(())
     }
-    /// Back up `p` before the first time init touches it. Idempotent across re-runs: the
-    /// backup taken by the FIRST init is the one that matters.
-    fn touch(&mut self, p: &Path) -> Result<()> {
-        if self.files.iter().any(|(q, _)| q == p) { return Ok(()); }
+    /// Back up `p`, run the mutation, and record the file ONLY if the mutation succeeded —
+    /// a failed merge changed nothing, so `--undo` must not later "restore" a stale copy
+    /// over work the user did afterwards. The manifest is saved after every recorded
+    /// change, so a crash mid-way still leaves an undo record for what was already done.
+    /// Idempotent across re-runs: the backup taken by the FIRST init is the one that
+    /// matters, later runs keep it.
+    fn mutate(&mut self, p: &Path, f: impl FnOnce() -> Result<()>) -> Result<()> {
+        if self.files.iter().any(|(q, _)| q == p) {
+            return f();
+        }
         let backup = if p.exists() {
             let dir = tokenstash_core::config::config_dir().join("init-backups");
             fs::create_dir_all(&dir)?;
@@ -58,7 +64,16 @@ impl Manifest {
             fs::copy(p, &b)?;
             Some(b)
         } else { None };
+        f()?;
         self.files.push((p.to_path_buf(), backup));
+        self.save()
+    }
+
+    fn record_dir(&mut self, d: &Path) -> Result<()> {
+        if !self.dirs.iter().any(|q| q == d) {
+            self.dirs.push(d.to_path_buf());
+            self.save()?;
+        }
         Ok(())
     }
 }
@@ -140,9 +155,10 @@ pub fn init(a: InitArgs) -> Result<i32> {
         // Claude Code
         if home.join(".claude").is_dir() || which("claude") {
             let skill_dir = home.join(".claude/skills/tokenstash");
-            if !skill_dir.exists() && !manifest.dirs.contains(&skill_dir) { manifest.dirs.push(skill_dir.clone()); }
+            let skill_is_new = !skill_dir.exists();
             fs::create_dir_all(&skill_dir)?;
             fs::write(skill_dir.join("SKILL.md"), SKILL_MD)?;
+            if skill_is_new { manifest.record_dir(&skill_dir)?; }
             touched.push(skill_dir.join("SKILL.md"));
             // The CLI registers cleanly when present. The desktop app ships without `claude`
             // on PATH, so fall back to writing the same user-scope entry into ~/.claude.json
@@ -156,11 +172,10 @@ pub fn init(a: InitArgs) -> Result<i32> {
                     .status()
                     .map(|s| s.success())
                     .unwrap_or(false);
-                if ok { manifest.claude_mcp_registered = true; }
+                if ok { manifest.claude_mcp_registered = true; manifest.save()?; }
                 ok
             } else {
-                manifest.touch(&claude_json)?;
-                match merge_mcp_json_typed(&claude_json, &exe_s, true) {
+                match manifest.mutate(&claude_json, || merge_mcp_json_typed(&claude_json, &exe_s, true)) {
                     Ok(()) => { touched.push(claude_json.clone()); true }
                     Err(e) => { println!("! Claude Code: left {} untouched — {e}", claude_json.display()); false }
                 }
@@ -172,11 +187,10 @@ pub fn init(a: InitArgs) -> Result<i32> {
         // Codex
         let codex = home.join(".codex");
         if codex.is_dir() {
-            manifest.touch(&codex.join("config.toml"))?;
-            manifest.touch(&codex.join("AGENTS.md"))?;
-            match merge_codex_toml(&codex.join("config.toml"), &exe_s) {
+            let (ctoml, cagents) = (codex.join("config.toml"), codex.join("AGENTS.md"));
+            match manifest.mutate(&ctoml, || merge_codex_toml(&ctoml, &exe_s)) {
                 Ok(()) => {
-                    append_snippet(&codex.join("AGENTS.md"))?;
+                    manifest.mutate(&cagents, || append_snippet(&cagents))?;
                     touched.push(codex.join("config.toml"));
                     touched.push(codex.join("AGENTS.md"));
                     println!("✓ Codex: MCP server ({}) + usage snippet ({})", codex.join("config.toml").display(), codex.join("AGENTS.md").display());
@@ -188,8 +202,8 @@ pub fn init(a: InitArgs) -> Result<i32> {
         // Cursor
         let cursor = home.join(".cursor");
         if cursor.is_dir() {
-            manifest.touch(&cursor.join("mcp.json"))?;
-            match merge_mcp_json(&cursor.join("mcp.json"), &exe_s) {
+            let cj = cursor.join("mcp.json");
+            match manifest.mutate(&cj, || merge_mcp_json(&cj, &exe_s)) {
                 Ok(()) => { touched.push(cursor.join("mcp.json")); println!("✓ Cursor: MCP server registered ({})", cursor.join("mcp.json").display()) }
                 Err(e) => println!("! Cursor: left ~/.cursor/mcp.json untouched — {e}"),
             }
@@ -198,8 +212,8 @@ pub fn init(a: InitArgs) -> Result<i32> {
         // Gemini CLI
         let gemini = home.join(".gemini");
         if gemini.is_dir() {
-            manifest.touch(&gemini.join("settings.json"))?;
-            match merge_mcp_json(&gemini.join("settings.json"), &exe_s) {
+            let gj = gemini.join("settings.json");
+            match manifest.mutate(&gj, || merge_mcp_json(&gj, &exe_s)) {
                 Ok(()) => { touched.push(gemini.join("settings.json")); println!("✓ Gemini CLI: MCP server registered ({})", gemini.join("settings.json").display()) }
                 Err(e) => println!("! Gemini CLI: left ~/.gemini/settings.json untouched — {e}"),
             }
@@ -208,12 +222,10 @@ pub fn init(a: InitArgs) -> Result<i32> {
 
     if a.project {
         let p = std::env::current_dir()?.join("AGENTS.md");
-        manifest.touch(&p)?;
-        append_snippet(&p)?;
+        manifest.mutate(&p, || append_snippet(&p))?;
         touched.push(p.clone());
         println!("✓ wrote tokenstash section to {}", p.display());
     }
-    manifest.save()?;
 
     if !touched.is_empty() {
         println!("\nFiles outside {} that init wrote (undo with `tokenstash init --undo`):", tokenstash_core::config::config_dir().display());
