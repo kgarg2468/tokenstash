@@ -737,3 +737,31 @@ fn env_file_with_leading_dot_slash_is_accepted() {
     assert!(p.starts_with(&dir));
     assert!(envfile::has(&dir, "./.env.local", "K"));
 }
+
+
+#[test]
+fn a_git_dir_in_a_shared_ancestor_never_becomes_the_project_root() {
+    // /tmp-like: sticky, world-writable. A stray .git there must not capture children.
+    let shared = tmp("shared-ancestor");
+    std::fs::create_dir_all(shared.join(".git")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    }
+    let proj = shared.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    assert_eq!(envfile::git_root(&proj), None, "sticky ancestor must not be a root");
+    assert_eq!(crate::project::canonical(&proj), proj.canonicalize().unwrap());
+    // ...and the env file lands in the project, not the ancestor
+    let written = envfile::write(&proj, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap();
+    assert!(written.starts_with(proj.canonicalize().unwrap()) || written.starts_with(&proj), "{}", written.display());
+    assert!(!shared.join(".env.local").exists());
+    assert!(!shared.join(".gitignore").exists(), "no ignore rule written into the shared ancestor");
+    // a normal, user-owned repo still resolves as before
+    let repo = tmp("owned-repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let sub = repo.join("a/b");
+    std::fs::create_dir_all(&sub).unwrap();
+    assert_eq!(envfile::git_root(&sub), Some(repo.clone()));
+}
