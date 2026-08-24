@@ -242,9 +242,18 @@ pub fn is_git_tracked(project: &Path, path: &Path) -> bool {
 }
 
 /// Walk up to find a git repo root.
+/// Nearest ancestor (or `start` itself) that holds a `.git`, with two guards git itself
+/// does not apply: the walk never crosses into a directory the current user does not own,
+/// and never accepts a world-writable/sticky directory (`/tmp`, `/var/tmp`) as a root. A
+/// stray `.git` in `/tmp` — one `git init` from the wrong cwd is enough — would otherwise
+/// make every project under it resolve to `/tmp`, and the env file (and `.gitignore`) would
+/// be written there, outside the project. Seen for real by the leak test.
 pub fn git_root(start: &Path) -> Option<PathBuf> {
     let mut p = start.to_path_buf();
     loop {
+        if !dir_is_private_to_user(&p) {
+            return None;
+        }
         if p.join(".git").exists() {
             return Some(p);
         }
@@ -252,6 +261,23 @@ pub fn git_root(start: &Path) -> Option<PathBuf> {
             return None;
         }
     }
+}
+
+/// Owned by the current user and not sticky/world-writable. Non-unix: always true.
+#[cfg(unix)]
+fn dir_is_private_to_user(p: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(md) = fs::metadata(p) else { return false };
+    let uid = unsafe { libc_geteuid() };
+    md.uid() == uid && md.mode() & 0o1002 == 0
+}
+#[cfg(not(unix))]
+fn dir_is_private_to_user(_p: &Path) -> bool { true }
+
+#[cfg(unix)]
+unsafe fn libc_geteuid() -> u32 {
+    extern "C" { fn geteuid() -> u32; }
+    geteuid()
 }
 
 /// If inside a git repo, make sure the env file is ignored. We add a rule to the root
