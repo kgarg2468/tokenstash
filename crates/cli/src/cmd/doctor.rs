@@ -35,7 +35,7 @@ pub fn doctor() -> Result<i32> {
 
     check("registry", true, format!("{} providers", tokenstash_core::registry::count()));
     ok &= check("trust roots", !cfg.trust_roots.is_empty(), if cfg.trust_roots.is_empty() { "none (every project will ask once)".into() } else { cfg.trust_roots.iter().map(|p| tokenstash_core::project::short(p)).collect::<Vec<_>>().join(", ") });
-    check("inbox", true, format!("{}  {}", crate::util::inbox_url(&cfg, None), if notify::inbox_running(&cfg) { "running" } else { "not running (starts on demand)" }));
+    check("inbox", true, format!("{}  {}", crate::util::inbox_url_tty(&cfg, None), notify::inbox_status(&cfg)));
 
     let home = dirs::home_dir().unwrap_or_default();
     let claude_skill = home.join(".claude/skills/tokenstash/SKILL.md").exists();
