@@ -163,7 +163,7 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
                 "results": results,
                 "env_file": project.join(&app.cfg.env_file),
                 "inbox": util::inbox_url_agent(&app.cfg, None, if pending { crate::notify::inbox_state(&app.cfg) } else { crate::notify::Inbox::Down }),
-                "next": if pending { "The user has been notified and opens the inbox from the notification or with `tokenstash open` (do not tell them to click the inbox link directly; a fresh browser session gets 404 by design). Continue other work; call task_check with the task_id later." } else { "Done." }
+                "next": if pending { "Show the user the `inbox` link — it works as-is for pasting the key (if the page asks for the full session, the user clicks the desktop notification or runs `tokenstash open`). Continue other work; call task_check with the task_id later." } else { "Done." }
             }), false))
         }
         "human_request" => {

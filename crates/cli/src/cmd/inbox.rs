@@ -37,7 +37,7 @@ pub fn serve(a: InboxArgs) -> Result<i32> {
     let port = a.port.unwrap_or(app.cfg.inbox_port);
     // Minted here on the first ever start and reused afterwards, so a notification the human
     // has not clicked yet still opens after the inbox has idled out and been respawned.
-    let token = inbox_auth::ensure_token()?;
+    let tokens = inbox_auth::Tokens::ensure()?;
     let server = match Server::http(format!("127.0.0.1:{port}")) {
         Ok(s) => s,
         Err(_) => { eprintln!("inbox already running on {port}"); return Ok(0); }
@@ -48,7 +48,7 @@ pub fn serve(a: InboxArgs) -> Result<i32> {
         match server.recv_timeout(Duration::from_secs(1)) {
             Ok(Some(req)) => {
                 last_activity = Instant::now();
-                if let Err(e) = handle(&app, req, &token) {
+                if let Err(e) = handle(&app, req, &tokens) {
                     eprintln!("inbox: {e:#}");
                 }
             }
@@ -66,7 +66,9 @@ pub fn serve(a: InboxArgs) -> Result<i32> {
     }
 }
 
-fn handle(app: &App, mut req: Request, token: &str) -> Result<()> {
+fn handle(app: &App, mut req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
+    use inbox_auth::Scope;
+    let token = &tokens.full;
     let url = req.url().to_string();
     let (path, query) = match url.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
@@ -94,7 +96,11 @@ fn handle(app: &App, mut req: Request, token: &str) -> Result<()> {
         return not_found(req);
     }
 
-    let cookie_ok = cookie(&req, inbox_auth::COOKIE).map(|c| inbox_auth::ct_eq(&c, token)).unwrap_or(false);
+    // The cookie value is whichever token the session was opened with; its scope decides
+    // what this request may do. The CSRF field must match the cookie, not merely be valid.
+    let session = cookie(&req, inbox_auth::COOKIE);
+    let scope = session.as_deref().and_then(|c| tokens.scope_of(c));
+    let cookie_ok = scope.is_some();
     // Read one byte past the limit so "exactly at the limit" and "too long" are
     // distinguishable. Truncating instead would be worse than refusing: the CSRF field sits at
     // the front of the body, so a cut-off form still authenticates, and parse_form would hand
@@ -111,24 +117,33 @@ fn handle(app: &App, mut req: Request, token: &str) -> Result<()> {
     // send it). POST: the cookie AND a matching hidden field — double submit, so even a
     // bypassed or unsupported SameSite cannot turn a cross-site form post into an answer.
     let authed = match method.as_str() {
-        "POST" => cookie_ok && form.get("t").map(|t| inbox_auth::ct_eq(t, token)).unwrap_or(false),
+        "POST" => cookie_ok && matches!((form.get("t"), session.as_deref()), (Some(t), Some(c)) if inbox_auth::ct_eq(t, c)),
         _ => cookie_ok,
     };
-    if !authed {
-        // First visit: the human clicked a `?t=<token>` URL from the notification or from
-        // `tokenstash open`. Swap it for a cookie and bounce to a clean path so the token
-        // stops appearing in the address bar, in history, and in any Referer we might send.
-        if method == "GET" {
-            if let Some(t) = q.get("t") {
-                if inbox_auth::ct_eq(t, token) {
-                    let rest: Vec<&str> = query.split('&').filter(|kv| !kv.is_empty() && !kv.starts_with("t=")).collect();
-                    let dest = if rest.is_empty() { path.clone() } else { format!("{path}?{}", rest.join("&")) };
-                    return redirect_authed(req, &dest, token);
-                }
+    // A `?t=` on a GET: the human clicked a link from the chat (paste scope), the
+    // notification or `tokenstash open` (full scope). Swap it for a cookie and bounce to a
+    // clean path so the token stops appearing in the address bar, history, and Referer.
+    // A full-scope cookie is never downgraded by a later paste-scope link: one
+    // `tokenstash open` per browser upgrades every agent link from then on.
+    if method == "GET" {
+        if let Some(t) = q.get("t") {
+            if let Some(presented) = tokens.scope_of(t) {
+                let rest: Vec<&str> = query.split('&').filter(|kv| !kv.is_empty() && !kv.starts_with("t=")).collect();
+                let dest = if rest.is_empty() { path.clone() } else { format!("{path}?{}", rest.join("&")) };
+                return match (scope, presented) {
+                    (Some(Scope::Full), _) => redirect(req, &dest),
+                    _ => redirect_authed(req, &dest, tokens.for_scope(presented)),
+                };
             }
         }
+    }
+    if !authed {
         return not_found(req);
     }
+    let scope = scope.unwrap_or(Scope::Paste);
+    // The CSRF hidden field carries the session's own token, so a paste-scope page never
+    // learns the full token.
+    let session_token = tokens.for_scope(scope);
 
     // Checked after authentication so an unauthenticated caller still learns nothing (it gets
     // the same bare 404 as everything else), and before any task lookup so nothing is stored.
@@ -154,7 +169,7 @@ fn handle(app: &App, mut req: Request, token: &str) -> Result<()> {
         let id = id.trim_end_matches('/').to_string();
         let Some(task) = app.db.find_task(&id)? else { return respond(req, 404, "text/plain", "no such task".into()) };
         if method == "GET" {
-            return respond(req, 200, "text/html; charset=utf-8", page_task(&task, None, token));
+            return respond(req, 200, "text/html; charset=utf-8", page_task(&task, None, session_token, scope));
         }
         if method == "POST" {
             let action = form.get("action").cloned().unwrap_or_default();
@@ -173,6 +188,12 @@ fn handle(app: &App, mut req: Request, token: &str) -> Result<()> {
                         }
                     }
                     (TaskKind::Approval, _) => {
+                        // Approving is the one thing a paste-scope session must not do: it is
+                        // the human's yes to "this project may use my key", and the agent's
+                        // link must not be able to give it. Refuse with no state change.
+                        if scope != Scope::Full {
+                            anyhow::bail!("approving needs the full inbox session: click the desktop notification or run `tokenstash open`, then reload this page");
+                        }
                         match tasks::answer_approval(&ctx, &task, action == "allow")? {
                             AnswerResult::Approved { injected } => Ok(format!("Approved; injected {}", if injected.is_empty() { "nothing new".into() } else { injected.join(", ") })),
                             _ => Ok("Denied".into()),
@@ -183,7 +204,7 @@ fn handle(app: &App, mut req: Request, token: &str) -> Result<()> {
             })();
             return match msg {
                 Ok(m) => redirect(req, &format!("/?m={}", urlencoding::encode(&m))),
-                Err(e) => respond(req, 200, "text/html; charset=utf-8", page_task(&task, Some(&format!("{e:#}")), token)),
+                Err(e) => respond(req, 200, "text/html; charset=utf-8", page_task(&task, Some(&format!("{e:#}")), session_token, scope)),
             };
         }
     }
@@ -310,7 +331,7 @@ fn csrf_field(token: &str) -> String {
     format!("<input type=hidden name=t value=\"{}\">", esc(token))
 }
 
-fn page_task(t: &Task, err: Option<&str>, token: &str) -> String {
+fn page_task(t: &Task, err: Option<&str>, token: &str, scope: inbox_auth::Scope) -> String {
     let csrf = csrf_field(token);
     let mut b = String::new();
     b.push_str("<p><a href='/'>← all tasks</a></p>");
@@ -338,8 +359,12 @@ fn page_task(t: &Task, err: Option<&str>, token: &str) -> String {
             ));
         }
         TaskKind::Approval => {
-            b.push_str(&format!("<p>Keys: <code>{}</code></p><form method=post>{csrf}<div class=row><button class=p name=action value=allow>Allow for this project</button><button class=bad name=action value=deny>Deny</button></div></form>",
-                crate::util::approval_names(&t.names).iter().map(|n| esc(n)).collect::<Vec<_>>().join("</code>, <code>")));
+            b.push_str(&format!("<p>Keys: <code>{}</code></p>", crate::util::approval_names(&t.names).iter().map(|n| esc(n)).collect::<Vec<_>>().join("</code>, <code>")));
+            if scope == inbox_auth::Scope::Full {
+                b.push_str(&format!("<form method=post>{csrf}<div class=row><button class=p name=action value=allow>Allow for this project</button><button class=bad name=action value=deny>Deny</button></div></form>"));
+            } else {
+                b.push_str("<div class=err>Approving needs the full inbox session, which only you can open: click the desktop notification, or run <code>tokenstash open</code> in a terminal, then reload this page. (The link your agent gave you can paste keys, but not approve — so an agent can never approve its own request.)</div>");
+            }
         }
         TaskKind::Human => {
             let note = if t.expects == "text" {
