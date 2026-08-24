@@ -21,6 +21,12 @@ notify-rust = "4"
 rpassword = "7"
 open = "5"
 urlencoding = "2"
+rand.workspace = true
+# Already in the lock file (keyring pulls them in); declared directly for the inbox
+# session token, the /verify HMAC, and constant-time credential comparison.
+sha2 = "0.10"
+hmac = "0.12"
+subtle = "2"
 secrecy.workspace = true
 toml.workspace = true
 dirs.workspace = true
