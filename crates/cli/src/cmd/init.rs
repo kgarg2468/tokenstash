@@ -223,7 +223,13 @@ pub fn init(a: InitArgs) -> Result<i32> {
             // on PATH, so fall back to writing the same user-scope entry into ~/.claude.json
             // ourselves — otherwise a desktop-only user is left with a printed command.
             let claude_json = home.join(".claude.json");
-            let added = if which("claude") {
+            let claude_has = |name: &str| std::process::Command::new("claude").args(["mcp", "get", name])
+                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+            let added = if which("claude") && claude_has("tokenstash") && !manifest.claude_mcp_registered {
+                // Already registered by someone else (the user, an older install): not ours
+                // to remove on --undo, so no record is taken.
+                true
+            } else if which("claude") {
                 // Record before registering, like every other mutation: a registration
                 // with no durable record could never be undone.
                 manifest.claude_mcp_registered = true;
