@@ -224,6 +224,10 @@ pub fn init(a: InitArgs) -> Result<i32> {
             // ourselves — otherwise a desktop-only user is left with a printed command.
             let claude_json = home.join(".claude.json");
             let added = if which("claude") {
+                // Record before registering, like every other mutation: a registration
+                // with no durable record could never be undone.
+                manifest.claude_mcp_registered = true;
+                manifest.save()?;
                 let ok = std::process::Command::new("claude")
                     .args(["mcp", "add", "-s", "user", "tokenstash", "--", &exe_s, "mcp"])
                     .stdout(std::process::Stdio::null())
@@ -231,7 +235,7 @@ pub fn init(a: InitArgs) -> Result<i32> {
                     .status()
                     .map(|s| s.success())
                     .unwrap_or(false);
-                if ok { manifest.claude_mcp_registered = true; manifest.save()?; }
+                if !ok { manifest.claude_mcp_registered = false; manifest.save()?; }
                 ok
             } else {
                 match manifest.mutate(&claude_json, || merge_mcp_json_typed(&claude_json, &exe_s, true)) {
