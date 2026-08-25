@@ -163,11 +163,18 @@ pub fn init(a: InitArgs) -> Result<i32> {
         // Claude Code
         if home.join(".claude").is_dir() || which("claude") {
             let skill_dir = home.join(".claude/skills/tokenstash");
-            let skill_is_new = !skill_dir.exists();
-            fs::create_dir_all(&skill_dir)?;
-            fs::write(skill_dir.join("SKILL.md"), SKILL_MD)?;
-            if skill_is_new { manifest.record_dir(&skill_dir)?; }
-            touched.push(skill_dir.join("SKILL.md"));
+            let skill_md = skill_dir.join("SKILL.md");
+            if !skill_dir.exists() {
+                // New directory: undo removes it wholesale.
+                fs::create_dir_all(&skill_dir)?;
+                manifest.record_dir(&skill_dir)?;
+                manifest.mutate(&skill_md, || Ok(fs::write(&skill_md, SKILL_MD)?))?;
+            } else {
+                // The directory was already there (a hand-written skill, an older init): back
+                // the file up like any other foreign file so undo restores exactly it.
+                manifest.mutate(&skill_md, || Ok(fs::write(&skill_md, SKILL_MD)?))?;
+            }
+            touched.push(skill_md.clone());
             // The CLI registers cleanly when present. The desktop app ships without `claude`
             // on PATH, so fall back to writing the same user-scope entry into ~/.claude.json
             // ourselves — otherwise a desktop-only user is left with a printed command.
