@@ -404,7 +404,8 @@ fn remove_toml_table(text: &str, header: &str) -> Option<String> {
         let inner = t.strip_prefix('[')?;
         let inner = inner.strip_prefix('[').unwrap_or(inner); // array-of-tables `[[x]]`
         let close = inner.find(']')?;
-        Some(inner[..close].chars().filter(|c| !c.is_whitespace()).collect())
+        // Quoted segments (`"tokenstash"`, `'tokenstash'`) name the same table as bare ones.
+        Some(inner[..close].chars().filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'').collect())
     };
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.iter().position(|l| header_key(l).as_deref() == Some(header))?;
