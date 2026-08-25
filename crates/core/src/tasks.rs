@@ -91,6 +91,10 @@ pub fn create_approval_task(ctx: &Ctx, project: &Path, agent: &str, names: &[Str
 /// `merge=false` always files a fresh task: used for program-derived requests, where each
 /// invocation must be authorized on its own and must not piggyback on (or be granted by)
 /// another invocation's pending approval.
+/// Marker in `expects` for an approval that must not become a standing grant: a program's
+/// own output chose the key (`run` shim), so the human authorises THIS injection only.
+pub const APPROVAL_ONCE: &str = "once";
+
 pub fn create_approval_task_opts(ctx: &Ctx, project: &Path, agent: &str, names: &[String], merge: bool) -> Result<Task> {
     let pid = project.to_string_lossy().to_string();
     if let Some(mut t) = ctx.db.open_approval_task(&pid)?.filter(|_| merge) {
@@ -130,7 +134,7 @@ pub fn create_approval_task_opts(ctx: &Ctx, project: &Path, agent: &str, names: 
         why,
         url: None,
         steps: vec![],
-        expects: "confirm".into(),
+        expects: if merge { "confirm".into() } else { APPROVAL_ONCE.into() },
         pattern: None,
         names: names.to_vec(),
         status: TaskStatus::Pending,
@@ -296,11 +300,15 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, allow: bool) -> Result<AnswerResu
     let project = Path::new(&pid);
     // 1. Record the decision atomically: every approval plus the task's answered status.
     //    Once this commits the human's answer is final and nothing can ask them again.
+    //    A one-time approval (program-derived, `run`) records the answer but no grant: the
+    //    next request for the same key in this project asks again, by design.
     {
         let tx = ctx.db.conn.unchecked_transaction()?;
-        for entry in &task.names {
-            let n = if entry == "*" { "*" } else { split_identity(entry).0 };
-            ctx.db.approve(&pid, n)?;
+        if task.expects != APPROVAL_ONCE {
+            for entry in &task.names {
+                let n = if entry == "*" { "*" } else { split_identity(entry).0 };
+                ctx.db.approve(&pid, n)?;
+            }
         }
         ctx.db.set_task_status(&task.id, TaskStatus::Answered, None)?;
         ctx.db.audit(Some(&pid), Some(&task.agent), "approve", None, None, Some(&task.names.join(",")))?;
