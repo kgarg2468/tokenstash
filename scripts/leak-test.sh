@@ -302,6 +302,22 @@ if [ -e "$ESCAPE" ]; then echo "LEAK: absolute env_file wrote a secret outside t
 if [ $rc -eq 0 ]; then echo "an escaping env_file must fail, not inject (got exit 0)"; fail=1; fi
 grep -q "relative path inside the project" "$OUT/escape.txt" || { echo "escaping env_file must say why it was refused"; fail=1; }
 rm -rf "$ESCAPE_DIR"
+# ── two homes, one stash: list and need must agree ─────────────────────────────
+# The stash is per-user, the index per-home. A second TOKENSTASH_HOME must not say "empty"
+# and then hand out the key anyway without indexing it (desktop-app test, bug A).
+HOME2="$(mktemp -d)"; cp "$TOKENSTASH_HOME/config.toml" "$HOME2/config.toml"
+# the insecure-file stash lives inside the home; a real keychain is per-user. Emulate that.
+cp "$TOKENSTASH_HOME/insecure-stash.json" "$HOME2/insecure-stash.json"
+TOKENSTASH_HOME="$HOME2" "$TS" list >"$OUT/home2-list-before.txt" 2>&1 || true
+grep -q "no secrets indexed" "$OUT/home2-list-before.txt" || { echo "FAIL: a fresh home must say it has no INDEXED secrets"; fail=1; }
+grep -q "adopted" "$OUT/home2-list-before.txt" || { echo "FAIL: the empty-index message must explain adoption"; fail=1; }
+rc=0; TOKENSTASH_HOME="$HOME2" "$TS" need OPENAI_API_KEY --agent ci >"$OUT/home2-need.txt" 2>&1 || rc=$?
+[ $rc -eq 0 ] || { echo "FAIL: a stash hit from another home should inject (got $rc)"; fail=1; }
+TOKENSTASH_HOME="$HOME2" "$TS" list >"$OUT/home2-list-after.txt" 2>&1 || true
+grep -q "OPENAI_API_KEY" "$OUT/home2-list-after.txt" || { echo "FAIL: after injecting, list in the second home still does not show the key"; fail=1; }
+TOKENSTASH_HOME="$HOME2" "$TS" audit | grep -q "adopt" || { echo "FAIL: adoption is not audited"; fail=1; }
+rm -rf "$HOME2"
+
 # exit-code contract
 rc=0; "$TS" need OPENAI_API_KEY --agent ci >/dev/null 2>&1 || rc=$?; [ $rc -eq 0 ] || { echo "hit should exit 0 (got $rc)"; fail=1; }
 rc=0; "$TS" need NEVER_SEEN_KEY --agent ci >/dev/null 2>&1 || rc=$?; [ $rc -eq 10 ] || { echo "miss should exit 10 (got $rc)"; fail=1; }

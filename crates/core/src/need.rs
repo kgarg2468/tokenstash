@@ -83,7 +83,26 @@ pub fn need(ctx: &Ctx, project: &Path, agent: &str, names: &[String], opts: &Nee
         let hit = ctx.stash.get(&stash_key(name, &identity))?;
 
         if let Some(value) = hit {
-            let meta = ctx.db.get_secret(name, &identity)?;
+            let mut meta = ctx.db.get_secret(name, &identity)?;
+            if meta.is_none() {
+                // The stash is per-user; this index is per-TOKENSTASH_HOME. A key stored under
+                // another home is real and usable, but `list` here would deny it exists —
+                // a stash that says "empty" and then injects is the worst kind of surprise.
+                // Adopt it into this index, visibly, before anything else happens.
+                let m = crate::db::SecretMeta {
+                    name: name.clone(),
+                    identity: identity.clone(),
+                    provider: provider.map(|p| p.provider.clone()),
+                    sensitive: provider.map(|p| p.sensitive).unwrap_or(false),
+                    source_url: provider.map(|p| p.url.clone()),
+                    created: crate::now(),
+                    last_used: None,
+                    stale: false,
+                };
+                ctx.db.upsert_secret(&m)?;
+                ctx.db.audit(Some(&pid), Some(agent), "adopt", Some(name), Some(&identity), Some("found in the stash but not in this home's index"))?;
+                meta = Some(m);
+            }
             let sensitive = meta.as_ref().map(|m| m.sensitive).unwrap_or_else(|| provider.map(|p| p.sensitive).unwrap_or(false));
             let gate = if opts.require_approval {
                 Gate::NeedsApproval { reason: GateReason::Sensitive }

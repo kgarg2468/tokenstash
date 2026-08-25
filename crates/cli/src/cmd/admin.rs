@@ -63,7 +63,8 @@ pub fn list(a: ListArgs) -> Result<i32> {
         return Ok(0);
     }
     if secrets.is_empty() {
-        println!("stash is empty. Run `tokenstash need SOME_KEY` from a project to start.");
+        println!("no secrets indexed in {}. Run `tokenstash need SOME_KEY` from a project to start.", tokenstash_core::config::config_dir().display());
+        println!("(the {} stash itself is per-user; a key stored under another TOKENSTASH_HOME is adopted here, and listed, the first time a project needs it)", app.stash.backend());
         return Ok(0);
     }
     println!("{:<36} {:<10} {:<18} {:<10} LAST USED", "NAME", "IDENTITY", "PROVIDER", "FLAGS");
