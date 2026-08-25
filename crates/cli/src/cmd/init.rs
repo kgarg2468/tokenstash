@@ -345,82 +345,42 @@ pub fn init(a: InitArgs) -> Result<i32> {
     Ok(0)
 }
 
-/// Add `[mcp_servers.tokenstash]` to Codex's config.toml. The file is parsed as TOML so an
-/// existing entry is detected whether it is a table header or an inline table; if the file
-/// cannot be parsed it is left untouched. The entry is appended as text (not re-serialized)
-/// so the user's comments and formatting survive.
+/// Set `mcp_servers.tokenstash` in Codex's config.toml with `toml_edit`, which preserves
+/// the user's comments and formatting and understands every header spelling (quoted keys,
+/// whitespace, inline tables, nested subtables) — an earlier line-scanning version got a
+/// steady stream of those wrong. An existing entry is replaced wholesale so the env
+/// (TOKENSTASH_HOME) is current. If the file cannot be parsed it is left untouched.
 fn merge_codex_toml(p: &Path, exe: &str, ts_home: Option<&str>) -> Result<()> {
     let existing = match fs::read_to_string(p) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e.into()),
     };
-    let doc: toml::Value = if existing.trim().is_empty() {
-        toml::Value::Table(Default::default())
-    } else {
-        toml::from_str(&existing).map_err(|e| anyhow::anyhow!("{} is not valid TOML ({e}); fix it or add the MCP server by hand", p.display()))?
+    let mut doc: toml_edit::DocumentMut = existing.parse().map_err(|e| anyhow::anyhow!("{} is not valid TOML ({e}); fix it or add the MCP server by hand", p.display()))?;
+    let servers = doc.entry("mcp_servers").or_insert(toml_edit::table());
+    let Some(servers) = servers.as_table_like_mut() else {
+        anyhow::bail!("{}: mcp_servers is not a table; add the MCP server by hand", p.display());
     };
-    let mut s = existing;
-    if doc.get("mcp_servers").and_then(|m| m.get("tokenstash")).is_some() {
-        // Already configured. If it is a `[mcp_servers.tokenstash]` table, drop it (and its
-        // nested subtables) line by line so it can be re-appended with the current env.
-        // Only a real header line counts — not a comment, not an inline-table entry. If the
-        // entry is not a table we can identify, leave it alone with a note rather than
-        // guess at the user's file.
-        match remove_toml_table(&s, "mcp_servers.tokenstash") {
-            Some(rest) => s = rest,
-            None => {
-                println!("! Codex: an existing mcp_servers.tokenstash entry was left as is{}", ts_home.map(|h| format!("; make sure it sets TOKENSTASH_HOME={h}")).unwrap_or_default());
-                return Ok(());
-            }
-        }
-    }
-    if !s.is_empty() && !s.ends_with('\n') { s.push('\n'); }
-    let cmd = toml::Value::String(exe.to_string()).to_string();
-    s.push_str(&format!("\n[mcp_servers.tokenstash]\ncommand = {cmd}\nargs = [\"mcp\"]\n"));
+    let mut entry = toml_edit::Table::new();
+    entry.insert("command", toml_edit::value(exe));
+    let mut args = toml_edit::Array::new();
+    args.push("mcp");
+    entry.insert("args", toml_edit::value(args));
     if let Some(h) = ts_home {
-        s.push_str(&format!("env = {{ TOKENSTASH_HOME = {} }}\n", toml::Value::String(h.to_string())));
+        let mut env = toml_edit::InlineTable::new();
+        env.insert("TOKENSTASH_HOME", h.into());
+        entry.insert("env", toml_edit::value(env));
     }
-    // the result must itself parse, and must contain exactly one tokenstash entry with the
-    // command we just wrote — otherwise the file is not touched
-    let back: toml::Value = toml::from_str(&s).map_err(|e| anyhow::anyhow!("refusing to write {}: result would not parse ({e})", p.display()))?;
-    let ours = back.get("mcp_servers").and_then(|m| m.get("tokenstash")).and_then(|t| t.get("command")).and_then(|c| c.as_str());
-    if ours != Some(exe) {
-        anyhow::bail!("refusing to write {}: could not replace the existing tokenstash entry cleanly; edit it by hand", p.display());
+    servers.insert("tokenstash", toml_edit::Item::Table(entry));
+    let out = doc.to_string();
+    // Belt and braces: the result must parse back with exactly our command.
+    let back: toml::Value = toml::from_str(&out).map_err(|e| anyhow::anyhow!("refusing to write {}: result would not parse ({e})", p.display()))?;
+    if back.get("mcp_servers").and_then(|m| m.get("tokenstash")).and_then(|t| t.get("command")).and_then(|c| c.as_str()) != Some(exe) {
+        anyhow::bail!("refusing to write {}: could not set the tokenstash entry cleanly; edit it by hand", p.display());
     }
     if let Some(parent) = p.parent() { fs::create_dir_all(parent)?; }
-    fs::write(p, s)?;
+    fs::write(p, out)?;
     Ok(())
-}
-
-/// Remove a `[header]` table and its `[header.sub]` subtables from TOML text, by lines. A
-/// header only counts at the start of a line (whitespace allowed), so comments and inline
-/// tables never match. Returns `None` if no such table line exists.
-fn remove_toml_table(text: &str, header: &str) -> Option<String> {
-    // The dotted key of a header line with TOML-permitted whitespace removed
-    // (`[ mcp_servers . tokenstash ]` → `mcp_servers.tokenstash`), or None if not a header.
-    let header_key = |line: &str| -> Option<String> {
-        let t = line.trim_start();
-        let inner = t.strip_prefix('[')?;
-        let inner = inner.strip_prefix('[').unwrap_or(inner); // array-of-tables `[[x]]`
-        let close = inner.find(']')?;
-        // Quoted segments (`"tokenstash"`, `'tokenstash'`) name the same table as bare ones.
-        Some(inner[..close].chars().filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'').collect())
-    };
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.iter().position(|l| header_key(l).as_deref() == Some(header))?;
-    let mut end = start + 1;
-    while end < lines.len() {
-        if let Some(k) = header_key(lines[end]) {
-            if !k.starts_with(&format!("{header}.")) {
-                break;
-            }
-        }
-        end += 1;
-    }
-    let mut out: Vec<&str> = lines[..start].to_vec();
-    out.extend_from_slice(&lines[end..]);
-    Some(out.join("\n").trim_end().to_string())
 }
 
 /// Add `mcpServers.tokenstash` to a JSON config owned by another tool. If the file exists
