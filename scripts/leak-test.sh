@@ -318,6 +318,22 @@ grep -q "OPENAI_API_KEY" "$OUT/home2-list-after.txt" || { echo "FAIL: after inje
 TOKENSTASH_HOME="$HOME2" "$TS" audit | grep -q "adopt" || { echo "FAIL: adoption is not audited"; fail=1; }
 rm -rf "$HOME2"
 
+# ── MCP task scoping: another project's tasks are invisible ─────────────────────
+# task_check by id/prefix and task_list must not act as a cross-project path oracle.
+OTHER="$(mktemp -d)/otherproj"; mkdir -p "$OTHER"
+"$TS" need OTHER_PROJECT_KEY --project "$OTHER" --agent ci >"$OUT/need-other.txt" 2>&1 || true
+OTID=$("$TS" tasks --all --json | python3 -c "import json,sys;print([t for t in json.load(sys.stdin) if t.get('name')=='OTHER_PROJECT_KEY'][0]['id'])")
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"ci"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"task_check","arguments":{"task_id":"'"$OTID"'","project":"'"$PROJ"'"}}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"task_list","arguments":{"project":"'"$PROJ"'","all":true}}}' \
+  '{"jsonrpc":"2.0","id":4,"method":"tools/list"}' \
+  | "$TS" mcp >"$OUT/mcp-scope.txt" 2>&1 || true
+grep -q "$OTHER" "$OUT/mcp-scope.txt" && { echo "FAIL: MCP revealed another project's path via task_check/task_list"; fail=1; }
+grep -q "OTHER_PROJECT_KEY" "$OUT/mcp-scope.txt" && { echo "FAIL: MCP revealed another project's task via task_check/task_list"; fail=1; }
+grep -q '"all"' "$OUT/mcp-scope.txt" && { echo "FAIL: task_list still advertises an all-projects switch"; fail=1; }
+rm -rf "$(dirname "$OTHER")"
+
 # exit-code contract
 rc=0; "$TS" need OPENAI_API_KEY --agent ci >/dev/null 2>&1 || rc=$?; [ $rc -eq 0 ] || { echo "hit should exit 0 (got $rc)"; fail=1; }
 rc=0; "$TS" need NEVER_SEEN_KEY --agent ci >/dev/null 2>&1 || rc=$?; [ $rc -eq 10 ] || { echo "miss should exit 10 (got $rc)"; fail=1; }
