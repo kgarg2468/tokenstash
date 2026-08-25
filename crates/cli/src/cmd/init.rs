@@ -121,6 +121,7 @@ fn undo() -> Result<i32> {
     let m = Manifest::load()?;
     if m.files.is_empty() && m.dirs.is_empty() && !m.claude_mcp_registered {
         println!("nothing to undo: no init manifest at {}", manifest_path().display());
+        println!("(if that init ran with a custom TOKENSTASH_HOME under an older version, run --undo with the same TOKENSTASH_HOME set: the record is adopted from there)");
         return Ok(0);
     }
     // Each completed step is removed from the on-disk manifest immediately, so a retry after
@@ -361,17 +362,18 @@ fn merge_codex_toml(p: &Path, exe: &str, ts_home: Option<&str>) -> Result<()> {
     };
     let mut s = existing;
     if doc.get("mcp_servers").and_then(|m| m.get("tokenstash")).is_some() {
-        // Already configured. If it is our own `[mcp_servers.tokenstash]` table, rewrite it so
-        // the env (TOKENSTASH_HOME) is current; an inline-table form we did not write is left
-        // alone with a note, since editing it textually could damage the user's file.
-        let Some(start) = s.find("[mcp_servers.tokenstash]") else {
-            println!("! Codex: an existing inline mcp_servers.tokenstash entry was left as is{}", ts_home.map(|h| format!("; make sure it sets TOKENSTASH_HOME={h}")).unwrap_or_default());
-            return Ok(());
-        };
-        let rest = &s[start + 1..];
-        let end = rest.find("\n[").map(|i| start + 1 + i + 1).unwrap_or(s.len());
-        s.replace_range(start..end, "");
-        s = s.trim_end().to_string();
+        // Already configured. If it is a `[mcp_servers.tokenstash]` table, drop it (and its
+        // nested subtables) line by line so it can be re-appended with the current env.
+        // Only a real header line counts — not a comment, not an inline-table entry. If the
+        // entry is not a table we can identify, leave it alone with a note rather than
+        // guess at the user's file.
+        match remove_toml_table(&s, "mcp_servers.tokenstash") {
+            Some(rest) => s = rest,
+            None => {
+                println!("! Codex: an existing mcp_servers.tokenstash entry was left as is{}", ts_home.map(|h| format!("; make sure it sets TOKENSTASH_HOME={h}")).unwrap_or_default());
+                return Ok(());
+            }
+        }
     }
     if !s.is_empty() && !s.ends_with('\n') { s.push('\n'); }
     let cmd = toml::Value::String(exe.to_string()).to_string();
@@ -379,11 +381,40 @@ fn merge_codex_toml(p: &Path, exe: &str, ts_home: Option<&str>) -> Result<()> {
     if let Some(h) = ts_home {
         s.push_str(&format!("env = {{ TOKENSTASH_HOME = {} }}\n", toml::Value::String(h.to_string())));
     }
-    // the result must itself parse
-    toml::from_str::<toml::Value>(&s).map_err(|e| anyhow::anyhow!("refusing to write {}: result would not parse ({e})", p.display()))?;
+    // the result must itself parse, and must contain exactly one tokenstash entry with the
+    // command we just wrote — otherwise the file is not touched
+    let back: toml::Value = toml::from_str(&s).map_err(|e| anyhow::anyhow!("refusing to write {}: result would not parse ({e})", p.display()))?;
+    let ours = back.get("mcp_servers").and_then(|m| m.get("tokenstash")).and_then(|t| t.get("command")).and_then(|c| c.as_str());
+    if ours != Some(exe) {
+        anyhow::bail!("refusing to write {}: could not replace the existing tokenstash entry cleanly; edit it by hand", p.display());
+    }
     if let Some(parent) = p.parent() { fs::create_dir_all(parent)?; }
     fs::write(p, s)?;
     Ok(())
+}
+
+/// Remove a `[header]` table and its `[header.sub]` subtables from TOML text, by lines. A
+/// header only counts at the start of a line (whitespace allowed), so comments and inline
+/// tables never match. Returns `None` if no such table line exists.
+fn remove_toml_table(text: &str, header: &str) -> Option<String> {
+    let is_header = |line: &str, h: &str| {
+        let t = line.trim_start();
+        t.strip_prefix('[').map(|r| r.trim_start().strip_prefix(h).map(|r| r.trim_start().starts_with(']')).unwrap_or(false)).unwrap_or(false)
+    };
+    let is_any_header = |line: &str| line.trim_start().starts_with('[');
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.iter().position(|l| is_header(l, header))?;
+    let mut end = start + 1;
+    while end < lines.len() {
+        let l = lines[end];
+        if is_any_header(l) && !l.trim_start().starts_with(&format!("[{header}.")) {
+            break;
+        }
+        end += 1;
+    }
+    let mut out: Vec<&str> = lines[..start].to_vec();
+    out.extend_from_slice(&lines[end..]);
+    Some(out.join("\n").trim_end().to_string())
 }
 
 /// Add `mcpServers.tokenstash` to a JSON config owned by another tool. If the file exists
