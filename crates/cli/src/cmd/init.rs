@@ -49,6 +49,16 @@ impl Manifest {
     /// re-run of `init` overwrite the only restoration points.
     fn load() -> Result<Self> {
         let p = manifest_path();
+        // Older versions kept the manifest inside TOKENSTASH_HOME. If the fixed location has
+        // none and the current home has one, adopt it (move, so there is one record).
+        if !p.exists() {
+            let legacy = tokenstash_core::config::config_dir().join("init.manifest.json");
+            if legacy != p && legacy.exists() {
+                if let Some(d) = p.parent() { fs::create_dir_all(d)?; }
+                fs::rename(&legacy, &p).or_else(|_| fs::copy(&legacy, &p).map(|_| ()).and_then(|_| fs::remove_file(&legacy)))?;
+                println!("(moved the init undo record from {} to {})", legacy.display(), p.display());
+            }
+        }
         match fs::read_to_string(&p) {
             Ok(s) => serde_json::from_str(&s).map_err(|e| anyhow::anyhow!(
                 "{} is unreadable ({e}). It records what a previous init changed so --undo can restore it; fix or move it, do not delete it, before running init again", p.display())),
@@ -240,6 +250,9 @@ pub fn init(a: InitArgs) -> Result<i32> {
             let added = if which("claude") && claude_has("tokenstash") && !manifest.claude_mcp_registered {
                 // Already registered by someone else (the user, an older install): not ours
                 // to remove on --undo, so no record is taken.
+                if let Some(h) = &ts_home {
+                    println!("! Claude Code: an existing tokenstash MCP registration was left as is; it may not use TOKENSTASH_HOME={h}. To re-register: claude mcp remove -s user tokenstash && tokenstash init");
+                }
                 true
             } else if which("claude") {
                 // Record before registering, like every other mutation: a registration
@@ -346,10 +359,20 @@ fn merge_codex_toml(p: &Path, exe: &str, ts_home: Option<&str>) -> Result<()> {
     } else {
         toml::from_str(&existing).map_err(|e| anyhow::anyhow!("{} is not valid TOML ({e}); fix it or add the MCP server by hand", p.display()))?
     };
-    if doc.get("mcp_servers").and_then(|m| m.get("tokenstash")).is_some() {
-        return Ok(()); // already configured (table header or inline table)
-    }
     let mut s = existing;
+    if doc.get("mcp_servers").and_then(|m| m.get("tokenstash")).is_some() {
+        // Already configured. If it is our own `[mcp_servers.tokenstash]` table, rewrite it so
+        // the env (TOKENSTASH_HOME) is current; an inline-table form we did not write is left
+        // alone with a note, since editing it textually could damage the user's file.
+        let Some(start) = s.find("[mcp_servers.tokenstash]") else {
+            println!("! Codex: an existing inline mcp_servers.tokenstash entry was left as is{}", ts_home.map(|h| format!("; make sure it sets TOKENSTASH_HOME={h}")).unwrap_or_default());
+            return Ok(());
+        };
+        let rest = &s[start + 1..];
+        let end = rest.find("\n[").map(|i| start + 1 + i + 1).unwrap_or(s.len());
+        s.replace_range(start..end, "");
+        s = s.trim_end().to_string();
+    }
     if !s.is_empty() && !s.ends_with('\n') { s.push('\n'); }
     let cmd = toml::Value::String(exe.to_string()).to_string();
     s.push_str(&format!("\n[mcp_servers.tokenstash]\ncommand = {cmd}\nargs = [\"mcp\"]\n"));
