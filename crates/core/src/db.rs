@@ -128,6 +128,9 @@ impl Db {
         }
         let conn = Connection::open(path)?;
         restrict_file(path)?;
+        // CLI, inbox and MCP server each hold their own connection; a write collision must
+        // wait, not error.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
             r#"
             PRAGMA journal_mode=WAL;
@@ -389,6 +392,8 @@ impl Db {
 
     // ---------- approvals / bindings ----------
 
+    /// Approved by name, or by the project-wide `*` that "allow this project" records.
+    /// Only for the LOCATION gate. Never for sensitive keys — see [`Self::is_approved_exact`].
     pub fn is_approved(&self, project: &str, name: &str) -> Result<bool> {
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM approvals WHERE project=?1 AND (name=?2 OR name='*')",
@@ -396,6 +401,29 @@ impl Db {
             |r| r.get(0),
         )?;
         Ok(n > 0)
+    }
+
+    /// Approved by this exact name only. A sensitive key is a per-key decision: the
+    /// project-wide `*` from an "allow this project" card must not satisfy it, or an
+    /// outside-root project becomes MORE permissive than a trusted one.
+    pub fn is_approved_exact(&self, project: &str, name: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM approvals WHERE project=?1 AND name=?2",
+            params![project, name],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Most recent denied approval task for a project after `since`. "Deny" on an approval
+    /// card must mean something: without memory, a program failing in a loop files a fresh
+    /// card each time until the human clicks through out of fatigue.
+    pub fn recent_denied_approval(&self, project: &str, since: &str) -> Result<Option<Task>> {
+        let sql = format!(
+            "SELECT {} FROM tasks WHERE kind='approval' AND status='denied' AND project=?1 AND answered_at > ?2 ORDER BY answered_at DESC",
+            Self::TASK_COLS
+        );
+        Ok(self.conn.query_row(&sql, params![project, since], Self::row_to_task).optional()?)
     }
 
     pub fn approve(&self, project: &str, name: &str) -> Result<()> {
