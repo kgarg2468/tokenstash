@@ -39,8 +39,17 @@ struct Manifest {
 fn manifest_path() -> PathBuf { tokenstash_core::config::config_dir().join("init.manifest.json") }
 
 impl Manifest {
-    fn load() -> Self {
-        fs::read_to_string(manifest_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    /// Absent → empty. Present but unreadable/invalid → an error: silently treating a corrupt
+    /// manifest as "nothing recorded" would let `--undo` say there is nothing to undo, or a
+    /// re-run of `init` overwrite the only restoration points.
+    fn load() -> Result<Self> {
+        let p = manifest_path();
+        match fs::read_to_string(&p) {
+            Ok(s) => serde_json::from_str(&s).map_err(|e| anyhow::anyhow!(
+                "{} is unreadable ({e}). It records what a previous init changed so --undo can restore it; fix or move it, do not delete it, before running init again", p.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(anyhow::anyhow!("reading {}: {e}", p.display())),
+        }
     }
     fn save(&self) -> Result<()> {
         tokenstash_core::fsutil::write_atomic_private(&manifest_path(), &serde_json::to_string_pretty(self)?)?;
@@ -94,49 +103,55 @@ impl Manifest {
 }
 
 fn undo() -> Result<i32> {
-    let m = Manifest::load();
+    let m = Manifest::load()?;
     if m.files.is_empty() && m.dirs.is_empty() && !m.claude_mcp_registered {
         println!("nothing to undo: no init manifest at {}", manifest_path().display());
         return Ok(0);
     }
-    // Whatever could not be undone stays in the manifest so a later --undo can retry it;
-    // the manifest is deleted only when everything is back.
-    let mut left = Manifest::default();
-    for (p, backup) in &m.files {
-        let r: Result<()> = match backup {
-            Some(b) if b.exists() => fs::copy(b, p).map(|_| ()).map_err(Into::into),
+    // Each completed step is removed from the on-disk manifest immediately, so a retry after
+    // a crash or a failed save never repeats a step already done (which would restore a
+    // stale backup over an edit made in between). Whatever fails stays recorded for retry.
+    let mut cur = m;
+    let mut i = 0;
+    while i < cur.files.len() {
+        let (p, backup) = cur.files[i].clone();
+        let r: Result<()> = match &backup {
+            Some(b) if b.exists() => fs::copy(b, &p).map(|_| ()).map_err(Into::into),
             Some(b) => Err(anyhow::anyhow!("backup missing at {}", b.display())),
-            None => match fs::remove_file(p) {
+            None => match fs::remove_file(&p) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(e.into()),
             },
         };
         match r {
-            Ok(()) => println!("✓ {} {}", if backup.is_some() { "restored" } else { "removed" }, p.display()),
-            Err(e) => { println!("! {}: {e} (kept in the manifest; re-run --undo to retry)", p.display()); left.files.push((p.clone(), backup.clone())); }
+            Ok(()) => {
+                println!("✓ {} {}", if backup.is_some() { "restored" } else { "removed" }, p.display());
+                cur.files.remove(i);
+                cur.save()?;
+            }
+            Err(e) => { println!("! {}: {e} (kept in the manifest; re-run --undo to retry)", p.display()); i += 1; }
         }
     }
-    for d in &m.dirs {
-        match fs::remove_dir_all(d) {
-            Ok(()) => println!("✓ removed {}", d.display()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("✓ removed {}", d.display()),
-            Err(e) => { println!("! {}: {e} (kept in the manifest)", d.display()); left.dirs.push(d.clone()); }
+    let mut i = 0;
+    while i < cur.dirs.len() {
+        let d = cur.dirs[i].clone();
+        match fs::remove_dir_all(&d) {
+            Ok(()) => { println!("✓ removed {}", d.display()); cur.dirs.remove(i); cur.save()?; }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => { println!("✓ removed {}", d.display()); cur.dirs.remove(i); cur.save()?; }
+            Err(e) => { println!("! {}: {e} (kept in the manifest)", d.display()); i += 1; }
         }
     }
-    if m.claude_mcp_registered {
+    if cur.claude_mcp_registered {
         let ok = which("claude") && std::process::Command::new("claude").args(["mcp", "remove", "-s", "user", "tokenstash"])
             .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
-        if ok { println!("✓ claude mcp remove tokenstash"); } else {
+        if ok { println!("✓ claude mcp remove tokenstash"); cur.claude_mcp_registered = false; cur.save()?; } else {
             println!("! could not run `claude mcp remove -s user tokenstash` (kept in the manifest; run it by hand or re-run --undo with `claude` on PATH)");
-            left.claude_mcp_registered = true;
         }
     }
-    let all_done = left.files.is_empty() && left.dirs.is_empty() && !left.claude_mcp_registered;
+    let all_done = cur.files.is_empty() && cur.dirs.is_empty() && !cur.claude_mcp_registered;
     if all_done {
         let _ = fs::remove_file(manifest_path());
-    } else {
-        left.save()?;
     }
     println!("\nThe stash, config and database were not touched (`tokenstash forget NAME` removes secrets).");
     Ok(if all_done { 0 } else { 1 })
@@ -146,7 +161,7 @@ pub fn init(a: InitArgs) -> Result<i32> {
     if a.undo { return undo(); }
     let mut cfg = Config::load()?;
     let fresh = !Config::exists();
-    let mut manifest = Manifest::load();
+    let mut manifest = Manifest::load()?;
 
     // 1. stash backend: probe and pin it so later calls don't re-probe
     let stash = tokenstash_core::stash::open(&cfg)?;
