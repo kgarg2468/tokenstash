@@ -50,11 +50,20 @@ impl Default for Config {
     }
 }
 
-/// `$TOKENSTASH_HOME` or `~/.config/tokenstash`.
+/// `$TOKENSTASH_HOME` or the default.
 pub fn config_dir() -> PathBuf {
     if let Ok(p) = std::env::var("TOKENSTASH_HOME") {
-        return PathBuf::from(p);
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
     }
+    default_config_dir()
+}
+
+/// The default home, ignoring `TOKENSTASH_HOME`: `~/.config/tokenstash` on Linux,
+/// `~/Library/Application Support/tokenstash` on macOS. For state that is about the machine
+/// rather than one home (the init undo manifest).
+pub fn default_config_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| dirs::home_dir().expect("no home dir").join(".config"))
         .join("tokenstash")

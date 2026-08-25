@@ -36,7 +36,12 @@ struct Manifest {
     claude_mcp_registered: bool,
 }
 
-fn manifest_path() -> PathBuf { tokenstash_core::config::config_dir().join("init.manifest.json") }
+/// The manifest records changes to the user's GLOBAL agent configs, so it lives in one fixed
+/// place — the default config dir — no matter what `TOKENSTASH_HOME` a given shell has set.
+/// Otherwise an init run with a scratch home and an `--undo` run without it (or the other way
+/// round) never see each other's record, and undo reports "nothing to undo" over a fully
+/// wired machine. Seen in the desktop-app test.
+fn manifest_path() -> PathBuf { tokenstash_core::config::default_config_dir().join("init.manifest.json") }
 
 impl Manifest {
     /// Absent → empty. Present but unreadable/invalid → an error: silently treating a corrupt
@@ -66,7 +71,7 @@ impl Manifest {
             return f();
         }
         let backup = if p.exists() {
-            let dir = tokenstash_core::config::config_dir().join("init-backups");
+            let dir = tokenstash_core::config::default_config_dir().join("init-backups");
             fs::create_dir_all(&dir)?;
             let name = p.to_string_lossy().replace(['/', '\\'], "_");
             let b = dir.join(name);
@@ -203,6 +208,13 @@ pub fn init(a: InitArgs) -> Result<i32> {
         let exe = std::env::current_exe()?;
         let exe_s = exe.display().to_string();
         let home = dirs::home_dir().unwrap_or_default();
+        // An agent spawns the MCP server from its own environment, not this shell's. If this
+        // init is running against a non-default TOKENSTASH_HOME, bake it into every
+        // registration, or the server and the CLI silently use two different homes.
+        let ts_home = std::env::var("TOKENSTASH_HOME").ok().filter(|h| !h.is_empty());
+        if let Some(h) = &ts_home {
+            println!("  (registrations carry TOKENSTASH_HOME={h} so agents use the same home as this shell)");
+        }
 
         // Claude Code
         if home.join(".claude").is_dir() || which("claude") {
@@ -234,8 +246,11 @@ pub fn init(a: InitArgs) -> Result<i32> {
                 // with no durable record could never be undone.
                 manifest.claude_mcp_registered = true;
                 manifest.save()?;
+                let mut args: Vec<String> = vec!["mcp".into(), "add".into(), "-s".into(), "user".into()];
+                if let Some(h) = &ts_home { args.push("-e".into()); args.push(format!("TOKENSTASH_HOME={h}")); }
+                args.extend(["tokenstash".into(), "--".into(), exe_s.clone(), "mcp".into()]);
                 let ok = std::process::Command::new("claude")
-                    .args(["mcp", "add", "-s", "user", "tokenstash", "--", &exe_s, "mcp"])
+                    .args(&args)
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status()
@@ -244,7 +259,7 @@ pub fn init(a: InitArgs) -> Result<i32> {
                 if !ok { manifest.claude_mcp_registered = false; manifest.save()?; }
                 ok
             } else {
-                match manifest.mutate(&claude_json, || merge_mcp_json_typed(&claude_json, &exe_s, true)) {
+                match manifest.mutate(&claude_json, || merge_mcp_json_typed(&claude_json, &exe_s, true, ts_home.as_deref())) {
                     Ok(()) => { touched.push(claude_json.clone()); true }
                     Err(e) => { println!("! Claude Code: left {} untouched — {e}", claude_json.display()); false }
                 }
@@ -257,7 +272,7 @@ pub fn init(a: InitArgs) -> Result<i32> {
         let codex = home.join(".codex");
         if codex.is_dir() {
             let (ctoml, cagents) = (codex.join("config.toml"), codex.join("AGENTS.md"));
-            match manifest.mutate(&ctoml, || merge_codex_toml(&ctoml, &exe_s)) {
+            match manifest.mutate(&ctoml, || merge_codex_toml(&ctoml, &exe_s, ts_home.as_deref())) {
                 Ok(()) => {
                     manifest.mutate(&cagents, || append_snippet(&cagents))?;
                     touched.push(codex.join("config.toml"));
@@ -272,7 +287,7 @@ pub fn init(a: InitArgs) -> Result<i32> {
         let cursor = home.join(".cursor");
         if cursor.is_dir() {
             let cj = cursor.join("mcp.json");
-            match manifest.mutate(&cj, || merge_mcp_json(&cj, &exe_s)) {
+            match manifest.mutate(&cj, || merge_mcp_json(&cj, &exe_s, ts_home.as_deref())) {
                 Ok(()) => { touched.push(cursor.join("mcp.json")); println!("✓ Cursor: MCP server registered ({})", cursor.join("mcp.json").display()) }
                 Err(e) => println!("! Cursor: left ~/.cursor/mcp.json untouched — {e}"),
             }
@@ -282,7 +297,7 @@ pub fn init(a: InitArgs) -> Result<i32> {
         let gemini = home.join(".gemini");
         if gemini.is_dir() {
             let gj = gemini.join("settings.json");
-            match manifest.mutate(&gj, || merge_mcp_json(&gj, &exe_s)) {
+            match manifest.mutate(&gj, || merge_mcp_json(&gj, &exe_s, ts_home.as_deref())) {
                 Ok(()) => { touched.push(gemini.join("settings.json")); println!("✓ Gemini CLI: MCP server registered ({})", gemini.join("settings.json").display()) }
                 Err(e) => println!("! Gemini CLI: left ~/.gemini/settings.json untouched — {e}"),
             }
@@ -320,7 +335,7 @@ pub fn init(a: InitArgs) -> Result<i32> {
 /// existing entry is detected whether it is a table header or an inline table; if the file
 /// cannot be parsed it is left untouched. The entry is appended as text (not re-serialized)
 /// so the user's comments and formatting survive.
-fn merge_codex_toml(p: &Path, exe: &str) -> Result<()> {
+fn merge_codex_toml(p: &Path, exe: &str, ts_home: Option<&str>) -> Result<()> {
     let existing = match fs::read_to_string(p) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -338,6 +353,9 @@ fn merge_codex_toml(p: &Path, exe: &str) -> Result<()> {
     if !s.is_empty() && !s.ends_with('\n') { s.push('\n'); }
     let cmd = toml::Value::String(exe.to_string()).to_string();
     s.push_str(&format!("\n[mcp_servers.tokenstash]\ncommand = {cmd}\nargs = [\"mcp\"]\n"));
+    if let Some(h) = ts_home {
+        s.push_str(&format!("env = {{ TOKENSTASH_HOME = {} }}\n", toml::Value::String(h.to_string())));
+    }
     // the result must itself parse
     toml::from_str::<toml::Value>(&s).map_err(|e| anyhow::anyhow!("refusing to write {}: result would not parse ({e})", p.display()))?;
     if let Some(parent) = p.parent() { fs::create_dir_all(parent)?; }
@@ -347,12 +365,12 @@ fn merge_codex_toml(p: &Path, exe: &str) -> Result<()> {
 
 /// Add `mcpServers.tokenstash` to a JSON config owned by another tool. If the file exists
 /// but cannot be parsed as a JSON object, refuse rather than replace it.
-fn merge_mcp_json(p: &Path, exe: &str) -> Result<()> {
-    merge_mcp_json_typed(p, exe, false)
+fn merge_mcp_json(p: &Path, exe: &str, ts_home: Option<&str>) -> Result<()> {
+    merge_mcp_json_typed(p, exe, false, ts_home)
 }
 
 /// Same, with `"type": "stdio"` — the shape Claude Code writes into `~/.claude.json`.
-fn merge_mcp_json_typed(p: &Path, exe: &str, typed: bool) -> Result<()> {
+fn merge_mcp_json_typed(p: &Path, exe: &str, typed: bool, ts_home: Option<&str>) -> Result<()> {
     let mut v: serde_json::Value = match fs::read_to_string(p) {
         Ok(s) if s.trim().is_empty() => serde_json::json!({}),
         Ok(s) => serde_json::from_str(&s).map_err(|e| anyhow::anyhow!("{} is not valid JSON ({e}); fix it or add the MCP server by hand", p.display()))?,
@@ -362,7 +380,11 @@ fn merge_mcp_json_typed(p: &Path, exe: &str, typed: bool) -> Result<()> {
     let root = v.as_object_mut().ok_or_else(|| anyhow::anyhow!("{} root is not a JSON object", p.display()))?;
     let servers = root.entry("mcpServers").or_insert(serde_json::json!({}));
     let m = servers.as_object_mut().ok_or_else(|| anyhow::anyhow!("{} has a non-object mcpServers", p.display()))?;
-    m.insert("tokenstash".into(), if typed { serde_json::json!({ "type": "stdio", "command": exe, "args": ["mcp"] }) } else { serde_json::json!({ "command": exe, "args": ["mcp"] }) });
+    let mut entry = if typed { serde_json::json!({ "type": "stdio", "command": exe, "args": ["mcp"] }) } else { serde_json::json!({ "command": exe, "args": ["mcp"] }) };
+    if let Some(h) = ts_home {
+        entry["env"] = serde_json::json!({ "TOKENSTASH_HOME": h });
+    }
+    m.insert("tokenstash".into(), entry);
     if let Some(parent) = p.parent() { fs::create_dir_all(parent)?; }
     fs::write(p, serde_json::to_string_pretty(&v)?)?;
     Ok(())
