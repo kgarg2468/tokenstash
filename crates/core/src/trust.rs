@@ -39,7 +39,7 @@ pub fn gate(db: &Db, cfg: &Config, project: &Path, name: &str, sensitive: bool) 
     };
     let project = project.as_path();
     let pid = project.to_string_lossy();
-    if sensitive && !db.is_approved(&pid, name)? {
+    if sensitive && !db.is_approved_exact(&pid, name)? {
         return Ok(Gate::NeedsApproval { reason: GateReason::Sensitive });
     }
     if !inside_roots(project, cfg) && !db.is_approved(&pid, "*")? {
