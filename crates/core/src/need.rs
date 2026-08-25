@@ -156,13 +156,42 @@ pub fn need(ctx: &Ctx, project: &Path, agent: &str, names: &[String], opts: &Nee
         if outside {
             names_for_task.push("*".into());
         }
-        // Program-derived requests never merge with another invocation's pending approval.
-        let t = tasks::create_approval_task_opts(ctx, project, agent, &names_for_task, !opts.require_approval)?;
-        for o in outcomes.iter_mut() {
-            if let Outcome::Pending { name, identity, task_id, title, .. } = o {
-                if task_id.is_empty() && gated.contains(&format!("{name}@{identity}")) {
-                    *task_id = t.id.clone();
-                    *title = t.title.clone();
+        // "Deny" on an approval card is remembered for task_ttl_hours, like a denied paste:
+        // every gated entry the human already refused for this project comes back Denied
+        // instead of a fresh card. Without this a program failing in a loop files a new card
+        // per failure until the human clicks through.
+        let mut denied_entries: Vec<String> = vec![];
+        if !opts.force {
+            let since = (chrono::Utc::now() - chrono::Duration::hours(ctx.cfg.task_ttl_hours as i64)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            if let Some(d) = ctx.db.recent_denied_approval(&pid, &since)? {
+                for g in &gated {
+                    let name_only = tasks::split_identity(g).0.to_string();
+                    let covered = d.names.iter().any(|n| n == g || n == &name_only)
+                        || (outside && d.names.iter().any(|n| n == "*"));
+                    if covered {
+                        denied_entries.push(g.clone());
+                    }
+                }
+                for o in outcomes.iter_mut() {
+                    if let Outcome::Pending { name, identity, .. } = o {
+                        if denied_entries.contains(&format!("{name}@{identity}")) {
+                            *o = Outcome::Denied { name: name.clone(), task_id: d.id.clone() };
+                        }
+                    }
+                }
+            }
+        }
+        let still_gated: Vec<String> = gated.iter().filter(|g| !denied_entries.contains(g)).cloned().collect();
+        if !still_gated.is_empty() {
+            let names_for_task: Vec<String> = names_for_task.into_iter().filter(|n| n == "*" || still_gated.contains(n)).collect();
+            // Program-derived requests never merge with another invocation's pending approval.
+            let t = tasks::create_approval_task_opts(ctx, project, agent, &names_for_task, !opts.require_approval)?;
+            for o in outcomes.iter_mut() {
+                if let Outcome::Pending { name, identity, task_id, title, .. } = o {
+                    if task_id.is_empty() && still_gated.contains(&format!("{name}@{identity}")) {
+                        *task_id = t.id.clone();
+                        *title = t.title.clone();
+                    }
                 }
             }
         }
