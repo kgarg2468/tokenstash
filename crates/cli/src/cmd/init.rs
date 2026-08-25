@@ -64,9 +64,17 @@ impl Manifest {
             fs::copy(p, &b)?;
             Some(b)
         } else { None };
-        f()?;
+        // Record the intent durably BEFORE changing the file: if the manifest cannot be
+        // written, the file is not touched at all, so there is never a changed file without
+        // an undo record. If the change then fails, the record is withdrawn.
         self.files.push((p.to_path_buf(), backup));
-        self.save()
+        self.save()?;
+        if let Err(e) = f() {
+            self.files.pop();
+            let _ = self.save();
+            return Err(e);
+        }
+        Ok(())
     }
 
     fn record_dir(&mut self, d: &Path) -> Result<()> {
