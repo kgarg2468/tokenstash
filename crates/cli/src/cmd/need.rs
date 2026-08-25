@@ -95,7 +95,14 @@ pub fn need(a: NeedArgs) -> Result<i32> {
             }
         }
         if outcomes.iter().any(|o| o.is_pending()) {
-            eprintln!("\nTell the user to open the link above — it works as-is for pasting the key. The user has also been notified on the desktop. Continue with other work; re-run this command or `tokenstash tasks` to check.");
+            // Only claim there is a link when there is one; with the inbox down or squatted
+            // the line above is an explanation, and an agent following "open the link above"
+            // would hand the user an error string as a URL.
+            if matches!(state, notify::Inbox::Ours) {
+                eprintln!("\nTell the user to open the link above — it works as-is for pasting the key. The user has also been notified on the desktop. Continue with other work; re-run this command or `tokenstash tasks` to check.");
+            } else {
+                eprintln!("\nThere is no inbox link yet (see the message above). Tell the user to run `tokenstash open` in a terminal; that starts the inbox and opens it. Continue with other work; re-run this command or `tokenstash tasks` to check.");
+            }
         }
     }
     Ok(code_for(&outcomes))
