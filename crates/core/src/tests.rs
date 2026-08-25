@@ -751,7 +751,8 @@ fn a_git_dir_in_a_shared_ancestor_never_becomes_the_project_root() {
     }
     let proj = shared.join("proj");
     std::fs::create_dir_all(&proj).unwrap();
-    assert_eq!(envfile::git_root(&proj), None, "sticky ancestor must not be a root");
+    assert_eq!(envfile::owned_git_root(&proj).unwrap(), None, "sticky ancestor must not be a root");
+    assert_eq!(envfile::git_root(&shared.join("proj")), Some(shared.clone()), "plain detection still sees it");
     assert_eq!(crate::project::canonical(&proj), proj.canonicalize().unwrap());
     // ...and the env file lands in the project, not the ancestor
     let written = envfile::write(&proj, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap();
@@ -764,4 +765,12 @@ fn a_git_dir_in_a_shared_ancestor_never_becomes_the_project_root() {
     let sub = repo.join("a/b");
     std::fs::create_dir_all(&sub).unwrap();
     assert_eq!(envfile::git_root(&sub), Some(repo.clone()));
+    assert_eq!(envfile::owned_git_root(&sub).unwrap(), Some(repo.clone()));
+    // a tracked env file is still refused inside the shared ancestor: detection is not
+    // suppressed, only adoption as a write root
+    let _ = std::process::Command::new("git").arg("-C").arg(&shared).args(["init", "-q", "."]).status();
+    std::fs::write(shared.join("proj/.env.local"), "OLD=1\n").unwrap();
+    let _ = std::process::Command::new("git").arg("-C").arg(&shared).args(["add", "proj/.env.local"]).env("GIT_AUTHOR_NAME","t").env("GIT_AUTHOR_EMAIL","t@t").status();
+    assert!(envfile::is_git_tracked(&proj, &proj.join(".env.local")));
+    assert!(envfile::write(&proj, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).is_err());
 }
