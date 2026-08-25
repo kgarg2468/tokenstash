@@ -774,3 +774,79 @@ fn a_git_dir_in_a_shared_ancestor_never_becomes_the_project_root() {
     assert!(envfile::is_git_tracked(&proj, &proj.join(".env.local")));
     assert!(envfile::write(&proj, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).is_err());
 }
+
+
+#[test]
+fn a_project_wide_approval_never_unlocks_sensitive_keys() {
+    // "Allow this project" records `*`; that must satisfy the LOCATION gate only. A sensitive
+    // key is a per-key decision, or an outside-root project ends up more permissive than a
+    // trusted one.
+    let dir = tmp("wildcard-sensitive");
+    let db = Db::open(&dir.join("t.db")).unwrap();
+    let cfg = Config { trust_roots: vec![], ..Default::default() };
+    let outside = dir.join("elsewhere");
+    std::fs::create_dir_all(&outside).unwrap();
+    let outside = outside.canonicalize().unwrap();
+    db.approve(&outside.to_string_lossy(), "*").unwrap();
+    assert_eq!(trust::gate(&db, &cfg, &outside, "OPENAI_API_KEY", false).unwrap(), trust::Gate::Open);
+    assert!(matches!(trust::gate(&db, &cfg, &outside, "STRIPE_SECRET_KEY", true).unwrap(), trust::Gate::NeedsApproval { reason: trust::GateReason::Sensitive }),
+        "a wildcard approval must not silence a sensitive key");
+    db.approve(&outside.to_string_lossy(), "STRIPE_SECRET_KEY").unwrap();
+    assert_eq!(trust::gate(&db, &cfg, &outside, "STRIPE_SECRET_KEY", true).unwrap(), trust::Gate::Open);
+}
+
+#[test]
+fn a_run_shim_approval_is_not_a_standing_grant() {
+    let _g = env_lock();
+    let home = tmp("once-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("once-proj").canonicalize().unwrap();
+    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    // a program-derived approval: merge=false marks it one-time
+    let t = tasks::create_approval_task_opts(&ctx, &proj, "test", &["STRIPE_SECRET_KEY@default".to_string()], false).unwrap();
+    assert_eq!(t.expects, tasks::APPROVAL_ONCE);
+    tasks::answer_approval(&ctx, &t, true).unwrap();
+    assert_eq!(db.get_task(&t.id).unwrap().unwrap().status, db::TaskStatus::Answered, "the answer is recorded");
+    assert!(!db.is_approved(&proj.to_string_lossy(), "STRIPE_SECRET_KEY").unwrap(), "but no grant was written");
+    assert!(matches!(trust::gate(&db, &cfg, &proj, "STRIPE_SECRET_KEY", true).unwrap(), trust::Gate::NeedsApproval { .. }), "the next bare request asks again");
+    // an ordinary (human-facing, mergeable) approval does persist
+    let t2 = tasks::create_approval_task_opts(&ctx, &proj, "test", &["STRIPE_SECRET_KEY@default".to_string()], true).unwrap();
+    tasks::answer_approval(&ctx, &t2, true).unwrap();
+    assert!(db.is_approved(&proj.to_string_lossy(), "STRIPE_SECRET_KEY").unwrap());
+    std::env::remove_var("TOKENSTASH_HOME");
+    std::env::remove_var("TOKENSTASH_STASH");
+}
+
+#[test]
+fn a_denied_approval_is_remembered() {
+    let _g = env_lock();
+    let home = tmp("deny-approval-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp("deny-approval-proj").canonicalize().unwrap();
+    // outside every trust root, so a stash hit needs approval
+    let cfg = Config { trust_roots: vec![], ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    stash.set(&stash::stash_key("OPENAI_API_KEY", "default"), &SecretString::from("sk-test-aaaaaaaaaaaaaaaa".to_string())).unwrap();
+    let names = vec!["OPENAI_API_KEY".to_string()];
+    let out = need::need(&ctx, &proj, "test", &names, &need::NeedOpts::default()).unwrap();
+    let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("expected pending, got {o:?}") };
+    let t = db.get_task(&tid).unwrap().unwrap();
+    assert_eq!(t.kind, db::TaskKind::Approval);
+    tasks::answer_approval(&ctx, &t, false).unwrap();
+    // asking again within the TTL is refused without a new card
+    let out2 = need::need(&ctx, &proj, "test", &names, &need::NeedOpts::default()).unwrap();
+    assert!(matches!(&out2[0], need::Outcome::Denied { .. }), "got {:?}", out2[0]);
+    assert_eq!(db.list_tasks(Some(&proj.to_string_lossy()), true).unwrap().len(), 0, "no fresh approval card was filed");
+    // --force asks again
+    let out3 = need::need(&ctx, &proj, "test", &names, &need::NeedOpts { force: true, ..Default::default() }).unwrap();
+    assert!(matches!(&out3[0], need::Outcome::Pending { .. }));
+    std::env::remove_var("TOKENSTASH_HOME");
+    std::env::remove_var("TOKENSTASH_STASH");
+}
