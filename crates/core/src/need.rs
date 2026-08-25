@@ -160,27 +160,35 @@ pub fn need(ctx: &Ctx, project: &Path, agent: &str, names: &[String], opts: &Nee
         // every gated entry the human already refused for this project comes back Denied
         // instead of a fresh card. Without this a program failing in a loop files a new card
         // per failure until the human clicks through.
-        let mut denied_entries: Vec<String> = vec![];
+        // Every denial still inside the TTL counts, not just the newest: each card may have
+        // covered different keys.
+        let mut denied_entries: Vec<(String, String)> = vec![]; // (entry, denying task id)
         if !opts.force {
             let since = (chrono::Utc::now() - chrono::Duration::hours(ctx.cfg.task_ttl_hours as i64)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-            if let Some(d) = ctx.db.recent_denied_approval(&pid, &since)? {
+            for d in ctx.db.recent_denied_approvals(&pid, &since)? {
                 for g in &gated {
+                    if denied_entries.iter().any(|(e, _)| e == g) {
+                        continue;
+                    }
+                    // Only the keys that card actually named. The `*` an outside-root card
+                    // carries is the project-wide GRANT offer; refusing it is not "deny every
+                    // future key here" — a different key deserves its own card.
                     let name_only = tasks::split_identity(g).0.to_string();
-                    let covered = d.names.iter().any(|n| n == g || n == &name_only)
-                        || (outside && d.names.iter().any(|n| n == "*"));
+                    let covered = d.names.iter().any(|n| n == g || n == &name_only);
                     if covered {
-                        denied_entries.push(g.clone());
+                        denied_entries.push((g.clone(), d.id.clone()));
                     }
                 }
-                for o in outcomes.iter_mut() {
-                    if let Outcome::Pending { name, identity, .. } = o {
-                        if denied_entries.contains(&format!("{name}@{identity}")) {
-                            *o = Outcome::Denied { name: name.clone(), task_id: d.id.clone() };
-                        }
+            }
+            for o in outcomes.iter_mut() {
+                if let Outcome::Pending { name, identity, .. } = o {
+                    if let Some((_, tid)) = denied_entries.iter().find(|(e, _)| e == &format!("{name}@{identity}")) {
+                        *o = Outcome::Denied { name: name.clone(), task_id: tid.clone() };
                     }
                 }
             }
         }
+        let denied_entries: Vec<String> = denied_entries.into_iter().map(|(e, _)| e).collect();
         let still_gated: Vec<String> = gated.iter().filter(|g| !denied_entries.contains(g)).cloned().collect();
         if !still_gated.is_empty() {
             let names_for_task: Vec<String> = names_for_task.into_iter().filter(|n| n == "*" || still_gated.contains(n)).collect();

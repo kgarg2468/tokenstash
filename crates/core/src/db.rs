@@ -418,12 +418,14 @@ impl Db {
     /// Most recent denied approval task for a project after `since`. "Deny" on an approval
     /// card must mean something: without memory, a program failing in a loop files a fresh
     /// card each time until the human clicks through out of fatigue.
-    pub fn recent_denied_approval(&self, project: &str, since: &str) -> Result<Option<Task>> {
+    pub fn recent_denied_approvals(&self, project: &str, since: &str) -> Result<Vec<Task>> {
         let sql = format!(
             "SELECT {} FROM tasks WHERE kind='approval' AND status='denied' AND project=?1 AND answered_at > ?2 ORDER BY answered_at DESC",
             Self::TASK_COLS
         );
-        Ok(self.conn.query_row(&sql, params![project, since], Self::row_to_task).optional()?)
+        let mut st = self.conn.prepare(&sql)?;
+        let rows = st.query_map(params![project, since], Self::row_to_task)?.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn approve(&self, project: &str, name: &str) -> Result<()> {

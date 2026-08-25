@@ -844,6 +844,14 @@ fn a_denied_approval_is_remembered() {
     let out2 = need::need(&ctx, &proj, "test", &names, &need::NeedOpts::default()).unwrap();
     assert!(matches!(&out2[0], need::Outcome::Denied { .. }), "got {:?}", out2[0]);
     assert_eq!(db.list_tasks(Some(&proj.to_string_lossy()), true).unwrap().len(), 0, "no fresh approval card was filed");
+    // an older denial for a DIFFERENT key is still honoured after a newer one
+    stash.set(&stash::stash_key("GROQ_API_KEY", "default"), &SecretString::from("gsk_test_bbbbbbbbbbbbbbbb".to_string())).unwrap();
+    let out_g = need::need(&ctx, &proj, "test", &["GROQ_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    let gid = match &out_g[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
+    tasks::answer_approval(&ctx, &db.get_task(&gid).unwrap().unwrap(), false).unwrap();
+    let both = need::need(&ctx, &proj, "test", &["OPENAI_API_KEY".to_string(), "GROQ_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    assert!(both.iter().all(|o| matches!(o, need::Outcome::Denied { .. })), "both denials must be remembered: {both:?}");
+    assert_eq!(db.list_tasks(Some(&proj.to_string_lossy()), true).unwrap().len(), 0);
     // --force asks again
     let out3 = need::need(&ctx, &proj, "test", &names, &need::NeedOpts { force: true, ..Default::default() }).unwrap();
     assert!(matches!(&out3[0], need::Outcome::Pending { .. }));
