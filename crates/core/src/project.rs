@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 pub fn canonical(dir: &Path) -> PathBuf {
     let abs = if dir.is_absolute() { dir.to_path_buf() } else { std::env::current_dir().unwrap_or_default().join(dir) };
     let abs = abs.canonicalize().unwrap_or(abs);
-    crate::envfile::git_root(&abs).unwrap_or(abs)
+    // A foreign-owned checkout still resolves to itself here so the write path can refuse
+    // it with a clear error; a shared ancestor (/tmp) is never adopted as the project.
+    crate::envfile::owned_git_root(&abs).ok().flatten().unwrap_or(abs)
 }
 
 pub fn current() -> PathBuf {

@@ -228,6 +228,7 @@ fn glob_match(pat: &str, s: &str) -> bool {
 /// tracked. Best effort: if git cannot be run, assume not tracked (the .gitignore path
 /// still applies).
 pub fn is_git_tracked(project: &Path, path: &Path) -> bool {
+    // Detection, not policy: a tracked file is refused wherever the repo lives.
     let Some(root) = git_root(project) else { return false };
     let Ok(rel) = path.strip_prefix(&root) else { return false };
     std::process::Command::new("git")
@@ -242,18 +243,11 @@ pub fn is_git_tracked(project: &Path, path: &Path) -> bool {
 }
 
 /// Walk up to find a git repo root.
-/// Nearest ancestor (or `start` itself) that holds a `.git`, with two guards git itself
-/// does not apply: the walk never crosses into a directory the current user does not own,
-/// and never accepts a world-writable/sticky directory (`/tmp`, `/var/tmp`) as a root. A
-/// stray `.git` in `/tmp` — one `git init` from the wrong cwd is enough — would otherwise
-/// make every project under it resolve to `/tmp`, and the env file (and `.gitignore`) would
-/// be written there, outside the project. Seen for real by the leak test.
+/// Nearest ancestor (or `start` itself) that holds a `.git` — plain detection, no policy.
+/// Callers that decide where to WRITE use [`owned_git_root`].
 pub fn git_root(start: &Path) -> Option<PathBuf> {
     let mut p = start.to_path_buf();
     loop {
-        if !dir_is_private_to_user(&p) {
-            return None;
-        }
         if p.join(".git").exists() {
             return Some(p);
         }
@@ -263,16 +257,56 @@ pub fn git_root(start: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Owned by the current user and not sticky/world-writable. Non-unix: always true.
+/// The git root a project may be resolved to and written into. Walks up like [`git_root`]
+/// with two rules git itself does not apply:
+/// - a sticky / world-writable directory (`/tmp`, `/var/tmp`) is never a root and ends the
+///   walk: a stray `.git` there (one `git init` from the wrong cwd is enough) would make every
+///   project under it resolve to `/tmp`, and the env file and `.gitignore` would be written
+///   there. Seen for real by the leak test. `Ok(None)`: treat the directory as its own project.
+/// - a `.git` in a directory the current user does not own is an ERROR, not "no repo": the
+///   checkout is real, so tracked-file and gitignore protection still apply, but we cannot
+///   write the ignore rule into someone else's tree. Failing closed here means a shared or
+///   root-owned checkout never silently loses its git safeguards.
+pub fn owned_git_root(start: &Path) -> Result<Option<PathBuf>> {
+    let mut p = start.to_path_buf();
+    loop {
+        let has_git = p.join(".git").exists();
+        match dir_class(&p) {
+            DirClass::Shared => return Ok(None),
+            DirClass::Foreign if has_git => anyhow::bail!(
+                "{} is a git checkout owned by another user; refusing to write a secret into a tree whose .gitignore is not yours",
+                p.display()
+            ),
+            DirClass::Foreign => return Ok(None),
+            DirClass::Own if has_git => return Ok(Some(p)),
+            DirClass::Own => {}
+        }
+        if !p.pop() {
+            return Ok(None);
+        }
+    }
+}
+
+enum DirClass {
+    /// Owned by the current user, not sticky/world-writable.
+    Own,
+    /// Sticky or world-writable: /tmp and friends. Never a project root.
+    Shared,
+    /// Owned by someone else.
+    Foreign,
+}
+
 #[cfg(unix)]
-fn dir_is_private_to_user(p: &Path) -> bool {
+fn dir_class(p: &Path) -> DirClass {
     use std::os::unix::fs::MetadataExt;
-    let Ok(md) = fs::metadata(p) else { return false };
-    let uid = unsafe { libc_geteuid() };
-    md.uid() == uid && md.mode() & 0o1002 == 0
+    let Ok(md) = fs::metadata(p) else { return DirClass::Foreign };
+    if md.mode() & 0o1002 != 0 {
+        return DirClass::Shared;
+    }
+    if md.uid() == unsafe { libc_geteuid() } { DirClass::Own } else { DirClass::Foreign }
 }
 #[cfg(not(unix))]
-fn dir_is_private_to_user(_p: &Path) -> bool { true }
+fn dir_class(_p: &Path) -> DirClass { DirClass::Own }
 
 #[cfg(unix)]
 unsafe fn libc_geteuid() -> u32 {
@@ -287,7 +321,7 @@ unsafe fn libc_geteuid() -> u32 {
 /// the project's own `.gitignore` (closest wins) and re-verified; if that still fails, the
 /// caller must not write the secret. Symlinked ignore files are refused.
 pub fn ensure_gitignore(project: &Path, env_file: &str) -> Result<bool> {
-    let Some(root) = git_root(project) else { return Ok(false) };
+    let Some(root) = owned_git_root(project)? else { return Ok(false) };
     let mut changed = add_rule_if_uncovered(&root.join(".gitignore"), env_file)?;
     let target = project.join(env_file);
     match git_check_ignore(&root, &target) {
