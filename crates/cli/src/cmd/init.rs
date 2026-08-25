@@ -397,18 +397,23 @@ fn merge_codex_toml(p: &Path, exe: &str, ts_home: Option<&str>) -> Result<()> {
 /// header only counts at the start of a line (whitespace allowed), so comments and inline
 /// tables never match. Returns `None` if no such table line exists.
 fn remove_toml_table(text: &str, header: &str) -> Option<String> {
-    let is_header = |line: &str, h: &str| {
+    // The dotted key of a header line with TOML-permitted whitespace removed
+    // (`[ mcp_servers . tokenstash ]` → `mcp_servers.tokenstash`), or None if not a header.
+    let header_key = |line: &str| -> Option<String> {
         let t = line.trim_start();
-        t.strip_prefix('[').map(|r| r.trim_start().strip_prefix(h).map(|r| r.trim_start().starts_with(']')).unwrap_or(false)).unwrap_or(false)
+        let inner = t.strip_prefix('[')?;
+        let inner = inner.strip_prefix('[').unwrap_or(inner); // array-of-tables `[[x]]`
+        let close = inner.find(']')?;
+        Some(inner[..close].chars().filter(|c| !c.is_whitespace()).collect())
     };
-    let is_any_header = |line: &str| line.trim_start().starts_with('[');
     let lines: Vec<&str> = text.lines().collect();
-    let start = lines.iter().position(|l| is_header(l, header))?;
+    let start = lines.iter().position(|l| header_key(l).as_deref() == Some(header))?;
     let mut end = start + 1;
     while end < lines.len() {
-        let l = lines[end];
-        if is_any_header(l) && !l.trim_start().starts_with(&format!("[{header}.")) {
-            break;
+        if let Some(k) = header_key(lines[end]) {
+            if !k.starts_with(&format!("{header}.")) {
+                break;
+            }
         }
         end += 1;
     }
