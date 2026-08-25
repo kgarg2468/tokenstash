@@ -131,7 +131,7 @@ pub fn inbox_unavailable(cfg: &Config, state: Inbox) -> Option<String> {
     match state {
         Inbox::Ours => None,
         Inbox::Foreign => Some(format!(
-            "port {} is held by another process; not sending you there. Free the port or change inbox_port in {}.",
+            "port {} is held by another process (often a tokenstash inbox started under a different TOKENSTASH_HOME); not sending you there. Stop it, free the port, or change inbox_port in {}.",
             cfg.inbox_port,
             tokenstash_core::config::config_path().display()
         )),

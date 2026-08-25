@@ -194,7 +194,8 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
             let id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
             app.db.expire_overdue()?;
             match app.db.find_task(id)? {
-                Some(t) => Ok((json!({ "task_id": t.id, "kind": t.kind, "status": t.status, "name": t.name, "title": t.title, "note": t.note, "env_file": project.join(&app.cfg.env_file) }), false)),
+                // The task knows its own project; the server's cwd is not it.
+                Some(t) => Ok((json!({ "task_id": t.id, "kind": t.kind, "status": t.status, "name": t.name, "title": t.title, "note": t.note, "env_file": std::path::Path::new(&t.project).join(&app.cfg.env_file) }), false)),
                 None => Ok((json!({ "error": format!("no task {id}") }), true)),
             }
         }
