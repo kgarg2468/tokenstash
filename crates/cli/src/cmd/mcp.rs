@@ -103,7 +103,7 @@ fn tools() -> Value {
             }, "required": ["title"] }
         },
         { "name": "task_check", "description": "Check the status of a task (pending | answered | denied | expired). For secret tasks, answered means the value is now in the env file.", "inputSchema": { "type": "object", "properties": { "task_id": { "type": "string" } }, "required": ["task_id"] } },
-        { "name": "task_list", "description": "List open tasks for the project.", "inputSchema": { "type": "object", "properties": { "project": { "type": "string" }, "all": { "type": "boolean" } } } },
+        { "name": "task_list", "description": "List open tasks for the project.", "inputSchema": { "type": "object", "properties": { "project": { "type": "string" } } } },
         { "name": "secrets_list", "description": "List the names (never values) of secrets the user already has, so you can request the right ones.", "inputSchema": { "type": "object", "properties": {} } }
     ])
 }
@@ -193,17 +193,19 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
         "task_check" => {
             let id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
             app.db.expire_overdue()?;
-            match app.db.find_task(id)? {
-                // The task knows its own project; the server's cwd is not it.
+            // Scoped to this project: a task id (or prefix) from another project reveals
+            // that project's path and state to a model that has no business with it.
+            let pid = project.to_string_lossy().to_string();
+            match app.db.find_task(id)?.filter(|t| t.project == pid) {
                 Some(t) => Ok((json!({ "task_id": t.id, "kind": t.kind, "status": t.status, "name": t.name, "title": t.title, "note": t.note, "env_file": std::path::Path::new(&t.project).join(&app.cfg.env_file) }), false)),
-                None => Ok((json!({ "error": format!("no task {id}") }), true)),
+                None => Ok((json!({ "error": format!("no task {id} in this project") }), true)),
             }
         }
         "task_list" => {
             app.db.expire_overdue()?;
-            let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+            // Always this project only: `all` was a cross-project path oracle for the model.
             let pid = project.to_string_lossy().to_string();
-            let list = app.db.list_tasks(if all { None } else { Some(&pid) }, true)?;
+            let list = app.db.list_tasks(Some(&pid), true)?;
             Ok((json!({ "tasks": list, "inbox": util::inbox_url_agent(&app.cfg, None, crate::notify::inbox_state(&app.cfg)) }), false))
         }
         "secrets_list" => {
