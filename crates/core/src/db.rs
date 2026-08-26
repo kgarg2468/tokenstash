@@ -522,6 +522,12 @@ impl Db {
             .optional()?)
     }
 
+    pub fn list_bindings(&self) -> Result<Vec<(String, String, String)>> {
+        let mut st = self.conn.prepare("SELECT project, name, identity FROM bindings ORDER BY project, name")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn set_binding(&self, project: &str, name: &str, identity: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO bindings (project, name, identity) VALUES (?1,?2,?3)

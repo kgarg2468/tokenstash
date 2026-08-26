@@ -292,10 +292,23 @@ pub fn check(a: CheckArgs) -> Result<i32> {
         require_human("check")?;
     }
     let app = App::open()?;
+    sweep(&app, &a.names, a.stale_only, !a.json)?;
+    if a.json {
+        // re-read the rows for a machine-readable view
+        let rows: Vec<serde_json::Value> = app.db.list_secrets()?.into_iter().filter(|m| a.names.is_empty() || a.names.contains(&m.name)).map(|m| serde_json::json!({ "name": m.name, "identity": m.identity, "stale": m.stale, "stale_reason": m.stale_reason, "last_verified": m.last_verified })).collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    }
+    Ok(0)
+}
+
+/// The liveness sweep shared by `check` and `import`: every key with a registry check (or
+/// only `names`), probed sequentially with polite pacing. Rejected → stale, Ok → verified,
+/// Unknown → untouched. Never prints a value.
+pub fn sweep(app: &App, names: &[String], stale_only: bool, print: bool) -> Result<()> {
     let mut rows = vec![];
     for m in app.db.list_secrets()? {
-        if !a.names.is_empty() && !a.names.contains(&m.name) { continue; }
-        if a.stale_only && !m.stale { continue; }
+        if !names.is_empty() && !names.contains(&m.name) { continue; }
+        if stale_only && !m.stale { continue; }
         let Some(check) = tokenstash_core::registry::lookup(&m.name).and_then(|p| p.check.clone()) else {
             rows.push((m.name.clone(), m.identity.clone(), "no check".to_string(), m.stale));
             continue;
@@ -304,11 +317,10 @@ pub fn check(a: CheckArgs) -> Result<i32> {
             rows.push((m.name.clone(), m.identity.clone(), "not in stash".to_string(), m.stale));
             continue;
         };
-        let verdict = tokenstash_core::validate::liveness(&check, &v);
-        let status = match verdict {
+        let status = match tokenstash_core::validate::liveness(&check, &v) {
             tokenstash_core::validate::Liveness::Ok => { app.db.set_verified(&m.name, &m.identity)?; "ok".to_string() }
             tokenstash_core::validate::Liveness::Rejected(code) => {
-                let reason = format!("rejected by the provider (HTTP {code}) on {} during `tokenstash check`", tokenstash_core::now());
+                let reason = format!("rejected by the provider (HTTP {code}) on {} during a check", tokenstash_core::now());
                 app.db.mark_stale(&m.name, &m.identity, true, Some(&reason))?;
                 app.db.audit(None, None, "check.rejected", Some(&m.name), Some(&m.identity), Some(&format!("HTTP {code}")))?;
                 format!("REJECTED (HTTP {code}) → stale")
@@ -317,16 +329,14 @@ pub fn check(a: CheckArgs) -> Result<i32> {
         };
         let stale_now = app.db.get_secret(&m.name, &m.identity)?.map(|x| x.stale).unwrap_or(false);
         rows.push((m.name.clone(), m.identity.clone(), status, stale_now));
-        std::thread::sleep(std::time::Duration::from_millis(200)); // polite pacing
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
-    if a.json {
-        println!("{}", serde_json::to_string_pretty(&rows.iter().map(|(n, i, st, stale)| serde_json::json!({ "name": n, "identity": i, "result": st, "stale": stale })).collect::<Vec<_>>())?);
-        return Ok(0);
+    if print {
+        if rows.is_empty() { println!("nothing to check"); return Ok(()); }
+        println!("{:<36} {:<10} RESULT", "NAME", "IDENTITY");
+        for (n, i, st, _) in &rows { println!("{n:<36} {i:<10} {st}"); }
+        let stale = rows.iter().filter(|r| r.3).count();
+        if stale > 0 { println!("\n{stale} stale — the next `tokenstash need` for each asks for a replacement (or run `tokenstash rotate NAME`)"); }
     }
-    if rows.is_empty() { println!("nothing to check"); return Ok(0); }
-    println!("{:<36} {:<10} RESULT", "NAME", "IDENTITY");
-    for (n, i, st, _) in &rows { println!("{n:<36} {i:<10} {st}"); }
-    let stale = rows.iter().filter(|r| r.3).count();
-    if stale > 0 { println!("\n{stale} stale — the next `tokenstash need` for each asks for a replacement (or run `tokenstash rotate NAME`)"); }
-    Ok(0)
+    Ok(())
 }
