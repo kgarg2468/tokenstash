@@ -355,7 +355,16 @@ pub fn deliver(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &st
     let mut current = value.clone();
     let unverified = match verify_at_use(ctx, project, agent, name, identity, value, budget)? {
         AtUse::Rejected(reason) => return Ok(Delivery::Rejected { reason }),
-        AtUse::Changed(v) => { current = v; true }
+        AtUse::Changed(v) => {
+            // The replacement may itself have been marked stale in the meantime.
+            if let Some(m) = ctx.db.get_secret(name, identity)? {
+                if m.stale {
+                    return Ok(Delivery::Rejected { reason: m.stale_reason.unwrap_or_else(|| "the stored key was marked stale".into()) });
+                }
+            }
+            current = v;
+            true
+        }
         AtUse::Unverified => true,
         AtUse::NotDue | AtUse::Verified => false,
     };
@@ -407,8 +416,11 @@ fn verify_at_use(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &
     if !ctx.db.claim_probe(name, identity, &rfc3339(now + PROBE_LEASE))? {
         return Ok(AtUse::Unverified);
     }
+    // The probe gets what is left of the budget, never more than its own timeout, so a
+    // request with several slow providers ends near MAX rather than MAX plus a timeout.
+    let timeout = crate::validate::TIMEOUT_AT_USE.min(ProbeBudget::MAX - budget.spent);
     let started = Instant::now();
-    let verdict = ctx.probe.run(check, value, crate::validate::TIMEOUT_AT_USE);
+    let verdict = ctx.probe.run(check, value, timeout);
     budget.spent += started.elapsed();
     let Some(verdict) = verdict else { return Ok(AtUse::NotDue) };
     // Another process may have replaced the value while the probe was in flight (the human
