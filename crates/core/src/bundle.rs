@@ -37,6 +37,13 @@ pub const P_COST: u32 = 1;
 /// Import floor: a header below this is refused even if it authenticates.
 pub const MIN_M_KIB: u32 = 19 * 1024;
 pub const MIN_T_COST: u32 = 2;
+/// Import ceiling: the header is only authenticated AFTER the KDF runs with its parameters,
+/// so a stranger's file must not be able to ask for terabytes of memory or years of work.
+pub const MAX_M_KIB: u32 = 1024 * 1024;
+pub const MAX_T_COST: u32 = 16;
+/// Caps on what import will even parse.
+pub const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_ENTRIES: usize = 10_000;
 
 /// Everything a stash is, minus per-machine state. Approvals are deliberately absent:
 /// they are consent tied to paths on a machine that no longer exists.
@@ -60,6 +67,44 @@ pub struct Entry {
     pub created: String,
     pub last_used: Option<String>,
     pub stale: bool,
+    /// Carried so a key the user asked to rotate stays a rotation on the new machine.
+    #[serde(default)]
+    pub stale_reason: Option<String>,
+}
+
+impl Drop for Payload_ {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        for e in &mut self.entries {
+            e.value.zeroize();
+        }
+    }
+}
+
+/// Names, identities and values a bundle may carry. Import is the first path that can put
+/// arbitrary bytes into the stash: a name like `FOO=bar` or a value with a newline would
+/// become extra lines in an env file on the next injection.
+pub fn validate_entry(e: &Entry) -> Result<()> {
+    let name_ok = !e.name.is_empty()
+        && e.name.len() <= 128
+        && e.name.as_bytes()[0].is_ascii_uppercase()
+        && e.name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+    if !name_ok {
+        bail!("entry name {:?} is not a valid variable name", e.name);
+    }
+    let ident_ok = !e.identity.is_empty()
+        && e.identity.len() <= 64
+        && e.identity.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if !ident_ok {
+        bail!("entry {} has an invalid identity {:?}", e.name, e.identity);
+    }
+    if e.value.chars().count() < crate::tasks::MIN_SECRET_CHARS || e.value.len() > 16 * 1024 {
+        bail!("entry {}@{}: value length out of range", e.name, e.identity);
+    }
+    if e.value.chars().any(|c| c.is_control()) {
+        bail!("entry {}@{}: value contains control characters", e.name, e.identity);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -131,6 +176,12 @@ pub fn open(bytes: &[u8], passphrase: &SecretString) -> Result<Payload_> {
     if m_kib < MIN_M_KIB || t < MIN_T_COST || p == 0 || p > 16 {
         bail!("bundle refuses: its key-derivation parameters are below the safety floor (m={m_kib} KiB, t={t}, p={p}); the file may have been tampered with");
     }
+    if m_kib > MAX_M_KIB || t > MAX_T_COST {
+        bail!("bundle refuses: its key-derivation parameters are above the ceiling (m={m_kib} KiB, t={t}); not spending that much memory or time on an unauthenticated header");
+    }
+    if passphrase.expose_secret().is_empty() {
+        bail!("empty passphrase");
+    }
     let salt: [u8; SALT_LEN] = bytes[26..26 + SALT_LEN].try_into().unwrap();
     let nonce: [u8; NONCE_LEN] = bytes[26 + SALT_LEN..HEADER_LEN].try_into().unwrap();
     let hdr = &bytes[..HEADER_LEN];
@@ -144,16 +195,17 @@ pub fn open(bytes: &[u8], passphrase: &SecretString) -> Result<Payload_> {
     serde_json::from_slice(&plain).context("bundle payload is not valid")
 }
 
-/// A passphrase the user did not have to invent: 5 groups of 4 from a 32-symbol alphabet
-/// (no ambiguous characters), 100 bits.
+/// A passphrase the user did not have to invent: 5 groups of 4 from a 31-symbol alphabet
+/// (no ambiguous characters), ~99 bits.
 pub fn generate_passphrase() -> SecretString {
     const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
+    use rand::Rng;
     let mut rng = rand::thread_rng();
     let mut s = String::with_capacity(24);
     for g in 0..5 {
         if g > 0 { s.push('-'); }
         for _ in 0..4 {
-            let i = (rng.next_u32() as usize) % ALPHABET.len();
+            let i = rng.gen_range(0..ALPHABET.len());
             s.push(ALPHABET[i] as char);
         }
     }
@@ -168,7 +220,7 @@ mod tests {
         Payload_ {
             created: "2026-08-26T00:00:00Z".into(),
             tool_version: "test".into(),
-            entries: vec![Entry { name: "OPENAI_API_KEY".into(), identity: "default".into(), value: "sk-bundlecanary-0123456789abcdef".into(), provider: Some("OpenAI".into()), sensitive: false, source_url: None, created: "2026-08-01T00:00:00Z".into(), last_used: None, stale: false }],
+            entries: vec![Entry { name: "OPENAI_API_KEY".into(), identity: "default".into(), value: "sk-bundlecanary-0123456789abcdef".into(), provider: Some("OpenAI".into()), sensitive: false, source_url: None, created: "2026-08-01T00:00:00Z".into(), last_used: None, stale: false, stale_reason: None }],
             bindings: vec![Binding { project: "/old/machine/proj".into(), name: "OPENAI_API_KEY".into(), identity: "default".into() }],
         }
     }
@@ -202,6 +254,24 @@ mod tests {
         // unknown version
         let mut t = bytes; t[12..14].copy_from_slice(&99u16.to_le_bytes());
         assert!(open(&t, &pw).unwrap_err().to_string().contains("version"));
+    }
+
+    #[test]
+    fn ceilings_and_entry_validation() {
+        let pw = SecretString::from("correct-horse-battery-staple".to_string());
+        let bytes = seal(&sample(), &pw).unwrap();
+        let mut t = bytes.clone(); t[14..18].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(open(&t, &pw).unwrap_err().to_string().contains("ceiling"), "a stranger's file must not demand terabytes");
+        let mut t = bytes.clone(); t[18..22].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(open(&t, &pw).unwrap_err().to_string().contains("ceiling"));
+        assert!(open(&bytes, &SecretString::from(String::new())).unwrap_err().to_string().contains("empty"));
+        let mut e = sample().entries[0].clone();
+        assert!(validate_entry(&e).is_ok());
+        e.name = "FOO=bar".into(); assert!(validate_entry(&e).is_err());
+        e.name = "lower".into(); assert!(validate_entry(&e).is_err());
+        e.name = "OPENAI_API_KEY".into(); e.identity = "a@b".into(); assert!(validate_entry(&e).is_err());
+        e.identity = "work".into(); e.value = "x\nNODE_OPTIONS=--require evil".into(); assert!(validate_entry(&e).is_err());
+        e.value = "short".into(); assert!(validate_entry(&e).is_err());
     }
 
     #[test]
