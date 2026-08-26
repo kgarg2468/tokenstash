@@ -212,7 +212,7 @@ fn require_approval_gates_even_hits() {
     let stash = stash::open(&cfg).unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
     stash.set(&stash::stash_key("GROQ_API_KEY", "default"), &SecretString::from("gsk_x".to_string())).unwrap();
-    db.upsert_secret(&db::SecretMeta { name: "GROQ_API_KEY".into(), identity: "default".into(), provider: None, sensitive: false, source_url: None, created: now(), last_used: None, stale: false }).unwrap();
+    db.upsert_secret(&db::SecretMeta { name: "GROQ_API_KEY".into(), identity: "default".into(), provider: None, sensitive: false, source_url: None, created: now(), last_used: None, stale: false, last_verified: None, stale_reason: None }).unwrap();
     // normal hit inside a trust root: silent
     let out = need::need(&ctx, &proj, "t", &["GROQ_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
     assert!(matches!(out[0], need::Outcome::Injected { .. }));
@@ -857,4 +857,99 @@ fn a_denied_approval_is_remembered() {
     assert!(matches!(&out3[0], need::Outcome::Pending { .. }));
     std::env::remove_var("TOKENSTASH_HOME");
     std::env::remove_var("TOKENSTASH_STASH");
+}
+
+
+fn rot_ctx_home(name: &str) -> (PathBuf, PathBuf) {
+    let home = tmp(&format!("{name}-home"));
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp(&format!("{name}-proj")).canonicalize().unwrap();
+    (home, proj)
+}
+
+#[test]
+fn a_stale_key_is_a_miss_with_the_reason_on_the_card() {
+    let _g = env_lock();
+    let (home, proj) = rot_ctx_home("stale-miss");
+    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let names = vec!["OPENAI_API_KEY".to_string()];
+    // store via a paste
+    let t = tasks::create_secret_task(&ctx, &proj, "test", "OPENAI_API_KEY", "default", &Default::default()).unwrap();
+    tasks::answer_secret(&ctx, &t, SecretString::from("sk-old-aaaaaaaaaaaaaaaa".to_string()), true).unwrap();
+    assert!(matches!(need::need(&ctx, &proj, "test", &names, &Default::default()).unwrap()[0], need::Outcome::Injected { .. }));
+    // mark stale → the next need is a miss whose card carries the reason
+    db.mark_stale("OPENAI_API_KEY", "default", true, Some("rejected by OpenAI (HTTP 401) on 2026-08-26, reported by claude-code in demo")).unwrap();
+    let out = need::need(&ctx, &proj, "test", &names, &Default::default()).unwrap();
+    let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
+    let card = db.get_task(&tid).unwrap().unwrap();
+    assert!(card.why.as_deref().unwrap().contains("reported by claude-code in demo"), "{:?}", card.why);
+    // the old value is still in the stash (self-heal path), not injected
+    assert!(stash.get(&stash::stash_key("OPENAI_API_KEY", "default")).unwrap().is_some());
+    // answering with a new value clears stale and injects
+    tasks::answer_secret(&ctx, &card, SecretString::from("sk-new-bbbbbbbbbbbbbbbb".to_string()), true).unwrap();
+    let m = db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap();
+    assert!(!m.stale && m.stale_reason.is_none());
+    assert!(std::fs::read_to_string(proj.join(".env.local")).unwrap().contains("sk-new-"));
+    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+#[test]
+fn rotate_files_the_card_and_rewrites_every_project_holding_the_old_value() {
+    let _g = env_lock();
+    let (home, proj_a) = rot_ctx_home("rotate");
+    let proj_b = tmp("rotate-proj-b").canonicalize().unwrap();
+    let cfg = Config { trust_roots: vec![proj_a.clone(), proj_b.clone()], ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let names = vec!["GROQ_API_KEY".to_string()];
+    let t = tasks::create_secret_task(&ctx, &proj_a, "test", "GROQ_API_KEY", "default", &Default::default()).unwrap();
+    tasks::answer_secret(&ctx, &t, SecretString::from("gsk_old_aaaaaaaaaaaaaaaa".to_string()), true).unwrap();
+    need::need(&ctx, &proj_b, "test", &names, &Default::default()).unwrap(); // delivered to B too
+    assert!(std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("gsk_old_"));
+    let card = tasks::rotate(&ctx, &proj_a, "test", "GROQ_API_KEY", "default").unwrap();
+    assert!(db.get_secret("GROQ_API_KEY", "default").unwrap().unwrap().stale);
+    assert!(card.why.as_deref().unwrap().contains("rotate"));
+    tasks::answer_secret(&ctx, &card, SecretString::from("gsk_new_bbbbbbbbbbbbbbbb".to_string()), true).unwrap();
+    assert!(std::fs::read_to_string(proj_a.join(".env.local")).unwrap().contains("gsk_new_"));
+    assert!(std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("gsk_new_"), "project B still held the old value and must be rewritten");
+    assert!(!std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("gsk_old_"));
+    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+#[test]
+fn report_bad_needs_standing_and_is_rate_limited() {
+    let _g = env_lock();
+    let (home, proj) = rot_ctx_home("report");
+    let stranger = tmp("report-stranger").canonicalize().unwrap();
+    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    // an unregistered name: no liveness check, so the report itself decides
+    let t = tasks::create_secret_task(&ctx, &proj, "test", "MY_CUSTOM_TOKEN", "default", &Default::default()).unwrap();
+    tasks::answer_secret(&ctx, &t, SecretString::from("custom-aaaaaaaaaaaaaaaa".to_string()), true).unwrap();
+    // a project that never received the key has no standing
+    assert_eq!(tasks::report_bad(&ctx, &stranger, "evil", "MY_CUSTOM_TOKEN", "default", Some(401), None).unwrap(), tasks::ReportOutcome::Ignored);
+    assert!(!db.get_secret("MY_CUSTOM_TOKEN", "default").unwrap().unwrap().stale);
+    // an unknown name is indistinguishable from an ignored one
+    assert_eq!(tasks::report_bad(&ctx, &proj, "test", "NOT_A_KEY", "default", Some(401), None).unwrap(), tasks::ReportOutcome::Ignored);
+    // the delivering project can report; the message is scrubbed of the value
+    let r = tasks::report_bad(&ctx, &proj, "test", "MY_CUSTOM_TOKEN", "default", Some(401), Some("invalid key custom-aaaaaaaaaaaaaaaa rejected")).unwrap();
+    assert_eq!(r, tasks::ReportOutcome::MarkedStale);
+    let m = db.get_secret("MY_CUSTOM_TOKEN", "default").unwrap().unwrap();
+    assert!(m.stale);
+    assert!(m.stale_reason.as_deref().unwrap().contains("by test in"), "{:?}", m.stale_reason);
+    let audit = db.recent_audit(5).unwrap();
+    assert!(audit.iter().any(|a| a.3 == "report"));
+    assert!(!audit.iter().any(|a| a.6.as_deref().unwrap_or("").contains("custom-aaaaaaaaaaaaaaaa")), "the value must be scrubbed from the audit detail");
+    // a second report inside the TTL is ignored (cooldown)
+    db.mark_stale("MY_CUSTOM_TOKEN", "default", false, None).unwrap();
+    assert_eq!(tasks::report_bad(&ctx, &proj, "test", "MY_CUSTOM_TOKEN", "default", Some(401), None).unwrap(), tasks::ReportOutcome::Ignored);
+    assert!(!db.get_secret("MY_CUSTOM_TOKEN", "default").unwrap().unwrap().stale);
+    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
 }

@@ -40,6 +40,13 @@ pub struct SecretMeta {
     pub created: String,
     pub last_used: Option<String>,
     pub stale: bool,
+    /// Last time a liveness probe (paste-time or `check`) accepted this value.
+    #[serde(default)]
+    pub last_verified: Option<String>,
+    /// Why it is stale: "rejected by X (HTTP n) on <date>, reported by <agent> in <project>",
+    /// "you asked to rotate", ... Shown on the replacement card.
+    #[serde(default)]
+    pub stale_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -161,6 +168,13 @@ impl Db {
             );
             "#,
         )?;
+        // Columns added after v0.1.0. SQLite has no ADD COLUMN IF NOT EXISTS; probe first.
+        for (col, ddl) in [("last_verified", "ALTER TABLE secrets ADD COLUMN last_verified TEXT"), ("stale_reason", "ALTER TABLE secrets ADD COLUMN stale_reason TEXT")] {
+            let has: bool = conn.prepare("SELECT 1 FROM pragma_table_info('secrets') WHERE name=?1")?.exists([col])?;
+            if !has {
+                conn.execute_batch(ddl)?;
+            }
+        }
         Ok(Self { conn })
     }
 
@@ -172,11 +186,11 @@ impl Db {
 
     pub fn upsert_secret(&self, m: &SecretMeta) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO secrets (name, identity, provider, sensitive, source_url, created, last_used, stale)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+            "INSERT INTO secrets (name, identity, provider, sensitive, source_url, created, last_used, stale, last_verified, stale_reason)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
              ON CONFLICT(name, identity) DO UPDATE SET provider=excluded.provider, sensitive=excluded.sensitive,
-               source_url=excluded.source_url, stale=excluded.stale",
-            params![m.name, m.identity, m.provider, m.sensitive as i32, m.source_url, m.created, m.last_used, m.stale as i32],
+               source_url=excluded.source_url, stale=excluded.stale, last_verified=excluded.last_verified, stale_reason=excluded.stale_reason",
+            params![m.name, m.identity, m.provider, m.sensitive as i32, m.source_url, m.created, m.last_used, m.stale as i32, m.last_verified, m.stale_reason],
         )?;
         Ok(())
     }
@@ -185,7 +199,7 @@ impl Db {
         Ok(self
             .conn
             .query_row(
-                "SELECT name, identity, provider, sensitive, source_url, created, last_used, stale FROM secrets WHERE name=?1 AND identity=?2",
+                "SELECT name, identity, provider, sensitive, source_url, created, last_used, stale, last_verified, stale_reason FROM secrets WHERE name=?1 AND identity=?2",
                 params![name, identity],
                 |r| {
                     Ok(SecretMeta {
@@ -197,6 +211,8 @@ impl Db {
                         created: r.get(5)?,
                         last_used: r.get(6)?,
                         stale: r.get::<_, i32>(7)? != 0,
+                        last_verified: r.get(8)?,
+                        stale_reason: r.get(9)?,
                     })
                 },
             )
@@ -205,7 +221,7 @@ impl Db {
 
     pub fn list_secrets(&self) -> Result<Vec<SecretMeta>> {
         let mut st = self.conn.prepare(
-            "SELECT name, identity, provider, sensitive, source_url, created, last_used, stale FROM secrets ORDER BY name, identity",
+            "SELECT name, identity, provider, sensitive, source_url, created, last_used, stale, last_verified, stale_reason FROM secrets ORDER BY name, identity",
         )?;
         let rows = st.query_map([], |r| {
             Ok(SecretMeta {
@@ -217,6 +233,8 @@ impl Db {
                 created: r.get(5)?,
                 last_used: r.get(6)?,
                 stale: r.get::<_, i32>(7)? != 0,
+                        last_verified: r.get(8)?,
+                        stale_reason: r.get(9)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -230,12 +248,49 @@ impl Db {
         Ok(())
     }
 
-    pub fn mark_stale(&self, name: &str, identity: &str, stale: bool) -> Result<()> {
+    /// Mark a key stale (with the reason the replacement card will show) or fresh again.
+    pub fn mark_stale(&self, name: &str, identity: &str, stale: bool, reason: Option<&str>) -> Result<()> {
         self.conn.execute(
-            "UPDATE secrets SET stale=?3 WHERE name=?1 AND identity=?2",
-            params![name, identity, stale as i32],
+            "UPDATE secrets SET stale=?3, stale_reason=?4 WHERE name=?1 AND identity=?2",
+            params![name, identity, stale as i32, if stale { reason } else { None }],
         )?;
         Ok(())
+    }
+
+    pub fn set_verified(&self, name: &str, identity: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE secrets SET last_verified=?3, stale=0, stale_reason=NULL WHERE name=?1 AND identity=?2",
+            params![name, identity, crate::now()],
+        )?;
+        Ok(())
+    }
+
+    /// Has this key ever been delivered (stored or injected) into this project? The audit
+    /// log is the record. A report of "this key is dead" is only credible from a project
+    /// that actually received it.
+    pub fn has_delivered(&self, project: &str, name: &str, identity: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM audit WHERE project=?1 AND name=?2 AND identity=?3 AND action IN ('inject','store')",
+            params![project, name, identity],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Projects that have ever had this key delivered. For re-injecting a rotated value.
+    pub fn delivered_projects(&self, name: &str, identity: &str) -> Result<Vec<String>> {
+        let mut st = self.conn.prepare("SELECT DISTINCT project FROM audit WHERE name=?1 AND identity=?2 AND action IN ('inject','store') AND project IS NOT NULL")?;
+        let rows = st.query_map(params![name, identity], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Most recent `report`/`false_report` audit row for (project, name, identity) after `since`.
+    pub fn recent_report(&self, project: &str, name: &str, identity: &str, since: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row(
+            "SELECT action FROM audit WHERE project=?1 AND name=?2 AND identity=?3 AND action IN ('report','false_report') AND ts > ?4 ORDER BY id DESC LIMIT 1",
+            params![project, name, identity, since],
+            |r| r.get::<_, String>(0),
+        ).optional()?)
     }
 
     pub fn delete_secret(&self, name: &str, identity: &str) -> Result<bool> {
