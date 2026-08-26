@@ -419,10 +419,21 @@ grep -q "$CRAWLCANARY" "$OUT/fromenv-pipe.txt" && { echo "LEAK: the refusal prin
 if script -qec true /dev/null >/dev/null 2>&1; then
   (sleep 2; printf 'q\n') | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_CI -u OPENAI_CODEX -u CURSOR_TRACE_ID -u CURSOR_AGENT -u GEMINI_CLI -u OPENCODE -u TOKENSTASH_AGENT \
     script -qec "$TS export --from-env $CRAWL" /dev/null >"$OUT/fromenv.txt" 2>&1 || true
-  grep -q "OPENAI_API_KEY@default" "$OUT/fromenv.txt" || { echo "FAIL: --from-env did not list the found key"; sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$OUT/fromenv.txt" | tail -4; fail=1; }
+  grep -q "OPENAI_API_KEY" "$OUT/fromenv.txt" || { echo "FAIL: --from-env did not list the found key"; sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$OUT/fromenv.txt" | tail -4; fail=1; }
   grep -q "$CRAWLCANARY" "$OUT/fromenv.txt" && { echo "LEAK: --from-env table shows a value"; fail=1; }
   grep -q "nothing imported" "$OUT/fromenv.txt" || { echo "FAIL: q did not abort the import"; fail=1; }
   "$TS" list | grep -q "GROQ_API_KEY" && { echo "FAIL: --from-env imported after q"; fail=1; }
+  # a bare Enter must not import: it shows the summary and asks; N keeps everything out
+  (sleep 2; printf '\n'; sleep 1; printf 'n\n') | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_CI -u OPENAI_CODEX -u CURSOR_TRACE_ID -u CURSOR_AGENT -u GEMINI_CLI -u OPENCODE -u TOKENSTASH_AGENT \
+    script -qec "$TS export --from-env $CRAWL" /dev/null >"$OUT/fromenv-enter.txt" 2>&1 || true
+  grep -q "proceed?" "$OUT/fromenv-enter.txt" || { echo "FAIL: --from-env imported on a bare Enter without asking"; fail=1; }
+  "$TS" list | grep -q "GROQ_API_KEY" && { echo "FAIL: --from-env imported after N"; fail=1; }
+  # ...and y imports the ticked rows, never printing a value
+  (sleep 2; printf '\n'; sleep 1; printf 'y\n') | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_CI -u OPENAI_CODEX -u CURSOR_TRACE_ID -u CURSOR_AGENT -u GEMINI_CLI -u OPENCODE -u TOKENSTASH_AGENT \
+    script -qec "$TS export --from-env $CRAWL --no-verify" /dev/null >"$OUT/fromenv-yes.txt" 2>&1 || true
+  "$TS" list | grep -q "GROQ_API_KEY" || { echo "FAIL: --from-env did not import the ticked GROQ key"; sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$OUT/fromenv-yes.txt" | tail -6; fail=1; }
+  grep -q "$CRAWLCANARY" "$OUT/fromenv-yes.txt" && { echo "LEAK: --from-env import printed a value"; fail=1; }
+  "$TS" forget GROQ_API_KEY >/dev/null 2>&1 || true
 fi
 grep -q "from_env\|from-env" "$OUT/mcp.txt" 2>/dev/null && { echo "FAIL: an MCP surface mentions --from-env"; fail=1; }
 rm -rf "$CRAWL"
