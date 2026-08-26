@@ -191,7 +191,7 @@ pub fn import(a: ImportArgs) -> Result<i32> {
         match p {
             Plan::Skip => { skipped += 1; continue; }
             Plan::CarryRotation => {
-                app.db.mark_stale(&e.name, &e.identity, true, e.stale_reason.as_deref())?;
+                app.db.mark_stale(&e.name, &e.identity, true, e.stale_reason.as_deref(), Some(stale_source_of(e)))?;
                 println!("  {}@{}: same value, marked for rotation as on the exporting machine", e.name, e.identity);
                 skipped += 1;
                 continue;
@@ -199,7 +199,7 @@ pub fn import(a: ImportArgs) -> Result<i32> {
             Plan::Add => added += 1,
             Plan::Replace => replaced += 1,
         }
-        apply_entry(&app, e, &format!("from {}", a.bundle.display()))?;
+        apply_entry(&app, e, &format!("from {}", a.bundle.display()), a.no_verify)?;
     }
     let mut bound = 0;
     for b in &payload.bindings {
@@ -220,7 +220,7 @@ pub fn import(a: ImportArgs) -> Result<i32> {
     // bundle: the other machine may have a working copy of the same value.
     let mut pairs: Vec<(String, String)> = plan.iter().filter(|(p, e)| *p != Plan::Skip && !e.stale).map(|(_, e)| (e.name.clone(), e.identity.clone())).collect();
     for (p, e) in &plan {
-        if *p == Plan::Skip && !e.stale && app.db.get_secret(&e.name, &e.identity)?.map(|m| m.stale && !m.stale_reason.as_deref().unwrap_or("").starts_with(tokenstash_core::db::Db::ROTATE_REASON)).unwrap_or(false) {
+        if *p == Plan::Skip && !e.stale && app.db.get_secret(&e.name, &e.identity)?.map(|m| m.stale && m.stale_source.as_deref() != Some(tokenstash_core::db::STALE_ROTATE)).unwrap_or(false) {
             pairs.push((e.name.clone(), e.identity.clone()));
         }
     }
@@ -240,7 +240,13 @@ pub fn import(a: ImportArgs) -> Result<i32> {
 /// Store one entry: stash first (the value's home), then the index, then an audit row with
 /// the source. Never an approval, never an env-file write. Shared by `import` and
 /// `export --from-env`.
-pub fn apply_entry(app: &App, e: &Entry, source: &str) -> Result<()> {
+/// The bundle carries the display reason only; the human's rotation is the one source
+/// that must survive the trip (a probe saying "live" must not cancel it on the new machine).
+fn stale_source_of(e: &Entry) -> &'static str {
+    if e.stale_reason.as_deref().unwrap_or("").starts_with(tokenstash_core::db::Db::ROTATE_REASON) { tokenstash_core::db::STALE_ROTATE } else { tokenstash_core::db::STALE_REPORT }
+}
+
+pub fn apply_entry(app: &App, e: &Entry, source: &str, no_verify: bool) -> Result<()> {
     app.stash.set(&stash_key(&e.name, &e.identity), &SecretString::from(e.value.clone()))?;
     let provider = tokenstash_core::registry::lookup(&e.name);
     let value = SecretString::from(e.value.clone());
@@ -258,6 +264,11 @@ pub fn apply_entry(app: &App, e: &Entry, source: &str) -> Result<()> {
         created: e.created.clone(), last_used: e.last_used.clone(), stale: e.stale,
         last_verified: None,
         stale_reason: if e.stale { e.stale_reason.clone().or_else(|| Some("stale at the source".into())) } else { None },
+        stale_source: if e.stale { Some(stale_source_of(e).into()) } else { None },
+        next_probe: None,
+        // An import that skipped the sweep is the human saying "do not check these": the
+        // sweep, when it runs, clears this for every key the provider accepts.
+        verify_off: no_verify,
     })?;
     app.db.audit(None, None, "import", Some(&e.name), Some(&e.identity), Some(source))?;
     Ok(())
@@ -395,7 +406,7 @@ pub fn from_env(a: FromEnvArgs) -> Result<i32> {
         if replaces {
             // replacing a stash value is a per-key decision, and never a silent one
             let local = app.db.get_secret(&cand.name, &identity)?;
-            if local.as_ref().map(|m| m.stale && m.stale_reason.as_deref().unwrap_or("").starts_with(tokenstash_core::db::Db::ROTATE_REASON)).unwrap_or(false) {
+            if local.as_ref().map(|m| m.stale && m.stale_source.as_deref() == Some(tokenstash_core::db::STALE_ROTATE)).unwrap_or(false) {
                 println!("  {}@{}: skipped — you asked to rotate this key; paste the NEW one via `tokenstash rotate`, not an old env file", cand.name, identity);
                 continue;
             }
@@ -405,7 +416,7 @@ pub fn from_env(a: FromEnvArgs) -> Result<i32> {
             std::io::stdin().read_line(&mut ans)?;
             if !ans.trim().eq_ignore_ascii_case("y") { println!("  kept the stash value"); continue; }
         }
-        apply_entry(&app, &e, &format!("from {}", display_path(&cand.sources[0])))?;
+        apply_entry(&app, &e, &format!("from {}", display_path(&cand.sources[0])), a.no_verify)?;
         n += 1;
         pairs.push((cand.name.clone(), identity));
     }

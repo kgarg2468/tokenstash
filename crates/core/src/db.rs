@@ -47,7 +47,26 @@ pub struct SecretMeta {
     /// "you asked to rotate", ... Shown on the replacement card.
     #[serde(default)]
     pub stale_reason: Option<String>,
+    /// Who set the stale flag: "rotate" (the human), "report" (an agent's report, probe-
+    /// decided when a probe exists), "probe" (verify-on-use or `check`). State transitions
+    /// key off this, never off the display text in `stale_reason`.
+    #[serde(default)]
+    pub stale_source: Option<String>,
+    /// Do not probe before this time (RFC 3339). A lease: set before a probe goes on the
+    /// wire so a concurrent process does not probe too, then extended by the result.
+    #[serde(default)]
+    pub next_probe: Option<String>,
+    /// Verify-on-use is off for this key: the human stored it with --skip-check / --no-verify,
+    /// so a probe that keeps saying "rejected" must not keep filing cards. Cleared by any
+    /// probe that says Ok.
+    #[serde(default)]
+    pub verify_off: bool,
 }
+
+/// Values for `SecretMeta::stale_source`.
+pub const STALE_ROTATE: &str = "rotate";
+pub const STALE_REPORT: &str = "report";
+pub const STALE_PROBE: &str = "probe";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -169,7 +188,13 @@ impl Db {
             "#,
         )?;
         // Columns added after v0.1.0. SQLite has no ADD COLUMN IF NOT EXISTS; probe first.
-        for (col, ddl) in [("last_verified", "ALTER TABLE secrets ADD COLUMN last_verified TEXT"), ("stale_reason", "ALTER TABLE secrets ADD COLUMN stale_reason TEXT")] {
+        for (col, ddl) in [
+            ("last_verified", "ALTER TABLE secrets ADD COLUMN last_verified TEXT"),
+            ("stale_reason", "ALTER TABLE secrets ADD COLUMN stale_reason TEXT"),
+            ("stale_source", "ALTER TABLE secrets ADD COLUMN stale_source TEXT"),
+            ("next_probe", "ALTER TABLE secrets ADD COLUMN next_probe TEXT"),
+            ("verify_off", "ALTER TABLE secrets ADD COLUMN verify_off INTEGER NOT NULL DEFAULT 0"),
+        ] {
             let has: bool = conn.prepare("SELECT 1 FROM pragma_table_info('secrets') WHERE name=?1")?.exists([col])?;
             if !has {
                 // Two processes (CLI + MCP server) can race here; the loser's ALTER fails
@@ -181,6 +206,13 @@ impl Db {
                 }
             }
         }
+        // Rows marked stale before `stale_source` existed: the human's rotation is the only
+        // one whose display text is a fixed constant, so it is the only one recoverable.
+        conn.execute(
+            "UPDATE secrets SET stale_source=?1 WHERE stale=1 AND stale_source IS NULL AND stale_reason LIKE ?2",
+            params![STALE_ROTATE, format!("{}%", Self::ROTATE_REASON)],
+        )?;
+        conn.execute("UPDATE secrets SET stale_source=?1 WHERE stale=1 AND stale_source IS NULL", params![STALE_REPORT])?;
         Ok(Self { conn })
     }
 
@@ -192,12 +224,13 @@ impl Db {
 
     pub fn upsert_secret(&self, m: &SecretMeta) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO secrets (name, identity, provider, sensitive, source_url, created, last_used, stale, last_verified, stale_reason)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+            "INSERT INTO secrets (name, identity, provider, sensitive, source_url, created, last_used, stale, last_verified, stale_reason, stale_source, next_probe, verify_off)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
              ON CONFLICT(name, identity) DO UPDATE SET provider=excluded.provider, sensitive=excluded.sensitive,
                source_url=excluded.source_url, stale=excluded.stale, last_verified=excluded.last_verified, stale_reason=excluded.stale_reason,
+               stale_source=excluded.stale_source, next_probe=excluded.next_probe, verify_off=excluded.verify_off,
                created=excluded.created, last_used=COALESCE(excluded.last_used, secrets.last_used)",
-            params![m.name, m.identity, m.provider, m.sensitive as i32, m.source_url, m.created, m.last_used, m.stale as i32, m.last_verified, m.stale_reason],
+            params![m.name, m.identity, m.provider, m.sensitive as i32, m.source_url, m.created, m.last_used, m.stale as i32, m.last_verified, m.stale_reason, m.stale_source, m.next_probe, m.verify_off as i32],
         )?;
         Ok(())
     }
@@ -206,7 +239,7 @@ impl Db {
         Ok(self
             .conn
             .query_row(
-                "SELECT name, identity, provider, sensitive, source_url, created, last_used, stale, last_verified, stale_reason FROM secrets WHERE name=?1 AND identity=?2",
+                "SELECT name, identity, provider, sensitive, source_url, created, last_used, stale, last_verified, stale_reason, stale_source, next_probe, verify_off FROM secrets WHERE name=?1 AND identity=?2",
                 params![name, identity],
                 |r| {
                     Ok(SecretMeta {
@@ -220,6 +253,9 @@ impl Db {
                         stale: r.get::<_, i32>(7)? != 0,
                         last_verified: r.get(8)?,
                         stale_reason: r.get(9)?,
+                        stale_source: r.get(10)?,
+                        next_probe: r.get(11)?,
+                        verify_off: r.get::<_, i32>(12)? != 0,
                     })
                 },
             )
@@ -228,7 +264,7 @@ impl Db {
 
     pub fn list_secrets(&self) -> Result<Vec<SecretMeta>> {
         let mut st = self.conn.prepare(
-            "SELECT name, identity, provider, sensitive, source_url, created, last_used, stale, last_verified, stale_reason FROM secrets ORDER BY name, identity",
+            "SELECT name, identity, provider, sensitive, source_url, created, last_used, stale, last_verified, stale_reason, stale_source, next_probe, verify_off FROM secrets ORDER BY name, identity",
         )?;
         let rows = st.query_map([], |r| {
             Ok(SecretMeta {
@@ -240,8 +276,11 @@ impl Db {
                 created: r.get(5)?,
                 last_used: r.get(6)?,
                 stale: r.get::<_, i32>(7)? != 0,
-                        last_verified: r.get(8)?,
-                        stale_reason: r.get(9)?,
+                last_verified: r.get(8)?,
+                stale_reason: r.get(9)?,
+                stale_source: r.get(10)?,
+                next_probe: r.get(11)?,
+                verify_off: r.get::<_, i32>(12)? != 0,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -255,28 +294,56 @@ impl Db {
         Ok(())
     }
 
-    /// Mark a key stale (with the reason the replacement card will show) or fresh again.
-    pub fn mark_stale(&self, name: &str, identity: &str, stale: bool, reason: Option<&str>) -> Result<()> {
+    /// Mark a key stale (with the reason the replacement card will show, and who decided)
+    /// or fresh again.
+    pub fn mark_stale(&self, name: &str, identity: &str, stale: bool, reason: Option<&str>, source: Option<&str>) -> Result<()> {
         self.conn.execute(
-            "UPDATE secrets SET stale=?3, stale_reason=?4 WHERE name=?1 AND identity=?2",
-            params![name, identity, stale as i32, if stale { reason } else { None }],
+            "UPDATE secrets SET stale=?3, stale_reason=?4, stale_source=?5 WHERE name=?1 AND identity=?2",
+            params![name, identity, stale as i32, if stale { reason } else { None }, if stale { source } else { None }],
         )?;
         Ok(())
     }
 
-    /// Marker prefix for a stale set by the human (`rotate`). A probe saying "still live"
-    /// must not cancel a rotation the human asked for: the old key is live by design until
-    /// the new one lands.
+    /// Display text for a stale set by the human (`rotate`).
     pub const ROTATE_REASON: &'static str = "you asked to rotate it";
 
+    /// A probe accepted the stored value: record it, clear a probe- or report-set stale
+    /// flag, release the probe lease, and re-enable verify-on-use. A rotation the human
+    /// asked for survives: the old key is live by design until the new one lands.
+    /// When the next routine probe is due follows from `last_verified` and the configured
+    /// window, so a config change takes effect immediately; `next_probe` only ever holds a
+    /// short lease or backoff.
     pub fn set_verified(&self, name: &str, identity: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE secrets SET last_verified=?3,
-                stale = CASE WHEN stale_reason LIKE ?4 THEN stale ELSE 0 END,
-                stale_reason = CASE WHEN stale_reason LIKE ?4 THEN stale_reason ELSE NULL END
+            "UPDATE secrets SET last_verified=?3, next_probe=NULL, verify_off=0,
+                stale = CASE WHEN stale_source=?4 THEN stale ELSE 0 END,
+                stale_reason = CASE WHEN stale_source=?4 THEN stale_reason ELSE NULL END,
+                stale_source = CASE WHEN stale_source=?4 THEN stale_source ELSE NULL END
              WHERE name=?1 AND identity=?2",
-            params![name, identity, crate::now(), format!("{}%", Self::ROTATE_REASON)],
+            params![name, identity, crate::now(), STALE_ROTATE],
         )?;
+        Ok(())
+    }
+
+    /// Lease / backoff for verify-on-use.
+    pub fn set_next_probe(&self, name: &str, identity: &str, at: &str) -> Result<()> {
+        self.conn.execute("UPDATE secrets SET next_probe=?3 WHERE name=?1 AND identity=?2", params![name, identity, at])?;
+        Ok(())
+    }
+
+    /// Claim the right to probe now: succeeds only if no other process holds a live lease.
+    /// Returns false when someone else got there first (or the key is gone).
+    pub fn claim_probe(&self, name: &str, identity: &str, until: &str) -> Result<bool> {
+        let now = crate::now();
+        let n = self.conn.execute(
+            "UPDATE secrets SET next_probe=?3 WHERE name=?1 AND identity=?2 AND (next_probe IS NULL OR next_probe <= ?4)",
+            params![name, identity, until, now],
+        )?;
+        Ok(n == 1)
+    }
+
+    pub fn set_verify_off(&self, name: &str, identity: &str, off: bool) -> Result<()> {
+        self.conn.execute("UPDATE secrets SET verify_off=?3 WHERE name=?1 AND identity=?2", params![name, identity, off as i32])?;
         Ok(())
     }
 

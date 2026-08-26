@@ -45,6 +45,13 @@ trap cleanup EXIT
 PORT=$(( 20000 + RANDOM % 20000 ))
 sed -i.bak -e "s/^inbox_port = .*/inbox_port = $PORT/" -e "s/^notifications = .*/notifications = false/" "$TOKENSTASH_HOME/config.toml"
 printf 'stash_backend = "insecure-file"\n' >> "$TOKENSTASH_HOME/config.toml"
+# The canary is a fake OpenAI key: verify-on-use would send it to api.openai.com and mark
+# it stale. Off for this run; the probe itself is covered by the loopback unit tests.
+sed -i.bak -e 's/^verify_every = .*/verify_every = "never"/' "$TOKENSTASH_HOME/config.toml"
+grep -q '^verify_every = "never"' "$TOKENSTASH_HOME/config.toml" || {
+    echo "refusing to run: could not turn verify-on-use off; the canary would be sent to a real provider"
+    exit 1
+}
 "$TS" doctor >"$OUT/doctor-pre.txt" 2>&1 || true
 grep -qE "stash backend +insecure-file" "$OUT/doctor-pre.txt" || {
     echo "refusing to run: the stash backend is not isolated, a canary would land in the real keyring"
