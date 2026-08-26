@@ -6,6 +6,7 @@
 pub mod bundle;
 pub mod config;
 pub mod db;
+pub mod envcrawl;
 pub mod envfile;
 pub mod fsutil;
 pub mod need;

@@ -24,9 +24,22 @@ pub struct ExportArgs {
     /// Where to write the bundle (default: ./tokenstash.bundle).
     #[arg(short, long)]
     pub out: Option<PathBuf>,
+    /// Instead of writing a bundle: scan a directory tree for env files and import the keys
+    /// found there into the stash (onboarding).
+    #[arg(long, value_name = "DIR", conflicts_with = "out")]
+    pub from_env: Option<PathBuf>,
+    /// With --from-env: identity for everything imported.
+    #[arg(long, default_value = "default")]
+    pub identity: String,
+    /// With --from-env: skip the liveness sweep afterwards.
+    #[arg(long)]
+    pub no_verify: bool,
 }
 
 pub fn export(a: ExportArgs) -> Result<i32> {
+    if let Some(dir) = a.from_env {
+        return from_env(FromEnvArgs { dir, identity: a.identity, no_verify: a.no_verify });
+    }
     require_human("export")?;
     let app = App::open()?;
     let out = a.out.unwrap_or_else(|| PathBuf::from("tokenstash.bundle"));
@@ -182,25 +195,7 @@ pub fn import(a: ImportArgs) -> Result<i32> {
             Plan::Add => added += 1,
             Plan::Replace => replaced += 1,
         }
-        app.stash.set(&stash_key(&e.name, &e.identity), &SecretString::from(e.value.clone()))?;
-        let provider = tokenstash_core::registry::lookup(&e.name);
-        let value = SecretString::from(e.value.clone());
-        // Sensitivity is re-derived here exactly as a paste derives it; the bundle cannot
-        // downgrade a registry-sensitive name or a live-mode value.
-        let by_pattern = match provider.and_then(|p| p.sensitive_pattern.as_ref()) {
-            Some(sp) => tokenstash_core::validate::matches_pattern(sp, &value)?,
-            None => false,
-        };
-        app.db.upsert_secret(&tokenstash_core::db::SecretMeta {
-            name: e.name.clone(), identity: e.identity.clone(),
-            provider: e.provider.clone().or_else(|| provider.map(|p| p.provider.clone())),
-            sensitive: e.sensitive || provider.map(|p| p.sensitive).unwrap_or(false) || by_pattern,
-            source_url: e.source_url.clone().or_else(|| provider.map(|p| p.url.clone())),
-            created: e.created.clone(), last_used: e.last_used.clone(), stale: e.stale,
-            last_verified: None,
-            stale_reason: if e.stale { e.stale_reason.clone().or_else(|| Some("stale on the exporting machine".into())) } else { None },
-        })?;
-        app.db.audit(None, None, "import", Some(&e.name), Some(&e.identity), Some(&format!("from {}", a.bundle.display())))?;
+        apply_entry(&app, e, &format!("from {}", a.bundle.display()))?;
     }
     let mut bound = 0;
     for b in &payload.bindings {
@@ -235,5 +230,121 @@ pub fn import(a: ImportArgs) -> Result<i32> {
         crate::cmd::admin::sweep_pairs(&app, &pairs, true)?;
     }
     println!("delete {} when you are done with it", a.bundle.display());
+    Ok(0)
+}
+
+/// Store one entry: stash first (the value's home), then the index, then an audit row with
+/// the source. Never an approval, never an env-file write. Shared by `import` and
+/// `export --from-env`.
+pub fn apply_entry(app: &App, e: &Entry, source: &str) -> Result<()> {
+    app.stash.set(&stash_key(&e.name, &e.identity), &SecretString::from(e.value.clone()))?;
+    let provider = tokenstash_core::registry::lookup(&e.name);
+    let value = SecretString::from(e.value.clone());
+    // Sensitivity is re-derived here exactly as a paste derives it; the source cannot
+    // downgrade a registry-sensitive name or a live-mode value.
+    let by_pattern = match provider.and_then(|p| p.sensitive_pattern.as_ref()) {
+        Some(sp) => tokenstash_core::validate::matches_pattern(sp, &value)?,
+        None => false,
+    };
+    app.db.upsert_secret(&tokenstash_core::db::SecretMeta {
+        name: e.name.clone(), identity: e.identity.clone(),
+        provider: e.provider.clone().or_else(|| provider.map(|p| p.provider.clone())),
+        sensitive: e.sensitive || provider.map(|p| p.sensitive).unwrap_or(false) || by_pattern,
+        source_url: e.source_url.clone().or_else(|| provider.map(|p| p.url.clone())),
+        created: e.created.clone(), last_used: e.last_used.clone(), stale: e.stale,
+        last_verified: None,
+        stale_reason: if e.stale { e.stale_reason.clone().or_else(|| Some("stale at the source".into())) } else { None },
+    })?;
+    app.db.audit(None, None, "import", Some(&e.name), Some(&e.identity), Some(source))?;
+    Ok(())
+}
+
+#[derive(Args)]
+pub struct FromEnvArgs {
+    /// Directory tree to scan for .env / .env.local / .env.<stage> / .envrc files.
+    pub dir: PathBuf,
+    /// Identity for everything imported (distinct values under one name get a numbered suffix).
+    #[arg(long, default_value = "default")]
+    pub identity: String,
+    /// Skip the liveness sweep afterwards.
+    #[arg(long)]
+    pub no_verify: bool,
+}
+
+/// Onboarding: find the keys already scattered across a person's projects and stash the
+/// ones they tick. Human-only and interactive by design — the table is an inventory of
+/// what the person has, and ticking rows is consent. There is no MCP tool for this and
+/// no non-interactive switch.
+pub fn from_env(a: FromEnvArgs) -> Result<i32> {
+    require_human("export --from-env")?;
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() { bail!("`export --from-env` is interactive; run it in a terminal"); }
+    let app = App::open()?;
+    let root = a.dir.canonicalize().with_context(|| format!("{} does not exist", a.dir.display()))?;
+    println!("scanning {} …", root.display());
+    let c = tokenstash_core::envcrawl::crawl(&root);
+    for p in &c.problems { eprintln!("  note: {p}"); }
+    if c.candidates.is_empty() {
+        println!("scanned {} env files; nothing that looks like a key", c.files_scanned);
+        return Ok(0);
+    }
+    println!("scanned {} env files; {} distinct values found
+", c.files_scanned, c.candidates.len());
+    let short = |p: &Path| tokenstash_core::project::short(p);
+    let mut ticked: Vec<bool> = vec![];
+    for (i, cand) in c.candidates.iter().enumerate() {
+        let identity = tokenstash_core::envcrawl::identity_for(&c.candidates, i, &a.identity);
+        let existing = app.stash.get(&stash_key(&cand.name, &identity))?;
+        let (default_on, note) = match (&cand.confidence, &existing) {
+            (_, Some(v)) if v.expose_secret() == cand.value.expose_secret() => (false, "already in the stash".to_string()),
+            (_, Some(_)) => (false, "DIFFERS from the stash (unticked; tick to replace)".to_string()),
+            (tokenstash_core::envcrawl::Confidence::Registry, None) => (true, cand.provider.clone().unwrap_or_default()),
+            (tokenstash_core::envcrawl::Confidence::RegistryShapeMismatch, None) => (false, format!("{} — does not look like a real key (placeholder?)", cand.provider.clone().unwrap_or_default())),
+            (tokenstash_core::envcrawl::Confidence::Heuristic, None) => (false, "unregistered; looks like a secret".to_string()),
+        };
+        ticked.push(default_on);
+        let srcs: Vec<String> = cand.sources.iter().take(3).map(|p| short(p)).collect();
+        let more = if cand.sources.len() > 3 { format!(" +{} more", cand.sources.len() - 3) } else { String::new() };
+        let alias = if cand.aliases.is_empty() { String::new() } else { format!(" (also as {})", cand.aliases.join(", ")) };
+        println!("{:>3}. [{}] {}@{}{}  {}{}
+       {}{}", i + 1, if default_on { "x" } else { " " }, cand.name, identity, alias, if cand.sensitive { "SENSITIVE " } else { "" }, note, srcs.join(", "), more);
+    }
+    println!("
+Type numbers to toggle (e.g. `3 7`), `all`, `none`, then Enter to import the ticked rows; `q` to quit.");
+    loop {
+        print!("> ");
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        let t = line.trim();
+        if t == "q" { println!("nothing imported"); return Ok(0); }
+        if t.is_empty() { break; }
+        if t == "all" { ticked.iter_mut().for_each(|x| *x = true); }
+        else if t == "none" { ticked.iter_mut().for_each(|x| *x = false); }
+        else {
+            for tok in t.split_whitespace() {
+                match tok.parse::<usize>() { Ok(n) if n >= 1 && n <= ticked.len() => ticked[n - 1] = !ticked[n - 1], _ => println!("  ? {tok}") }
+            }
+        }
+        let on: Vec<String> = ticked.iter().enumerate().filter(|(_, t)| **t).map(|(i, _)| (i + 1).to_string()).collect();
+        println!("  ticked: {}", if on.is_empty() { "none".into() } else { on.join(" ") });
+    }
+    let mut n = 0;
+    let mut names = vec![];
+    for (i, cand) in c.candidates.iter().enumerate() {
+        if !ticked[i] { continue; }
+        let identity = tokenstash_core::envcrawl::identity_for(&c.candidates, i, &a.identity);
+        let e = Entry { name: cand.name.clone(), identity: identity.clone(), value: cand.value.expose_secret().to_string(), provider: cand.provider.clone(), sensitive: cand.sensitive, source_url: None, created: tokenstash_core::now(), last_used: None, stale: false, stale_reason: None };
+        bundle::validate_entry(&e)?;
+        apply_entry(&app, &e, &format!("from env files under {}", short(&root)))?;
+        n += 1;
+        names.push(cand.name.clone());
+    }
+    println!("✓ {n} imported. From now on any project under your trust roots gets these silently.");
+    if !a.no_verify && !names.is_empty() {
+        println!("verifying against providers (--no-verify to skip)…");
+        crate::cmd::admin::sweep(&app, &names, false, true)?;
+    }
     Ok(0)
 }
