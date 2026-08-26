@@ -409,6 +409,24 @@ if script -qec true /dev/null >/dev/null 2>&1; then
   rm -rf "$BDIR"
 fi
 
+# ── --from-env: human-only, the table names keys and projects, never values ─────────
+CRAWL="$(mktemp -d)"; mkdir -p "$CRAWL/app" "$CRAWL/web"
+CRAWLCANARY="sk-proj-CRAWLCANARY$RANDOM-0123456789abcdef0123456789"
+printf 'OPENAI_API_KEY=%s\nPORT=3000\n' "$CRAWLCANARY" > "$CRAWL/app/.env.local"
+printf 'export OPENAI_API_KEY="%s"\nGROQ_API_KEY=gsk_%s\n' "$CRAWLCANARY" "$(head -c 40 /dev/zero | tr '\0' 'q')" > "$CRAWL/web/.env"
+"$TS" export --from-env "$CRAWL" </dev/null >"$OUT/fromenv-pipe.txt" 2>&1 && { echo "FAIL: export --from-env ran without a terminal"; fail=1; }
+grep -q "$CRAWLCANARY" "$OUT/fromenv-pipe.txt" && { echo "LEAK: the refusal printed a value"; fail=1; }
+if script -qec true /dev/null >/dev/null 2>&1; then
+  (sleep 2; printf 'q\n') | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_CI -u OPENAI_CODEX -u CURSOR_TRACE_ID -u CURSOR_AGENT -u GEMINI_CLI -u OPENCODE -u TOKENSTASH_AGENT \
+    script -qec "$TS export --from-env $CRAWL" /dev/null >"$OUT/fromenv.txt" 2>&1 || true
+  grep -q "OPENAI_API_KEY@default" "$OUT/fromenv.txt" || { echo "FAIL: --from-env did not list the found key"; sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$OUT/fromenv.txt" | tail -4; fail=1; }
+  grep -q "$CRAWLCANARY" "$OUT/fromenv.txt" && { echo "LEAK: --from-env table shows a value"; fail=1; }
+  grep -q "nothing imported" "$OUT/fromenv.txt" || { echo "FAIL: q did not abort the import"; fail=1; }
+  "$TS" list | grep -q "GROQ_API_KEY" && { echo "FAIL: --from-env imported after q"; fail=1; }
+fi
+grep -q "from_env\|from-env" "$OUT/mcp.txt" 2>/dev/null && { echo "FAIL: an MCP surface mentions --from-env"; fail=1; }
+rm -rf "$CRAWL"
+
 # exit-code contract
 rc=0; "$TS" need OPENAI_API_KEY --agent ci >/dev/null 2>&1 || rc=$?; [ $rc -eq 0 ] || { echo "hit should exit 0 (got $rc)"; fail=1; }
 rc=0; "$TS" need NEVER_SEEN_KEY --agent ci >/dev/null 2>&1 || rc=$?; [ $rc -eq 10 ] || { echo "miss should exit 10 (got $rc)"; fail=1; }
