@@ -359,6 +359,18 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// Was this key injected into this project by an approval answered at or after `since`?
+    /// The audit row is written by `deliver` after the env file, so it is the proof that the
+    /// delivery finished — a value already sitting in the file proves nothing.
+    pub fn injected_after_approval_since(&self, project: &str, name: &str, identity: &str, since: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM audit WHERE project=?1 AND name=?2 AND identity=?3 AND action='inject' AND detail='after-approval' AND ts >= ?4",
+            params![project, name, identity, since],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     /// Projects that have ever had this key delivered. For re-injecting a rotated value.
     pub fn delivered_projects(&self, name: &str, identity: &str) -> Result<Vec<String>> {
         let mut st = self.conn.prepare("SELECT DISTINCT project FROM audit WHERE name=?1 AND identity=?2 AND action IN ('inject','store') AND project IS NOT NULL")?;

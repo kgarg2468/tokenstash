@@ -223,9 +223,10 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
                                 }
                             }
                             // The approval is committed before delivery runs; between the two
-                            // there is neither a value in the env file nor a Replace card.
-                            // Say so rather than let "answered" read as "injected".
-                            if !tokenstash_core::envfile::has(&project, &app.cfg.env_file, n) {
+                            // there is neither an inject audit row nor a Replace card (a value
+                            // already in the env file may be the old one). Say so rather than
+                            // let "answered" read as "injected".
+                            if !app.db.injected_after_approval_since(&pid, n, identity, &t.created)? {
                                 in_flight.push(n.to_string());
                             }
                         }
