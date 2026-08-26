@@ -227,9 +227,11 @@ pub fn answer_secret(ctx: &Ctx, task: &Task, value: SecretString, skip_liveness:
             Some(sp) => validate::matches_pattern(sp, &value)?,
             None => false,
         };
-    // Rotation: remember the value being replaced so every other project still holding it
-    // can be rewritten below. Read before the store overwrites it.
-    let previous = ctx.stash.get(&stash_key(&name, &task.identity))?;
+    // Rotation: when a STALE key is being replaced, remember the value so every other project
+    // still holding it can be rewritten below. An ordinary paste that happens to differ from
+    // a stored value (two projects with their own pending cards) is not a rotation.
+    let was_stale = ctx.db.get_secret(&name, &task.identity)?.map(|m| m.stale).unwrap_or(false);
+    let previous = if was_stale { ctx.stash.get(&stash_key(&name, &task.identity))? } else { None };
     let injected_to = store_and_inject(
         ctx, &name, &task.identity, &value, provider.map(|p| p.provider.clone()), task.url.clone(), sensitive,
         Path::new(&task.project), &task.agent, Some(&task.id),
@@ -396,12 +398,21 @@ pub struct RotationReport {
 
 pub fn rewrite_replaced_value(ctx: &Ctx, name: &str, identity: &str, old: &SecretString, new: &SecretString, answering_project: &str) -> Result<RotationReport> {
     let mut report = RotationReport::default();
+    let sensitive = ctx.db.get_secret(name, identity)?.map(|m| m.sensitive).unwrap_or(false);
     for project in ctx.db.delivered_projects(name, identity)? {
         if project == answering_project {
             continue;
         }
         let dir = Path::new(&project);
         if !dir.is_dir() {
+            continue;
+        }
+        // A past delivery is not a standing grant: a project that only ever had a one-time
+        // (run-shim) approval, or has since left the trust roots, must pass the gate again.
+        if !matches!(crate::trust::gate(ctx.db, ctx.cfg, dir, name, sensitive)?, crate::trust::Gate::Open) {
+            let why = "no standing approval for this key here; it will ask on its next `need`".to_string();
+            ctx.db.audit(Some(&project), None, "rotate.skip", Some(name), Some(identity), Some(&why))?;
+            report.skipped.push((project.clone(), why));
             continue;
         }
         let Ok(env_path) = crate::envfile::resolve(dir, &ctx.cfg.env_file) else { continue };

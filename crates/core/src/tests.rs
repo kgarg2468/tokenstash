@@ -1026,3 +1026,41 @@ fn rotation_reports_projects_it_could_not_rewrite() {
     assert!(std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("gsk_old_"), "B keeps the old value and the human is told");
     std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
 }
+
+
+#[test]
+fn rotation_never_rewrites_a_project_without_a_standing_grant_and_ordinary_pastes_are_not_rotations() {
+    let _g = env_lock();
+    let (home, proj_a) = rot_ctx_home("rotate-gate");
+    let proj_b = tmp("rotate-gate-b").canonicalize().unwrap();
+    // B is outside the trust roots: it received the key once via a one-time (run) approval
+    let cfg = Config { trust_roots: vec![proj_a.clone()], ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let t = tasks::create_secret_task(&ctx, &proj_a, "test", "GROQ_API_KEY", "default", &Default::default()).unwrap();
+    tasks::answer_secret(&ctx, &t, SecretString::from("gsk_old_aaaaaaaaaaaaaaaa".to_string()), true).unwrap();
+    let once = tasks::create_approval_task_opts(&ctx, &proj_b, "run", &["GROQ_API_KEY@default".to_string()], false).unwrap();
+    tasks::answer_approval(&ctx, &once, true).unwrap();
+    assert!(std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("gsk_old_"));
+    assert!(!db.is_approved(&proj_b.to_string_lossy(), "GROQ_API_KEY").unwrap(), "one-time approval left no grant");
+    // rotate from A: B must NOT be rewritten, and the human is told
+    let card = tasks::rotate(&ctx, &proj_a, "human", "GROQ_API_KEY", "default").unwrap();
+    let r = tasks::answer_secret(&ctx, &card, SecretString::from("gsk_new_bbbbbbbbbbbbbbbb".to_string()), true).unwrap();
+    let tasks::AnswerResult::Stored { rotation: Some(rep), .. } = r else { panic!() };
+    assert!(rep.skipped.iter().any(|(p, why)| p == &proj_b.to_string_lossy() && why.contains("no standing approval")), "{rep:?}");
+    assert!(std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("gsk_old_"));
+    // an ordinary paste in another project with a different value is NOT a rotation
+    let proj_c = tmp("rotate-gate-c").canonicalize().unwrap();
+    let cfg2 = Config { trust_roots: vec![proj_a.clone(), proj_c.clone()], ..Default::default() };
+    let ctx2 = tasks::Ctx { cfg: &cfg2, db: &db, stash: stash.as_ref() };
+    let tc = tasks::create_secret_task(&ctx2, &proj_c, "test", "OTHER_KEY", "default", &Default::default()).unwrap();
+    tasks::answer_secret(&ctx2, &tc, SecretString::from("other-aaaaaaaaaaaaaaaa".to_string()), true).unwrap();
+    need::need(&ctx2, &proj_a, "test", &["OTHER_KEY".to_string()], &Default::default()).unwrap();
+    let ta = tasks::create_secret_task(&ctx2, &proj_a, "test", "OTHER_KEY", "default", &Default::default()).unwrap();
+    let r = tasks::answer_secret(&ctx2, &ta, SecretString::from("other-bbbbbbbbbbbbbbbb".to_string()), true).unwrap();
+    let tasks::AnswerResult::Stored { rotation, .. } = r else { panic!() };
+    assert!(rotation.is_none(), "a fresh paste is not a rotation");
+    assert!(std::fs::read_to_string(proj_c.join(".env.local")).unwrap().contains("other-aaaa"), "C keeps its own value");
+    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+}
