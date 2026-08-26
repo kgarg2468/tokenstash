@@ -303,10 +303,19 @@ pub fn check(a: CheckArgs) -> Result<i32> {
 /// only `names`), probed sequentially with polite pacing. Rejected → stale, Ok → verified,
 /// Unknown → untouched. Never prints a value.
 pub fn sweep(app: &App, names: &[String], stale_only: bool, print: bool) -> Result<Vec<(String, String, String, bool)>> {
+    sweep_where(app, &|m| (names.is_empty() || names.contains(&m.name)) && (!stale_only || m.stale), print)
+}
+
+/// The sweep over exactly the (name, identity) pairs given — what `import` and
+/// `--from-env` touched, and nothing else of the same name.
+pub fn sweep_pairs(app: &App, pairs: &[(String, String)], print: bool) -> Result<Vec<(String, String, String, bool)>> {
+    sweep_where(app, &|m| pairs.iter().any(|(n, i)| n == &m.name && i == &m.identity), print)
+}
+
+fn sweep_where(app: &App, select: &dyn Fn(&tokenstash_core::db::SecretMeta) -> bool, print: bool) -> Result<Vec<(String, String, String, bool)>> {
     let mut rows = vec![];
     for m in app.db.list_secrets()? {
-        if !names.is_empty() && !names.contains(&m.name) { continue; }
-        if stale_only && !m.stale { continue; }
+        if !select(&m) { continue; }
         let Some(check) = tokenstash_core::registry::lookup(&m.name).and_then(|p| p.check.clone()) else {
             rows.push((m.name.clone(), m.identity.clone(), "no check".to_string(), m.stale));
             continue;
