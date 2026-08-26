@@ -22,6 +22,11 @@ impl Liveness {
     pub fn is_rate_limited(&self) -> bool {
         matches!(self, Liveness::Unknown(s) if s == "HTTP 429")
     }
+    /// The provider evaluated the key and found it live but not permitted on the probe
+    /// endpoint (a restricted key). A verdict that will not change soon.
+    pub fn is_forbidden(&self) -> bool {
+        matches!(self, Liveness::Unknown(s) if s == "HTTP 403")
+    }
 }
 
 /// Timeout for a human-initiated probe (paste, `check`, import).
@@ -81,7 +86,7 @@ pub fn liveness(check: &Check, value: &SecretString, timeout: Duration) -> Liven
         Err(ureq::Error::Status(code, _)) => {
             if code == 401 || check.reject_status.contains(&code) {
                 Liveness::Rejected(code)
-            } else if code == 403 || (300..400).contains(&code) || code == 429 || code >= 500 {
+            } else if code == 403 || code == 429 || code >= 500 {
                 // The provider did not evaluate the key (rate-limited, down, redirecting)
                 // or evaluated it and found it live but under-scoped (403): no verdict.
                 // Treating this as "accepted" would let an outage record a genuine dead-key

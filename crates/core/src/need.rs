@@ -31,7 +31,7 @@ pub struct NeedOpts {
 pub enum Outcome {
     /// `unverified`: the key has a registry probe that was due but could not run (provider
     /// unreachable, rate-limited, or the per-call probe budget was spent). Delivered anyway.
-    Injected { name: String, identity: String, written_to: String, generated: bool, #[serde(default)] unverified: bool },
+    Injected { name: String, identity: String, written_to: String, generated: bool, unverified: bool },
     Pending { name: String, identity: String, task_id: String, title: String, url: Option<String> },
     Denied { name: String, task_id: String },
     Expired { name: String, task_id: String },
@@ -67,6 +67,12 @@ fn generate(spec: &str) -> Option<SecretString> {
 }
 
 pub fn need(ctx: &Ctx, project: &Path, agent: &str, names: &[String], opts: &NeedOpts) -> Result<Vec<Outcome>> {
+    need_with_budget(ctx, project, agent, names, opts, &mut ProbeBudget::default())
+}
+
+/// `need` with a caller-owned probe budget, for callers that issue several `need`s in one
+/// request (the MCP server, one per name) and must not pay one timeout per name offline.
+pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String], opts: &NeedOpts, budget: &mut ProbeBudget) -> Result<Vec<Outcome>> {
     ctx.db.expire_overdue()?;
     // Approvals, bindings, and tasks are keyed by the resolved path, so a symlink that is
     // later retargeted cannot inherit another project's approval.
@@ -75,7 +81,6 @@ pub fn need(ctx: &Ctx, project: &Path, agent: &str, names: &[String], opts: &Nee
     let mut outcomes: Vec<Outcome> = Vec::with_capacity(names.len());
     let mut gated: Vec<String> = vec![];
     let mut outside = false;
-    let mut budget = ProbeBudget::default();
 
     for name in names {
         let identity = opts
@@ -121,12 +126,9 @@ pub fn need(ctx: &Ctx, project: &Path, agent: &str, names: &[String], opts: &Nee
             match gate {
                 // A stale key is a miss, but only once the project has passed the same gate a
                 // fresh injection would: a project that would need approval to receive this
-                // key must not get a paste card for its replacement instead.
-                Gate::Open if meta.as_ref().map(|m| m.stale).unwrap_or(false) => {
-                    let reason = meta.as_ref().and_then(|m| m.stale_reason.clone()).unwrap_or_else(|| "the stored key was marked stale".into());
-                    outcomes.push(replacement(ctx, project, agent, name, &identity, opts, &reason)?);
-                }
-                Gate::Open => match deliver(ctx, project, agent, name, &identity, &value, None, &mut budget)? {
+                // key must not get a paste card for its replacement instead. `deliver` makes
+                // that call (it re-reads the flag), so every door sees the same answer.
+                Gate::Open => match deliver(ctx, project, agent, name, &identity, &value, None, budget)? {
                     Delivery::Injected { path, unverified } => {
                         outcomes.push(Outcome::Injected { name: name.clone(), identity, written_to: path.display().to_string(), generated: false, unverified });
                     }
@@ -249,7 +251,7 @@ pub fn wait(ctx: &Ctx, project: &Path, outcomes: &mut [Outcome], timeout: Durati
                         let v = ctx.stash.get(&stash_key(name, identity))?
                             .ok_or_else(|| anyhow::anyhow!("task {} is answered but {name}@{identity} is not in the stash", t.id))?;
                         match deliver(ctx, project, &t.agent, name, identity, &v, Some("after-answer"), &mut budget)
-                            .map_err(|e| anyhow::anyhow!("{name} is stored but could not be written to {}: {e:#}", written.display()))?
+                            .map_err(|e| anyhow::anyhow!("{name} is stored but could not be delivered to {}: {e:#}", written.display()))?
                         {
                             Delivery::Injected { unverified, .. } => {
                                 *o = Outcome::Injected { name: name.clone(), identity: identity.clone(), written_to: written.display().to_string(), generated: false, unverified };
@@ -286,11 +288,35 @@ pub struct ProbeBudget {
 }
 impl ProbeBudget {
     pub const MAX: Duration = Duration::from_secs(6);
+    /// A budget with nothing left (tests; callers that must not wait on the network).
+    pub fn exhausted() -> Self { Self { spent: Self::MAX } }
 }
 
 /// Lease taken before a probe goes on the wire, and the backoff after "no verdict".
 const PROBE_LEASE: chrono::Duration = chrono::Duration::minutes(10);
 const PROBE_BACKOFF_RATE_LIMITED: chrono::Duration = chrono::Duration::minutes(60);
+/// After an Ok, no probe for at least this long whatever `verify_every` says: `always`
+/// means "every call, at most once a minute", so a `need` loop cannot become a request
+/// loop against the user's real quota.
+const PROBE_FLOOR: chrono::Duration = chrono::Duration::seconds(60);
+
+/// The routine window as a chrono duration (`Always` → the floor).
+fn window(cfg: &crate::config::Config) -> chrono::Duration {
+    use crate::config::VerifyEvery::*;
+    match cfg.verify_every {
+        Always | Never => PROBE_FLOOR,
+        Every(d) => chrono::Duration::from_std(d).unwrap_or_else(|_| chrono::Duration::days(1)).max(PROBE_FLOOR),
+    }
+}
+
+/// Agent names come from the caller (`--agent`, `TOKENSTASH_AGENT`, MCP `clientInfo.name`)
+/// and end up in audit rows and on cards ("found at use by <agent>"). Short and printable,
+/// so a caller cannot write the card's body.
+pub fn clean_agent(raw: &str) -> String {
+    let clean: String = raw.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-')).take(48).collect();
+    let clean = clean.trim().to_string();
+    if clean.is_empty() { "agent".into() } else { clean }
+}
 
 fn rfc3339(t: chrono::DateTime<chrono::Utc>) -> String {
     t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -308,20 +334,32 @@ enum AtUse {
     Verified,
     Unverified,
     Rejected(String),
+    /// The stash changed under the probe: deliver what is stored now, unverified.
+    Changed(SecretString),
 }
 
 /// Hand a stash value to a project. Every path that writes a stored key into an env file
 /// after authorization goes through here — the plain hit, the after-approval inject, the
-/// after-answer inject — so verify-on-use cannot be bypassed by taking a different door.
+/// after-answer inject — so neither verify-on-use nor the stale flag can be bypassed by
+/// taking a different door.
 #[allow(clippy::too_many_arguments)]
 pub fn deliver(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &str, value: &SecretString, note: Option<&str>, budget: &mut ProbeBudget) -> Result<Delivery> {
     let pid = project.to_string_lossy().to_string();
+    // Re-read: the flag may have been set after the caller looked (a report from another
+    // project while an approval card was pending, a probe in another process).
+    if let Some(m) = ctx.db.get_secret(name, identity)? {
+        if m.stale {
+            return Ok(Delivery::Rejected { reason: m.stale_reason.unwrap_or_else(|| "the stored key was marked stale".into()) });
+        }
+    }
+    let mut current = value.clone();
     let unverified = match verify_at_use(ctx, project, agent, name, identity, value, budget)? {
         AtUse::Rejected(reason) => return Ok(Delivery::Rejected { reason }),
+        AtUse::Changed(v) => { current = v; true }
         AtUse::Unverified => true,
         AtUse::NotDue | AtUse::Verified => false,
     };
-    let path = crate::envfile::write(project, &ctx.cfg.env_file, name, value)?;
+    let path = crate::envfile::write(project, &ctx.cfg.env_file, name, &current)?;
     ctx.db.touch_secret(name, identity)?;
     ctx.db.audit(Some(&pid), Some(agent), "inject", Some(name), Some(identity), note)?;
     Ok(Delivery::Injected { path, unverified })
@@ -356,33 +394,36 @@ fn verify_at_use(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &
             return Ok(AtUse::NotDue);
         }
     }
-    // Backoff and lease live in one column (never the routine window, which is derived from
-    // `last_verified` so a config change applies at once): a future `next_probe` means "not
-    // now", whoever set it. `claim_probe` is a conditional UPDATE, so two processes racing to the same
-    // due key produce one request, not two. A key inside a backoff is delivered, but the
-    // caller is told it was not checked.
-    if !ctx.db.claim_probe(name, identity, &rfc3339(now + PROBE_LEASE))? {
+    // Out of time for this call: deliver unverified without taking a lease, so the next
+    // call (or another process) still gets to probe.
+    if budget.spent >= ProbeBudget::MAX {
         return Ok(AtUse::Unverified);
     }
-    if budget.spent >= ProbeBudget::MAX {
-        // The lease stays: the next call inside ten minutes delivers unverified without
-        // paying a timeout either.
+    // Backoff, floor and lease live in one column (never the routine window, which is
+    // derived from `last_verified` so a config change applies at once): a future
+    // `next_probe` means "not now", whoever set it. `claim_probe` is a conditional UPDATE,
+    // so two processes racing to the same due key produce one request, not two. A key
+    // inside a backoff is delivered, but the caller is told it was not checked.
+    if !ctx.db.claim_probe(name, identity, &rfc3339(now + PROBE_LEASE))? {
         return Ok(AtUse::Unverified);
     }
     let started = Instant::now();
     let verdict = ctx.probe.run(check, value, crate::validate::TIMEOUT_AT_USE);
     budget.spent += started.elapsed();
     let Some(verdict) = verdict else { return Ok(AtUse::NotDue) };
-    // Another process may have replaced the value while the probe was in flight; a verdict
-    // about a value that is no longer stored says nothing about the one that is.
-    let still_stored = ctx.stash.get(&stash_key(name, identity))?.map(|v| v.expose_secret() == value.expose_secret()).unwrap_or(false);
-    if !still_stored {
-        return Ok(AtUse::Unverified);
+    // Another process may have replaced the value while the probe was in flight (the human
+    // answered a card): a verdict about the old value says nothing about the new one, and
+    // the old one must not be written over the new.
+    match ctx.stash.get(&stash_key(name, identity))? {
+        Some(v) if v.expose_secret() == value.expose_secret() => {}
+        Some(v) => return Ok(AtUse::Changed(v)),
+        None => return Ok(AtUse::Unverified),
     }
     let pid = project.to_string_lossy().to_string();
     match verdict {
         Liveness::Ok => {
             ctx.db.set_verified(name, identity)?;
+            ctx.db.set_next_probe(name, identity, &rfc3339(chrono::Utc::now() + PROBE_FLOOR))?;
             Ok(AtUse::Verified)
         }
         Liveness::Rejected(code) => {
@@ -393,7 +434,9 @@ fn verify_at_use(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &
             Ok(AtUse::Rejected(reason))
         }
         Liveness::Unknown(_) => {
-            let wait = if verdict.is_rate_limited() { PROBE_BACKOFF_RATE_LIMITED } else { PROBE_LEASE };
+            // 403 is a verdict ("live, not permitted here") that will not change: wait a
+            // whole window, not a backoff, or a restricted key is probed every ten minutes.
+            let wait = if verdict.is_rate_limited() { PROBE_BACKOFF_RATE_LIMITED } else if verdict.is_forbidden() { window(ctx.cfg) } else { PROBE_LEASE };
             ctx.db.set_next_probe(name, identity, &rfc3339(chrono::Utc::now() + wait))?;
             Ok(AtUse::Unverified)
         }

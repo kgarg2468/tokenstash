@@ -369,7 +369,7 @@ impl Db {
     /// Most recent `report`/`false_report` audit row for (project, name, identity) after `since`.
     pub fn recent_report(&self, project: &str, name: &str, identity: &str, since: &str) -> Result<Option<String>> {
         Ok(self.conn.query_row(
-            "SELECT action FROM audit WHERE project=?1 AND name=?2 AND identity=?3 AND action IN ('report','false_report') AND ts >= ?4 ORDER BY id DESC LIMIT 1",
+            "SELECT action FROM audit WHERE project=?1 AND name=?2 AND identity=?3 AND action IN ('report','false_report','report.unverified') AND ts >= ?4 ORDER BY id DESC LIMIT 1",
             params![project, name, identity, since],
             |r| r.get::<_, String>(0),
         ).optional()?)

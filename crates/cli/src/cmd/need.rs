@@ -87,7 +87,7 @@ pub fn need(a: NeedArgs) -> Result<i32> {
                     let rel = p.strip_prefix(&project).map(|r| r.display().to_string()).unwrap_or(written_to.clone());
                     println!("✓ {name} {} → {rel}", if *generated { "generated and injected" } else { "injected" });
                     if *unverified {
-                        eprintln!("  {name}: provider unreachable, delivered without re-checking it");
+                        eprintln!("  {name}: delivered without re-checking it (provider unreachable or rate-limited, or checked moments ago by another process)");
                     }
                 }
                 Outcome::Pending { name, task_id, .. } => {

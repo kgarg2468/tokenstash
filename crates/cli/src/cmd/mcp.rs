@@ -42,9 +42,7 @@ pub fn serve() -> Result<i32> {
                 // ("found at use by <agent>"). Keep it short and printable so a client
                 // cannot write the card's body.
                 if let Some(n) = params.pointer("/clientInfo/name").and_then(|v| v.as_str()) {
-                    let clean: String = n.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '/' | '-')).take(48).collect();
-                    let clean = clean.trim().to_string();
-                    if !clean.is_empty() { agent = clean; }
+                    agent = need::clean_agent(n);
                 }
                 let pv = params.get("protocolVersion").and_then(|v| v.as_str()).unwrap_or(PROTOCOL);
                 result(id, json!({
@@ -112,7 +110,7 @@ fn tools() -> Value {
         { "name": "task_check", "description": "Check the status of a task (pending | answered | denied | expired). For secret tasks, answered means the value is now in the env file.", "inputSchema": { "type": "object", "properties": { "task_id": { "type": "string" } }, "required": ["task_id"] } },
         { "name": "task_list", "description": "List open tasks for the project.", "inputSchema": { "type": "object", "properties": { "project": { "type": "string" } } } },
         { "name": "secrets_list", "description": "List the names (never values) of secrets the user already has, so you can request the right ones.", "inputSchema": { "type": "object", "properties": {} } },
-        { "name": "secrets_report_invalid", "description": "Report that a provider rejected a key tokenstash injected for this project (HTTP 401/403, or the provider's documented invalid-key status) after confirming your own request was well-formed. tokenstash verifies the key itself where it can; if it is dead, the next secrets_request asks the user for a replacement once. Always returns ok. Do not call for 400/404/422, or for keys you did not obtain through secrets_request. Never ask the user to rotate a key in chat.", "inputSchema": { "type": "object", "properties": { "name": { "type": "string" }, "identity": { "type": "string" }, "status": { "type": "integer", "description": "HTTP status the provider returned" }, "message": { "type": "string", "description": "Provider error text; accepted but never stored" } }, "required": ["name"] } }
+        { "name": "secrets_report_invalid", "description": "Report that a provider rejected a key tokenstash injected for this project (HTTP 401, or the provider's documented invalid-key status) after confirming your own request was well-formed. 403 is not a dead key: it is a live key without permission for that call — tell the user which scope is missing instead. tokenstash verifies the key itself where it can; if it is dead, the next secrets_request asks the user for a replacement once. Always returns ok. Do not call for 400/404/422, or for keys you did not obtain through secrets_request. Never ask the user to rotate a key in chat.", "inputSchema": { "type": "object", "properties": { "name": { "type": "string" }, "identity": { "type": "string" }, "status": { "type": "integer", "description": "HTTP status the provider returned" }, "message": { "type": "string", "description": "Provider error text; accepted but never stored" } }, "required": ["name"] } }
     ])
 }
 
@@ -152,12 +150,15 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
                 }
             }
             let mut results = vec![];
+            // One probe budget for the whole request: offline, ten names must not cost ten
+            // timeouts on a single-threaded server.
+            let mut budget = need::ProbeBudget::default();
             for s in &specs {
                 let opts = NeedOpts {
                     req: SecretRequest { why: s.why.clone(), url: s.url.clone(), steps: s.steps.clone(), pattern: s.pattern.clone() },
                     identity: s.identity.clone(), blocking: false, timeout, force: false, require_approval: false,
                 };
-                results.extend(need::need(&app.ctx(), &project, agent, std::slice::from_ref(&s.name), &opts)?);
+                results.extend(need::need_with_budget(&app.ctx(), &project, agent, std::slice::from_ref(&s.name), &opts, &mut budget)?);
             }
             if results.iter().any(|o| o.is_pending()) {
                 notify_pending(&app, &project, agent, &results);
