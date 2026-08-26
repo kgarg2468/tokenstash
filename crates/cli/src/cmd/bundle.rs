@@ -31,7 +31,7 @@ pub fn export(a: ExportArgs) -> Result<i32> {
     let app = App::open()?;
     let out = a.out.unwrap_or_else(|| PathBuf::from("tokenstash.bundle"));
     let out = if out.is_absolute() { out } else { std::env::current_dir()?.join(out) };
-    refuse_bad_destination(&out, &app.cfg.env_file)?;
+    let out = refuse_bad_destination(&out, &app.cfg.env_file)?;
     let secrets = app.db.list_secrets()?;
     if secrets.is_empty() {
         println!("nothing indexed in this home; nothing to export");
@@ -74,19 +74,25 @@ pub fn export(a: ExportArgs) -> Result<i32> {
 /// A bundle holds every value: never into a device/pipe, a git-tracked path, a checkout
 /// owned by someone else (owned_git_root's hard error propagates), or a project's env-file
 /// name (a bundle is not an env file, and that name is what agents read).
-fn refuse_bad_destination(p: &Path, env_file: &str) -> Result<()> {
-    if p.starts_with("/dev") || p.starts_with("/proc") { bail!("refusing to write the bundle to {}", p.display()); }
-    if p.file_name().map(|f| f.to_string_lossy() == env_file).unwrap_or(false) {
+fn refuse_bad_destination(p: &Path, env_file: &str) -> Result<PathBuf> {
+    let Some(file_name) = p.file_name() else { bail!("{} is not a file path", p.display()) };
+    if file_name.to_string_lossy() == env_file {
         bail!("refusing to write the bundle as {}: that is the env-file name agents read", p.display());
     }
+    // Resolve the parent first: the checks below and the rename that follows must look at
+    // the same directory, and a symlinked parent would otherwise let the rename land in a
+    // checkout the lexical check never saw.
     let parent = p.parent().filter(|d| !d.as_os_str().is_empty()).map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+    let parent = parent.canonicalize().with_context(|| format!("{} does not exist", parent.display()))?;
+    let resolved = parent.join(file_name);
+    if resolved.starts_with("/dev") || resolved.starts_with("/proc") || resolved.starts_with("/sys") { bail!("refusing to write the bundle to {}", resolved.display()); }
     if let Some(root) = tokenstash_core::envfile::owned_git_root(&parent)? {
-        if tokenstash_core::envfile::is_git_tracked(&root, p) {
-            bail!("{} is tracked by git; refusing to write a bundle there", p.display());
+        if tokenstash_core::envfile::is_git_tracked(&root, &resolved) {
+            bail!("{} is tracked by git; refusing to write a bundle there", resolved.display());
         }
-        eprintln!("note: {} is inside a git repo — make sure the bundle is never committed", p.display());
+        eprintln!("note: {} is inside a git repo — make sure the bundle is never committed", resolved.display());
     }
-    Ok(())
+    Ok(resolved)
 }
 
 #[derive(Args)]
@@ -139,7 +145,17 @@ pub fn import(a: ImportArgs) -> Result<i32> {
         let existing = app.stash.get(&stash_key(&e.name, &e.identity))?;
         let p = match existing {
             None => Plan::Add,
-            Some(v) if v.expose_secret() == e.value => Plan::Skip,
+            Some(v) if v.expose_secret() == e.value => {
+                // Same value: nothing to store, but a rotation the user asked for on the
+                // other machine must not be lost here.
+                if e.stale && e.stale_reason.as_deref().unwrap_or("").starts_with(tokenstash_core::db::Db::ROTATE_REASON)
+                    && !app.db.get_secret(&e.name, &e.identity)?.map(|m| m.stale).unwrap_or(false)
+                {
+                    app.db.mark_stale(&e.name, &e.identity, true, e.stale_reason.as_deref())?;
+                    println!("  {}@{}: same value, marked for rotation as on the exporting machine", e.name, e.identity);
+                }
+                Plan::Skip
+            }
             Some(_) => {
                 if a.keep_existing { Plan::Skip } else if a.replace { Plan::Replace } else {
                     let local = app.db.get_secret(&e.name, &e.identity)?;
@@ -203,10 +219,10 @@ pub fn import(a: ImportArgs) -> Result<i32> {
     // saying "still live" must not un-stale a rotation the user asked for on the old machine.
     // Also re-probe a key that was skipped as identical but is stale HERE and fresh in the
     // bundle: the other machine may have a working copy of the same value.
-    let mut names: Vec<String> = plan.iter().filter(|(p, e)| *p != Plan::Skip && !e.stale).map(|(_, e)| e.name.clone()).collect();
+    let mut pairs: Vec<(String, String)> = plan.iter().filter(|(p, e)| *p != Plan::Skip && !e.stale).map(|(_, e)| (e.name.clone(), e.identity.clone())).collect();
     for (p, e) in &plan {
         if *p == Plan::Skip && !e.stale && app.db.get_secret(&e.name, &e.identity)?.map(|m| m.stale && !m.stale_reason.as_deref().unwrap_or("").starts_with(tokenstash_core::db::Db::ROTATE_REASON)).unwrap_or(false) {
-            names.push(e.name.clone());
+            pairs.push((e.name.clone(), e.identity.clone()));
         }
     }
     drop(plan);
@@ -214,9 +230,9 @@ pub fn import(a: ImportArgs) -> Result<i32> {
 
     // 4. verify after everything is stored, never before: a network failure must not leave a
     //    half-imported stash. Same sweep as `tokenstash check`.
-    if !a.no_verify && !names.is_empty() {
+    if !a.no_verify && !pairs.is_empty() {
         println!("verifying imported keys against their providers (--no-verify to skip)…");
-        crate::cmd::admin::sweep(&app, &names, false, true)?;
+        crate::cmd::admin::sweep_pairs(&app, &pairs, true)?;
     }
     println!("delete {} when you are done with it", a.bundle.display());
     Ok(0)
