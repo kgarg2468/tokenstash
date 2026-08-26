@@ -183,7 +183,14 @@ fn handle(app: &App, mut req: Request, tokens: &inbox_auth::Tokens) -> Result<()
                         if v.is_empty() { anyhow::bail!("empty value"); }
                         let skip = form.contains_key("skip_check");
                         match tasks::answer_secret(&ctx, &task, SecretString::from(v), skip)? {
-                            AnswerResult::Stored { injected_to, .. } => Ok(format!("Stored {} and wrote it to {}", task.name.clone().unwrap_or_default(), injected_to.map(|p| p.display().to_string()).unwrap_or_else(|| "the stash".into()))),
+                            AnswerResult::Stored { injected_to, rotation, .. } => {
+                                let mut m = format!("Stored {} and wrote it to {}", task.name.clone().unwrap_or_default(), injected_to.map(|p| p.display().to_string()).unwrap_or_else(|| "the stash".into()));
+                                if let Some(r) = rotation {
+                                    if !r.rewritten.is_empty() { m.push_str(&format!("; also updated {} other project(s)", r.rewritten.len())); }
+                                    if !r.skipped.is_empty() { m.push_str(&format!("; {} project(s) STILL HOLD THE OLD VALUE ({}) — fix before revoking it", r.skipped.len(), r.skipped.iter().map(|(p, _)| tokenstash_core::project::short(std::path::Path::new(p))).collect::<Vec<_>>().join(", "))); }
+                                }
+                                Ok(m)
+                            }
                             _ => Ok("stored".into()),
                         }
                     }

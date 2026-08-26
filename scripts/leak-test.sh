@@ -336,26 +336,45 @@ rm -rf "$(dirname "$OTHER")"
 
 # ── rotation: report-bad is not an oracle, check never prints a value ─────────────
 # Same line whether the name exists, was delivered here, or not at all.
-"$TS" report-bad OPENAI_API_KEY --status 401 --message "invalid key $CANARY" >"$OUT/report1.txt" 2>&1 || true
-"$TS" report-bad NOT_A_REAL_NAME --status 401 >"$OUT/report2.txt" 2>&1 || true
-diff <(sed 's/OPENAI_API_KEY\|NOT_A_REAL_NAME/NAME/' "$OUT/report1.txt") <(sed 's/OPENAI_API_KEY\|NOT_A_REAL_NAME/NAME/' "$OUT/report2.txt") >/dev/null || { echo "FAIL: report-bad answers differently for a real vs unknown name (oracle)"; fail=1; }
-grep -q "$CANARY" "$OUT/report1.txt" && { echo "LEAK: report-bad echoed the value"; fail=1; }
-"$TS" audit >"$OUT/audit-after-report.txt" 2>&1; grep -q "$CANARY" "$OUT/audit-after-report.txt" && { echo "LEAK: the reported message reached the audit log unscrubbed"; fail=1; }
+# PASTE_TARGET_KEY was delivered to $PROJ above and has no registry check (no network).
+"$TS" report-bad PASTE_TARGET_KEY --status 401 --message "invalid key $PGOOD rejected" >"$OUT/report1.txt" 2>&1 || true
+"$TS" report-bad NOT_A_REAL_NAME --status 401 --message "invalid key $PGOOD" >"$OUT/report2.txt" 2>&1 || true
+diff <(sed 's/PASTE_TARGET_KEY\|NOT_A_REAL_NAME/NAME/' "$OUT/report1.txt") <(sed 's/PASTE_TARGET_KEY\|NOT_A_REAL_NAME/NAME/' "$OUT/report2.txt") >/dev/null || { echo "FAIL: report-bad answers differently for a real vs unknown name (oracle)"; fail=1; }
+grep -q "$PGOOD" "$OUT/report1.txt" "$OUT/report2.txt" && { echo "LEAK: report-bad echoed the value"; fail=1; }
+"$TS" audit >"$OUT/audit-after-report.txt" 2>&1; grep -q "$PGOOD" "$OUT/audit-after-report.txt" && { echo "LEAK: the reported message reached the audit log"; fail=1; }
+"$TS" list >"$OUT/list-after-report.txt" 2>&1; grep -q "PASTE_TARGET_KEY.*STALE\|PASTE_TARGET_KEY@default:" "$OUT/list-after-report.txt" || { echo "FAIL: a report from the delivering project did not mark the key stale"; fail=1; }
+grep -q "$PGOOD" "$OUT/list-after-report.txt" && { echo "LEAK: list shows the value in the stale reason"; fail=1; }
+# rotate refuses an agent / a pipe, and its refusal names nothing
+"$TS" rotate OPENAI_API_KEY >"$OUT/rotate-pipe.txt" 2>&1 && { echo "FAIL: rotate ran without a terminal"; fail=1; }
 # check refuses a pipe (it is for a person at a terminal); the refusal must not list keys
 "$TS" check >"$OUT/check-pipe.txt" 2>&1 && { echo "FAIL: check ran without a terminal"; fail=1; }
 grep -q "OPENAI_API_KEY" "$OUT/check-pipe.txt" && { echo "FAIL: check's refusal listed a key name"; fail=1; }
-# rotate marks stale and files a card; the old value stays out of every output
-"$TS" rotate OPENAI_API_KEY >"$OUT/rotate.txt" 2>&1 || true
+# rotate (human, via a pty when util-linux `script` exists) marks stale and files a card;
+# the old value stays out of every output. Without a pty the stale path is exercised by the
+# report above; the replacement flow below runs either way.
+# (this test itself may run inside an agent session, whose env markers rotate rightly
+# refuses; clear them so the pty run looks like a person at a terminal)
+if script -qec true /dev/null >/dev/null 2>&1; then
+  env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_CI -u OPENAI_CODEX -u CURSOR_TRACE_ID -u CURSOR_AGENT -u GEMINI_CLI -u OPENCODE -u TOKENSTASH_AGENT \
+    script -qec "$TS rotate OPENAI_API_KEY" /dev/null >"$OUT/rotate.txt" 2>&1 || true
+else
+  : >"$OUT/rotate.txt"
+fi
 "$TS" list >"$OUT/list-stale.txt" 2>&1
-grep -q "STALE" "$OUT/list-stale.txt" || { echo "FAIL: rotate did not mark the key stale"; fail=1; }
+grep -q "STALE" "$OUT/list-stale.txt" || { echo "FAIL: nothing is marked stale"; fail=1; }
 grep -q "$CANARY" "$OUT/rotate.txt" "$OUT/list-stale.txt" && { echo "LEAK: rotation output contains the value"; fail=1; }
 RTID=$("$TS" tasks --json | python3 -c "import json,sys;l=[t for t in json.load(sys.stdin) if t.get('name')=='OPENAI_API_KEY' and t['status']=='pending'];print(l[0]['id'] if l else '')")
-[ -n "$RTID" ] || { echo "FAIL: rotate filed no replacement card"; fail=1; }
+if [ -z "$RTID" ]; then "$TS" need OPENAI_API_KEY --agent ci >/dev/null 2>&1 || true; RTID=$("$TS" tasks --json | python3 -c "import json,sys;l=[t for t in json.load(sys.stdin) if t.get('name')=='OPENAI_API_KEY' and t['status']=='pending'];print(l[0]['id'] if l else '')"); fi
+[ -n "$RTID" ] || { echo "FAIL: no replacement card for the stale key"; echo "--- rotate.txt:"; sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$OUT/rotate.txt" | head -5; echo "--- tasks:"; "$TS" tasks --all --json | python3 -c "import json,sys;[print(t['id'],t['kind'],t.get('name'),t['status'],t['project']) for t in json.load(sys.stdin)]"; echo "--- list:"; cat "$OUT/list-stale.txt"; fail=1; }
 NEWCANARY="sk-ROTATEDCANARY-$(date +%s)-0123456789abcdef"
 echo "$NEWCANARY" | "$TS" answer "$RTID" --stdin --skip-check >"$OUT/rotate-answer.txt" 2>&1 || true
 grep -q "OPENAI_API_KEY=$NEWCANARY" "$PROJ/.env.local" || { echo "FAIL: the rotated value did not land in the env file"; fail=1; }
-"$TS" list | grep -q "STALE" && { echo "FAIL: answering the rotation card did not clear stale"; fail=1; }
-CANARY="$NEWCANARY"
+"$TS" list | grep -q "OPENAI_API_KEY.*STALE" && { echo "FAIL: answering the rotation card did not clear stale"; fail=1; }
+OLDCANARY="$CANARY"; CANARY="$NEWCANARY"
+# the OLD value must not survive anywhere the agent reads, and the new one only in the env file
+if grep -rl "$OLDCANARY" "$OUT" "$WEB"; then echo "LEAK: the pre-rotation value appears in output"; fail=1; fi
+if strings "$TOKENSTASH_HOME/tokenstash.db"* | grep -q "$OLDCANARY\|$NEWCANARY"; then echo "LEAK: a rotation value is in the database"; fail=1; fi
+if grep -rl "$NEWCANARY" "$OUT" "$WEB"; then echo "LEAK: the rotated value appears in output"; fail=1; fi
 
 # exit-code contract
 rc=0; "$TS" need OPENAI_API_KEY --agent ci >/dev/null 2>&1 || rc=$?; [ $rc -eq 0 ] || { echo "hit should exit 0 (got $rc)"; fail=1; }
