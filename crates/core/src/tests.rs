@@ -38,7 +38,7 @@ fn registry_is_sane() {
             assert!(known, "{} unsupported check auth {:?}", p.name, c.auth);
             for s in &c.reject_status {
                 assert!((400..600).contains(s), "{} reject_status {}", p.name, s);
-                assert!(*s != 401 && *s != 403, "{} reject_status {} is already implied", p.name, s);
+                assert!(*s != 401, "{} reject_status {} is already implied", p.name, s);
             }
         }
         assert!(p.name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'), "{} name", p.name);
@@ -1166,7 +1166,9 @@ fn at_use_ok_refreshes_and_respects_the_window() {
     assert_eq!(calls.get(), 1);
     let m = db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap();
     assert!(m.last_verified.is_some());
-    assert!(m.next_probe.is_none(), "an Ok releases the lease; the window comes from last_verified");
+    assert!(m.next_probe.as_deref().unwrap() > now().as_str(), "an Ok leaves the one-minute floor, nothing longer");
+    let in_2m = (chrono::Utc::now() + chrono::Duration::minutes(2)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    assert!(m.next_probe.as_deref().unwrap() < in_2m.as_str(), "the window itself comes from last_verified");
     // inside the window: no second probe
     need::need(&ctx, &proj, "t", &names, &need::NeedOpts::default()).unwrap();
     assert_eq!(calls.get(), 1);
@@ -1181,7 +1183,13 @@ fn at_use_ok_refreshes_and_respects_the_window() {
     let cfg_always = Config { verify_every: config::VerifyEvery::Always, ..cfg.clone() };
     let ctx_a = tasks::Ctx { cfg: &cfg_always, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Stub(&stub) };
     let before = calls.get();
+    db.conn.execute("UPDATE secrets SET next_probe=NULL", []).unwrap();
     need::need(&ctx_a, &proj, "t", &names, &need::NeedOpts::default()).unwrap();
+    // ...but never more than once a minute: a `need` loop is not a request loop
+    let out = need::need(&ctx_a, &proj, "t", &names, &need::NeedOpts::default()).unwrap();
+    assert!(matches!(out[0], need::Outcome::Injected { unverified: true, .. }), "inside the floor the caller is told it was not re-checked");
+    assert_eq!(calls.get(), before + 1);
+    db.conn.execute("UPDATE secrets SET next_probe=NULL", []).unwrap();
     need::need(&ctx_a, &proj, "t", &names, &need::NeedOpts::default()).unwrap();
     assert_eq!(calls.get(), before + 2);
     let cfg_never = Config { verify_every: config::VerifyEvery::Never, ..cfg.clone() };
@@ -1222,6 +1230,16 @@ fn at_use_unknown_delivers_unverified_with_backoff() {
     let m = db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap();
     let in_50m = (chrono::Utc::now() + chrono::Duration::minutes(50)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     assert!(m.next_probe.unwrap() > in_50m, "429 backs off for an hour, not ten minutes");
+    // 403 is a verdict that will not change: a restricted key waits a whole window
+    let cfg_day = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let ctx_d = tasks::Ctx { cfg: &cfg_day, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Stub(&stub) };
+    db.conn.execute("UPDATE secrets SET next_probe=NULL", []).unwrap();
+    *verdict.borrow_mut() = validate::Liveness::Unknown("HTTP 403".into());
+    need::need(&ctx_d, &proj, "t", &names, &need::NeedOpts::default()).unwrap();
+    let m = db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap();
+    let in_23h = (chrono::Utc::now() + chrono::Duration::hours(23)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    assert!(m.next_probe.unwrap() > in_23h, "403 waits a full window");
+    assert!(!m.stale, "403 never stales a key");
 }
 
 #[test]
@@ -1301,13 +1319,23 @@ fn approval_delivery_is_verified_too() {
     let out = need::need(&ctx, &proj, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
     let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
     assert!(tid.starts_with("a_"), "untrusted project: approval card first");
-    let err = tasks::answer_approval(&ctx, &db.get_task(&tid).unwrap().unwrap(), true).unwrap_err().to_string();
-    assert!(err.contains("replacement card"), "{err}");
+    match tasks::answer_approval(&ctx, &db.get_task(&tid).unwrap().unwrap(), true).unwrap() {
+        tasks::AnswerResult::Approved { injected, replaced } => { assert!(injected.is_empty()); assert_eq!(replaced, vec!["OPENAI_API_KEY".to_string()]); }
+        o => panic!("{o:?}"),
+    }
     assert!(!envfile::has(&proj, ".env.local", "OPENAI_API_KEY"), "approval must not bypass the probe");
     assert!(db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap().stale);
     let pid = proj.to_string_lossy().to_string();
     let rt = db.open_secret_task(&pid, "OPENAI_API_KEY", "default").unwrap().expect("replacement card filed for this project");
     assert_eq!(rt.expects, tasks::EXPECTS_REPLACE);
+    // the agent's `wait` now sees the approval Answered — and must not inject the dead key
+    let mut outcomes = vec![need::Outcome::Pending { name: "OPENAI_API_KEY".into(), identity: "default".into(), task_id: tid.clone(), title: String::new(), url: None }];
+    need::wait(&ctx, &proj, &mut outcomes, std::time::Duration::from_millis(10)).unwrap();
+    match &outcomes[0] {
+        need::Outcome::Pending { task_id, .. } => assert_eq!(*task_id, rt.id, "wait re-pends on the Replace card"),
+        o => panic!("wait must not inject a stale key: {o:?}"),
+    }
+    assert!(!envfile::has(&proj, ".env.local", "OPENAI_API_KEY"));
 }
 
 #[test]
@@ -1327,6 +1355,9 @@ fn a_verdict_for_a_value_no_longer_stored_is_discarded() {
     let out = need::need(&ctx, &proj, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
     assert!(matches!(out[0], need::Outcome::Injected { unverified: true, .. }), "{out:?}");
     assert!(!db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap().stale, "the old value's verdict must not stale the new value");
+    let written = std::fs::read_to_string(proj.join(".env.local")).unwrap();
+    assert!(written.contains("sk-new-"), "the value stored now is what lands, not the one probed: {written}");
+    assert!(!written.contains("sk-old-"));
 }
 
 #[test]
@@ -1336,7 +1367,11 @@ fn verify_every_parses_strictly() {
     assert_eq!(config::VerifyEvery::parse("30m").unwrap(), Every(std::time::Duration::from_secs(1800)));
     assert_eq!(config::VerifyEvery::parse("always").unwrap(), Always);
     assert_eq!(config::VerifyEvery::parse(" never ").unwrap(), Never);
-    for bad in ["0m", "0h", "5s", "", "daily", "h", "-1h"] {
+    assert_eq!(config::VerifyEvery::parse("8760h").unwrap(), Every(std::time::Duration::from_secs(8760 * 3600)), "a year is the cap");
+    let c: Config = toml::from_str("verify_every = \"90m\"").unwrap();
+    assert!(toml::to_string(&c).unwrap().contains("verify_every = \"90m\""));
+    assert!(toml::from_str::<Config>("verify_evry = \"never\"").is_err(), "a typo must not silently keep the default");
+    for bad in ["0m", "0h", "5s", "", "daily", "h", "-1h", "+5h", "5м", "24ｈ", "99999999999999999999h", "9000h", "1.5h", " 1 h"] {
         assert!(config::VerifyEvery::parse(bad).is_err(), "{bad:?} must be rejected");
     }
     let c: Config = toml::from_str("verify_every = \"2h\"").unwrap();
@@ -1353,12 +1388,15 @@ fn registry_at_use_is_a_deliberate_allowlist() {
         let Some(c) = &p.check else { continue };
         if c.at_use {
             assert!(!c.reject_status.contains(&400), "{}: a generic 400 reject cannot run unattended", p.name);
+            assert!(c.reject_status.iter().all(|s| *s == 403), "{}: only a documented 403-for-bad-token provider may add a reject status at use", p.name);
             assert!(!c.url.contains("search"), "{}: a metered endpoint cannot run unattended", p.name);
             assert!(c.url.starts_with("https://"), "{}", p.name);
         }
     }
     assert!(registry::lookup("OPENAI_API_KEY").unwrap().check.as_ref().unwrap().at_use);
     assert!(!registry::lookup("CLOUDFLARE_API_TOKEN").unwrap().check.as_ref().unwrap().at_use, "200 with status=expired in the body");
+    assert!(!registry::lookup("ELEVENLABS_API_KEY").unwrap().check.as_ref().unwrap().at_use, "401 missing_permissions for a live restricted key");
+    assert_eq!(registry::lookup("VERCEL_TOKEN").unwrap().check.as_ref().unwrap().reject_status, vec![403], "Vercel answers 403 for a bad token");
 }
 
 /// A one-shot loopback HTTP server: records the request head, answers with `response`.
@@ -1403,10 +1441,11 @@ fn liveness_verdicts_over_loopback() {
     assert_eq!(validate::liveness(&check_for(&url, "header:xi-api-key"), &v, t), validate::Liveness::Ok);
     // 302 → Unknown, and the redirect is NOT followed: the custom header never leaves for
     // the target. The same listener plays both origins; exactly one request must arrive.
-    let (url, rx, h) = loopback("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let (url, rx, _h) = loopback("HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     assert!(matches!(validate::liveness(&check_for(&url, "header:xi-api-key"), &v, t), validate::Liveness::Unknown(_)));
-    drop(rx);
-    let _ = h;
+    let first = rx.recv().unwrap();
+    assert!(first.contains("xi-api-key: sk-probe-value"), "{first}");
+    assert!(rx.recv_timeout(std::time::Duration::from_millis(500)).is_err(), "the redirect target must never receive a request");
     // no response inside the timeout → Unknown, and the error text does not carry the key
     let (url, _rx, _h) = loopback("");
     let started = std::time::Instant::now();
@@ -1415,4 +1454,95 @@ fn liveness_verdicts_over_loopback() {
         o => panic!("{o:?}"),
     }
     assert!(started.elapsed() < std::time::Duration::from_secs(3));
+}
+
+
+#[test]
+fn probe_budget_delivers_unverified_without_taking_a_lease() {
+    let _env = env_lock();
+    let (home, proj) = verify_setup("budget");
+    let cfg = Config { trust_roots: vec![proj.clone()], verify_every: config::VerifyEvery::Always, ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let calls = std::cell::Cell::new(0);
+    let stub = |_: &registry::Check| { calls.set(calls.get() + 1); validate::Liveness::Ok };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Stub(&stub) };
+    seed(&db, stash.as_ref(), "OPENAI_API_KEY", "sk-live-aaaaaaaaaaaaaaaaaaaa", None);
+    let names = ["OPENAI_API_KEY".to_string()];
+    let out = need::need_with_budget(&ctx, &proj, "t", &names, &need::NeedOpts::default(), &mut need::ProbeBudget::exhausted()).unwrap();
+    assert!(matches!(out[0], need::Outcome::Injected { unverified: true, .. }), "{out:?}");
+    assert_eq!(calls.get(), 0);
+    assert!(db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap().next_probe.is_none(), "no lease taken: the next call may probe");
+    let out = need::need(&ctx, &proj, "t", &names, &need::NeedOpts::default()).unwrap();
+    assert!(matches!(out[0], need::Outcome::Injected { unverified: false, .. }));
+    assert_eq!(calls.get(), 1);
+}
+
+#[test]
+fn old_databases_get_stale_source_backfilled() {
+    let home = tmp("migrate");
+    let path = home.join("old.db");
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch("CREATE TABLE secrets (name TEXT NOT NULL, identity TEXT NOT NULL DEFAULT 'default', provider TEXT, sensitive INTEGER NOT NULL DEFAULT 0, source_url TEXT, created TEXT NOT NULL, last_used TEXT, stale INTEGER NOT NULL DEFAULT 0, last_verified TEXT, stale_reason TEXT, PRIMARY KEY(name, identity));").unwrap();
+        c.execute("INSERT INTO secrets (name, created, stale, stale_reason) VALUES ('ROT', '2026-01-01T00:00:00Z', 1, ?1)", [format!("{} (old)", Db::ROTATE_REASON)]).unwrap();
+        c.execute("INSERT INTO secrets (name, created, stale, stale_reason) VALUES ('REP', '2026-01-01T00:00:00Z', 1, 'rejected by X (HTTP 401) ...')", []).unwrap();
+        c.execute("INSERT INTO secrets (name, created, stale) VALUES ('OK', '2026-01-01T00:00:00Z', 0)", []).unwrap();
+    }
+    let db = Db::open(&path).unwrap();
+    assert_eq!(db.get_secret("ROT", "default").unwrap().unwrap().stale_source.as_deref(), Some(db::STALE_ROTATE));
+    assert_eq!(db.get_secret("REP", "default").unwrap().unwrap().stale_source.as_deref(), Some(db::STALE_REPORT));
+    let ok = db.get_secret("OK", "default").unwrap().unwrap();
+    assert!(ok.stale_source.is_none() && ok.next_probe.is_none() && !ok.verify_off);
+    // and the rotation survives a probe saying Ok, the report does not
+    db.set_verified("ROT", "default").unwrap();
+    db.set_verified("REP", "default").unwrap();
+    assert!(db.get_secret("ROT", "default").unwrap().unwrap().stale);
+    assert!(!db.get_secret("REP", "default").unwrap().unwrap().stale);
+    // reopening is idempotent
+    drop(db);
+    Db::open(&path).unwrap();
+}
+
+#[test]
+fn agent_names_are_short_and_printable() {
+    assert_eq!(need::clean_agent("claude-code"), "claude-code");
+    assert_eq!(need::clean_agent("Codex CLI/1.2"), "Codex CLI1.2");
+    assert_eq!(need::clean_agent("<b>PASTE YOUR KEY AT http://evil</b>"), "bPASTE YOUR KEY AT httpevilb");
+    assert_eq!(need::clean_agent(&"x".repeat(200)).len(), 48);
+    assert_eq!(need::clean_agent("\n\t\u{202e}"), "agent");
+}
+
+#[test]
+fn unverified_reports_count_toward_the_cooldown() {
+    let _env = env_lock();
+    let (home, proj) = verify_setup("reportcool");
+    let cfg = Config { trust_roots: vec![proj.clone()], verify_every: config::VerifyEvery::Never, ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let calls = std::cell::Cell::new(0);
+    let stub = |_: &registry::Check| { calls.set(calls.get() + 1); validate::Liveness::Unknown("HTTP 403".into()) };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Stub(&stub) };
+    seed(&db, stash.as_ref(), "OPENAI_API_KEY", "sk-restricted-aaaaaaaaaaaaaaa", None);
+    need::need(&ctx, &proj, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    // a report that the provider cannot confirm (403 → no verdict) is one probe, then silence
+    for _ in 0..3 {
+        tasks::report_bad(&ctx, &proj, "t", "OPENAI_API_KEY", "default", Some(403)).unwrap();
+    }
+    assert_eq!(calls.get(), 1, "an agent looping secrets_report_invalid must not loop the provider");
+    assert!(!db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap().stale);
+}
+
+#[test]
+fn skipping_the_check_on_an_uncheckable_key_does_not_flag_it() {
+    let _env = env_lock();
+    let (home, proj) = verify_setup("uncheckable");
+    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let out = need::need(&ctx, &proj, "t", &["MY_CUSTOM_TOKEN".to_string()], &need::NeedOpts::default()).unwrap();
+    let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
+    tasks::answer_secret(&ctx, &db.get_task(&tid).unwrap().unwrap(), SecretString::from("custom-token-value-1234567890".to_string()), true).unwrap();
+    assert!(!db.get_secret("MY_CUSTOM_TOKEN", "default").unwrap().unwrap().verify_off, "nothing to skip for a key without a probe");
 }

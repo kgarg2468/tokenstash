@@ -88,7 +88,10 @@ pub fn answer(a: AnswerArgs) -> Result<i32> {
                 matches!(ans.trim(), "y" | "Y" | "yes")
             };
             match tasks::answer_approval(&ctx, &task, allow)? {
-                AnswerResult::Approved { injected } => println!("✓ approved; injected {}", if injected.is_empty() { "nothing new".into() } else { injected.join(", ") }),
+                AnswerResult::Approved { injected, replaced } => {
+                    println!("✓ approved; injected {}", if injected.is_empty() { "nothing new".into() } else { injected.join(", ") });
+                    if !replaced.is_empty() { println!("  {} rejected by the provider at delivery — a Replace card is waiting", replaced.join(", ")); }
+                }
                 AnswerResult::Denied => println!("✗ denied"),
                 _ => unreachable!(),
             }

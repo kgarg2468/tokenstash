@@ -67,13 +67,13 @@ pub fn list(a: ListArgs) -> Result<i32> {
         println!("(the {} stash itself is per-user; a key stored under another TOKENSTASH_HOME is adopted here, and listed, the first time a project needs it)", app.stash.backend());
         return Ok(0);
     }
-    println!("{:<36} {:<10} {:<18} {:<10} LAST USED", "NAME", "IDENTITY", "PROVIDER", "FLAGS");
+    println!("{:<36} {:<10} {:<18} {:<24} LAST USED", "NAME", "IDENTITY", "PROVIDER", "FLAGS");
     for s in &secrets {
         let mut flags = vec![];
         if s.sensitive { flags.push("sensitive"); }
         if s.stale { flags.push("STALE"); }
         if s.verify_off { flags.push("no-verify"); }
-        println!("{:<36} {:<10} {:<18} {:<10} {}", s.name, s.identity, s.provider.clone().unwrap_or_default(), flags.join(","), s.last_used.clone().unwrap_or_default());
+        println!("{:<36} {:<10} {:<18} {:<24} {}", s.name, s.identity, s.provider.clone().unwrap_or_default(), flags.join(","), s.last_used.clone().unwrap_or_default());
     }
     for s in secrets.iter().filter(|s| s.stale) {
         println!("  {}@{}: {}", s.name, s.identity, s.stale_reason.clone().unwrap_or_else(|| "stale".into()));

@@ -70,6 +70,13 @@ pub struct Entry {
     /// Carried so a key the user asked to rotate stays a rotation on the new machine.
     #[serde(default)]
     pub stale_reason: Option<String>,
+    /// Who set the stale flag (`rotate` | `report` | `probe`); absent in bundles written
+    /// before it existed, in which case the reason text decides.
+    #[serde(default)]
+    pub stale_source: Option<String>,
+    /// The human stored this past the provider check: verify-on-use stays off for it.
+    #[serde(default)]
+    pub verify_off: bool,
 }
 
 impl Drop for Payload_ {
@@ -220,7 +227,7 @@ mod tests {
         Payload_ {
             created: "2026-08-26T00:00:00Z".into(),
             tool_version: "test".into(),
-            entries: vec![Entry { name: "OPENAI_API_KEY".into(), identity: "default".into(), value: "sk-bundlecanary-0123456789abcdef".into(), provider: Some("OpenAI".into()), sensitive: false, source_url: None, created: "2026-08-01T00:00:00Z".into(), last_used: None, stale: false, stale_reason: None }],
+            entries: vec![Entry { name: "OPENAI_API_KEY".into(), identity: "default".into(), value: "sk-bundlecanary-0123456789abcdef".into(), provider: Some("OpenAI".into()), sensitive: false, source_url: None, created: "2026-08-01T00:00:00Z".into(), last_used: None, stale: false, stale_reason: None, stale_source: None, verify_off: false }],
             bindings: vec![Binding { project: "/old/machine/proj".into(), name: "OPENAI_API_KEY".into(), identity: "default".into() }],
         }
     }
