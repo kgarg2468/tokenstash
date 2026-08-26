@@ -27,6 +27,71 @@ pub struct Config {
     /// missing-key cards but not approve) or "full" (the link can do everything).
     #[serde(default = "default_links")]
     pub inbox_links: String,
+    /// How often a key with a registry probe is re-checked with its provider before an agent
+    /// `need` delivers it: "24h" (default), "<n>h", "<n>m", "always", or "never". One free
+    /// authenticated request per key per window; a rejected key becomes a Replace card
+    /// before the agent ever sees a 401.
+    #[serde(default)]
+    pub verify_every: VerifyEvery,
+}
+
+/// Parsed at load time so an invalid value is a config error, not a silent default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyEvery {
+    Always,
+    Never,
+    Every(std::time::Duration),
+}
+
+impl Default for VerifyEvery {
+    fn default() -> Self { VerifyEvery::Every(std::time::Duration::from_secs(24 * 3600)) }
+}
+
+impl VerifyEvery {
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        let s = s.trim();
+        match s {
+            "always" => return Ok(VerifyEvery::Always),
+            "never" => return Ok(VerifyEvery::Never),
+            _ => {}
+        }
+        let (num, unit) = s.split_at(s.len().saturating_sub(1));
+        let n: u64 = num.parse().map_err(|_| format!("verify_every: expected \"always\", \"never\", \"<n>h\" or \"<n>m\", got {s:?}"))?;
+        if n == 0 {
+            return Err("verify_every: the interval must be at least 1m (use \"always\" for every call)".into());
+        }
+        match unit {
+            "h" => Ok(VerifyEvery::Every(std::time::Duration::from_secs(n * 3600))),
+            "m" => Ok(VerifyEvery::Every(std::time::Duration::from_secs(n * 60))),
+            _ => Err(format!("verify_every: expected \"always\", \"never\", \"<n>h\" or \"<n>m\", got {s:?}")),
+        }
+    }
+}
+
+impl std::fmt::Display for VerifyEvery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VerifyEvery::Always => write!(f, "always"),
+            VerifyEvery::Never => write!(f, "never"),
+            VerifyEvery::Every(d) => {
+                let s = d.as_secs();
+                if s % 3600 == 0 { write!(f, "{}h", s / 3600) } else { write!(f, "{}m", s / 60) }
+            }
+        }
+    }
+}
+
+impl serde::Serialize for VerifyEvery {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for VerifyEvery {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        VerifyEvery::parse(&s).map_err(serde::de::Error::custom)
+    }
 }
 
 fn default_links() -> String { "paste".into() }
@@ -46,6 +111,7 @@ impl Default for Config {
             stash_backend: None,
             notifications: true,
             inbox_links: default_links(),
+            verify_every: VerifyEvery::default(),
         }
     }
 }

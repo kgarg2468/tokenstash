@@ -38,13 +38,20 @@ pub fn serve() -> Result<i32> {
         let Some(id) = id else { continue }; // notification
         let resp = match method.as_str() {
             "initialize" => {
-                if let Some(n) = params.pointer("/clientInfo/name").and_then(|v| v.as_str()) { agent = n.to_string(); }
+                // The client names itself; the name ends up in audit rows and on cards
+                // ("found at use by <agent>"). Keep it short and printable so a client
+                // cannot write the card's body.
+                if let Some(n) = params.pointer("/clientInfo/name").and_then(|v| v.as_str()) {
+                    let clean: String = n.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '/' | '-')).take(48).collect();
+                    let clean = clean.trim().to_string();
+                    if !clean.is_empty() { agent = clean; }
+                }
                 let pv = params.get("protocolVersion").and_then(|v| v.as_str()).unwrap_or(PROTOCOL);
                 result(id, json!({
                     "protocolVersion": pv,
                     "capabilities": { "tools": { "listChanged": false } },
                     "serverInfo": { "name": "tokenstash", "version": env!("CARGO_PKG_VERSION") },
-                    "instructions": "Call secrets_request for any API key or secret the project needs instead of asking the user to paste it. Values are written to the project's env file; they are never returned. If a result is pending, keep working and call task_check later. If a provider rejects an injected key (401/403 with a well-formed request), call secrets_report_invalid and then secrets_request again — never ask the user to paste or rotate a key in chat."
+                    "instructions": "Call secrets_request for any API key or secret the project needs instead of asking the user to paste it. Values are written to the project's env file; they are never returned. If a result is pending, keep working and call task_check later. If a provider rejects an injected key (401 with a well-formed request), call secrets_report_invalid and then secrets_request again — never ask the user to paste or rotate a key in chat. A secrets_request for a key you already had can come back pending with a 'Replace' card: tokenstash re-checked the key with its provider before delivering it and it was rejected. Hand the user the link and keep working; do not also report it."
                 }))
             }
             "ping" => result(id, json!({})),

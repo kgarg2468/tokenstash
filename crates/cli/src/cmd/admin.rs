@@ -72,10 +72,14 @@ pub fn list(a: ListArgs) -> Result<i32> {
         let mut flags = vec![];
         if s.sensitive { flags.push("sensitive"); }
         if s.stale { flags.push("STALE"); }
+        if s.verify_off { flags.push("no-verify"); }
         println!("{:<36} {:<10} {:<18} {:<10} {}", s.name, s.identity, s.provider.clone().unwrap_or_default(), flags.join(","), s.last_used.clone().unwrap_or_default());
     }
     for s in secrets.iter().filter(|s| s.stale) {
         println!("  {}@{}: {}", s.name, s.identity, s.stale_reason.clone().unwrap_or_else(|| "stale".into()));
+    }
+    if secrets.iter().any(|s| s.verify_off) {
+        println!("  no-verify: stored with --skip-check / --no-verify, so it is not re-checked before use; `tokenstash check NAME` turns that back on once the provider accepts it");
     }
     println!("\n{} secrets in the {} stash (values never shown)", secrets.len(), app.stash.backend());
     Ok(0)
@@ -324,11 +328,11 @@ fn sweep_where(app: &App, select: &dyn Fn(&tokenstash_core::db::SecretMeta) -> b
             rows.push((m.name.clone(), m.identity.clone(), "not in stash".to_string(), m.stale));
             continue;
         };
-        let status = match tokenstash_core::validate::liveness(&check, &v) {
+        let status = match tokenstash_core::validate::liveness(&check, &v, tokenstash_core::validate::TIMEOUT_HUMAN) {
             tokenstash_core::validate::Liveness::Ok => { app.db.set_verified(&m.name, &m.identity)?; "ok".to_string() }
             tokenstash_core::validate::Liveness::Rejected(code) => {
                 let reason = format!("rejected by the provider (HTTP {code}) on {} during a check", tokenstash_core::now());
-                app.db.mark_stale(&m.name, &m.identity, true, Some(&reason))?;
+                app.db.mark_stale(&m.name, &m.identity, true, Some(&reason), Some(tokenstash_core::db::STALE_PROBE))?;
                 app.db.audit(None, None, "check.rejected", Some(&m.name), Some(&m.identity), Some(&format!("HTTP {code}")))?;
                 format!("REJECTED (HTTP {code}) → stale")
             }

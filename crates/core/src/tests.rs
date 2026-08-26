@@ -210,9 +210,9 @@ fn require_approval_gates_even_hits() {
     let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
-    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     stash.set(&stash::stash_key("GROQ_API_KEY", "default"), &SecretString::from("gsk_x".to_string())).unwrap();
-    db.upsert_secret(&db::SecretMeta { name: "GROQ_API_KEY".into(), identity: "default".into(), provider: None, sensitive: false, source_url: None, created: now(), last_used: None, stale: false, last_verified: None, stale_reason: None }).unwrap();
+    db.upsert_secret(&db::SecretMeta { name: "GROQ_API_KEY".into(), identity: "default".into(), provider: None, sensitive: false, source_url: None, created: now(), last_used: None, stale: false, last_verified: None, stale_reason: None, stale_source: None, next_probe: None, verify_off: false }).unwrap();
     // normal hit inside a trust root: silent
     let out = need::need(&ctx, &proj, "t", &["GROQ_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
     assert!(matches!(out[0], need::Outcome::Injected { .. }));
@@ -295,7 +295,7 @@ fn need_end_to_end_with_file_stash() {
     let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
-    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     let names = vec!["OPENAI_API_KEY".to_string(), "AUTH_SECRET".to_string()];
     let out = need::need(&ctx, &proj, "test", &names, &need::NeedOpts::default()).unwrap();
     assert!(matches!(out[0], need::Outcome::Pending { .. }));
@@ -339,7 +339,7 @@ fn text_answers_that_look_like_secrets_are_refused() {
     let db = Db::open(&home.join("t.db")).unwrap();
     let cfg = Config::default();
     let st = stash::FileStash::new().unwrap(); // never touched by this test
-    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: &st };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: &st, probe: tasks::Probe::Off };
     let t = tasks::create_human_task(&ctx, &home, "t", tasks::HumanRequest { title: "which region?".into(), why: None, url: None, steps: vec![], expects: "text".into() }).unwrap();
     assert!(tasks::answer_human(&ctx, &t, Some("sk-abcdefghijklmnopqrstuvwxyz012345")).is_err());
     assert_eq!(db.get_task(&t.id).unwrap().unwrap().status, db::TaskStatus::Pending, "refused answer must not close the task");
@@ -357,7 +357,7 @@ fn answering_a_secret_marks_the_task_before_injection() {
     let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
-    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     let out = need::need(&ctx, &proj, "t", &["RESEND_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
     let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), _ => unreachable!() };
     let task = db.get_task(&tid).unwrap().unwrap();
@@ -390,7 +390,7 @@ fn same_name_different_identities_get_separate_tasks() {
     let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
-    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     let name = vec!["OPENAI_API_KEY".to_string()];
     let work = need::need(&ctx, &proj, "t", &name, &need::NeedOpts { identity: Some("work".into()), ..Default::default() }).unwrap();
     let personal = need::need(&ctx, &proj, "t", &name, &need::NeedOpts { identity: Some("personal".into()), ..Default::default() }).unwrap();
@@ -480,7 +480,7 @@ fn approvals_follow_the_resolved_project_not_the_symlink() {
     let cfg = Config { trust_roots: vec![], ..Default::default() }; // nothing trusted: every project needs approval
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
-    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     stash.set(&stash::stash_key("OPENAI_API_KEY", "default"), &SecretString::from("sk-aaaaaaaaaaaa".to_string())).unwrap();
     // approve via the symlink while it points at a
     let out = need::need(&ctx, &link, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
@@ -505,7 +505,7 @@ fn approval_injects_the_requested_identity() {
     let cfg = Config { trust_roots: vec![], ..Default::default() }; // untrusted → approval needed
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
-    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     stash.set("OPENAI_API_KEY@default", &SecretString::from("sk-defaultdefault".to_string())).unwrap();
     stash.set("OPENAI_API_KEY@work", &SecretString::from("sk-workworkwork1".to_string())).unwrap();
     let opts = need::NeedOpts { identity: Some("work".into()), ..Default::default() };
@@ -568,7 +568,7 @@ fn approval_is_final_even_if_injection_fails() {
     let cfg = Config { trust_roots: vec![], ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
-    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     stash.set("A_KEY@default", &SecretString::from("aaaaaaaaaa".to_string())).unwrap();
     stash.set("B_KEY@default", &SecretString::from("bbbbbbbbbb".to_string())).unwrap();
     let out = need::need(&ctx, &proj, "t", &["A_KEY".to_string(), "B_KEY".to_string()], &need::NeedOpts::default()).unwrap();
@@ -593,7 +593,7 @@ fn program_derived_approvals_do_not_merge() {
     let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
-    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     stash.set("A_KEY@default", &SecretString::from("aaaaaaaaaa".to_string())).unwrap();
     stash.set("B_KEY@default", &SecretString::from("bbbbbbbbbb".to_string())).unwrap();
     let ra = need::NeedOpts { require_approval: true, ..Default::default() };
@@ -622,7 +622,7 @@ fn wait_does_not_file_duplicate_program_approvals() {
     let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
-    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     stash.set("A_KEY@default", &SecretString::from("aaaaaaaaaa".to_string())).unwrap();
     let ra = need::NeedOpts { require_approval: true, ..Default::default() };
     let mut out = need::need(&ctx, &proj, "run", &["A_KEY".to_string()], &ra).unwrap();
@@ -633,7 +633,7 @@ fn wait_does_not_file_duplicate_program_approvals() {
     let h = std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(300));
         let st = stash::open(&cfg2).unwrap();
-        let c = tasks::Ctx { cfg: &cfg2, db: &db2, stash: st.as_ref() };
+        let c = tasks::Ctx { cfg: &cfg2, db: &db2, stash: st.as_ref(), probe: tasks::Probe::Off };
         tasks::answer_approval(&c, &db2.get_task(&tid2).unwrap().unwrap(), true).unwrap();
         let _ = proj2;
     });
@@ -805,7 +805,7 @@ fn a_run_shim_approval_is_not_a_standing_grant() {
     let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
-    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     // a program-derived approval: merge=false marks it one-time
     let t = tasks::create_approval_task_opts(&ctx, &proj, "test", &["STRIPE_SECRET_KEY@default".to_string()], false).unwrap();
     assert_eq!(t.expects, tasks::APPROVAL_ONCE);
@@ -832,7 +832,7 @@ fn a_denied_approval_is_remembered() {
     let cfg = Config { trust_roots: vec![], ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
-    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     stash.set(&stash::stash_key("OPENAI_API_KEY", "default"), &SecretString::from("sk-test-aaaaaaaaaaaaaaaa".to_string())).unwrap();
     let names = vec!["OPENAI_API_KEY".to_string()];
     let out = need::need(&ctx, &proj, "test", &names, &need::NeedOpts::default()).unwrap();
@@ -875,14 +875,14 @@ fn a_stale_key_is_a_miss_with_the_reason_on_the_card() {
     let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
-    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     let names = vec!["OPENAI_API_KEY".to_string()];
     // store via a paste
     let t = tasks::create_secret_task(&ctx, &proj, "test", "OPENAI_API_KEY", "default", &Default::default()).unwrap();
     tasks::answer_secret(&ctx, &t, SecretString::from("sk-old-aaaaaaaaaaaaaaaa".to_string()), true).unwrap();
     assert!(matches!(need::need(&ctx, &proj, "test", &names, &Default::default()).unwrap()[0], need::Outcome::Injected { .. }));
     // mark stale → the next need is a miss whose card carries the reason
-    db.mark_stale("OPENAI_API_KEY", "default", true, Some("rejected by OpenAI (HTTP 401) on 2026-08-26, reported by claude-code in demo")).unwrap();
+    db.mark_stale("OPENAI_API_KEY", "default", true, Some("rejected by OpenAI (HTTP 401) on 2026-08-26, reported by claude-code in demo"), Some(db::STALE_REPORT)).unwrap();
     let out = need::need(&ctx, &proj, "test", &names, &Default::default()).unwrap();
     let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
     let card = db.get_task(&tid).unwrap().unwrap();
@@ -905,7 +905,7 @@ fn rotate_files_the_card_and_rewrites_every_project_holding_the_old_value() {
     let cfg = Config { trust_roots: vec![proj_a.clone(), proj_b.clone()], ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
-    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     let names = vec!["GROQ_API_KEY".to_string()];
     let t = tasks::create_secret_task(&ctx, &proj_a, "test", "GROQ_API_KEY", "default", &Default::default()).unwrap();
     tasks::answer_secret(&ctx, &t, SecretString::from("gsk_old_aaaaaaaaaaaaaaaa".to_string()), true).unwrap();
@@ -929,7 +929,7 @@ fn report_bad_needs_standing_and_is_rate_limited() {
     let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
-    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     // an unregistered name: no liveness check, so the report itself decides
     let t = tasks::create_secret_task(&ctx, &proj, "test", "MY_CUSTOM_TOKEN", "default", &Default::default()).unwrap();
     tasks::answer_secret(&ctx, &t, SecretString::from("custom-aaaaaaaaaaaaaaaa".to_string()), true).unwrap();
@@ -948,7 +948,7 @@ fn report_bad_needs_standing_and_is_rate_limited() {
     assert!(audit.iter().any(|a| a.3 == "report"));
     assert!(audit.iter().all(|a| !a.6.as_deref().unwrap_or("").contains("custom-")), "only the status is persisted, never provider text");
     // a second report inside the TTL is ignored (cooldown)
-    db.mark_stale("MY_CUSTOM_TOKEN", "default", false, None).unwrap();
+    db.mark_stale("MY_CUSTOM_TOKEN", "default", false, None, Some(db::STALE_REPORT)).unwrap();
     assert_eq!(tasks::report_bad(&ctx, &proj, "test", "MY_CUSTOM_TOKEN", "default", Some(401)).unwrap(), tasks::ReportOutcome::Ignored);
     assert!(!db.get_secret("MY_CUSTOM_TOKEN", "default").unwrap().unwrap().stale);
     // ...but a report about a NEWLY stored value is not shadowed by the old cooldown
@@ -965,14 +965,14 @@ fn report_bad_needs_standing_and_is_rate_limited() {
 fn a_probe_ok_never_cancels_a_human_rotation() {
     let dir = tmp("rotate-vs-verify");
     let db = Db::open(&dir.join("t.db")).unwrap();
-    db.upsert_secret(&db::SecretMeta { name: "K".into(), identity: "default".into(), provider: None, sensitive: false, source_url: None, created: now(), last_used: None, stale: false, last_verified: None, stale_reason: None }).unwrap();
-    db.mark_stale("K", "default", true, Some(Db::ROTATE_REASON)).unwrap();
+    db.upsert_secret(&db::SecretMeta { name: "K".into(), identity: "default".into(), provider: None, sensitive: false, source_url: None, created: now(), last_used: None, stale: false, last_verified: None, stale_reason: None, stale_source: None, next_probe: None, verify_off: false }).unwrap();
+    db.mark_stale("K", "default", true, Some(Db::ROTATE_REASON), Some(db::STALE_ROTATE)).unwrap();
     db.set_verified("K", "default").unwrap();
     let m = db.get_secret("K", "default").unwrap().unwrap();
     assert!(m.stale, "a human rotation survives a probe saying the old key is still live");
     assert!(m.last_verified.is_some());
     // a report-driven stale IS cleared by a probe Ok
-    db.mark_stale("K", "default", true, Some("rejected by X (HTTP 401) ...")).unwrap();
+    db.mark_stale("K", "default", true, Some("rejected by X (HTTP 401) ..."), Some(db::STALE_REPORT)).unwrap();
     db.set_verified("K", "default").unwrap();
     assert!(!db.get_secret("K", "default").unwrap().unwrap().stale);
 }
@@ -985,10 +985,10 @@ fn a_stale_key_still_goes_through_the_trust_gate_and_generated_names_regenerate(
     let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
-    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     let t = tasks::create_secret_task(&ctx, &proj, "test", "OPENAI_API_KEY", "default", &Default::default()).unwrap();
     tasks::answer_secret(&ctx, &t, SecretString::from("sk-old-aaaaaaaaaaaaaaaa".to_string()), true).unwrap();
-    db.mark_stale("OPENAI_API_KEY", "default", true, Some("rejected ...")).unwrap();
+    db.mark_stale("OPENAI_API_KEY", "default", true, Some("rejected ..."), Some(db::STALE_REPORT)).unwrap();
     // outside the trust roots: an APPROVAL card, not a paste card into the stranger's file
     let out = need::need(&ctx, &outside, "test", &["OPENAI_API_KEY".to_string()], &Default::default()).unwrap();
     let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
@@ -996,7 +996,7 @@ fn a_stale_key_still_goes_through_the_trust_gate_and_generated_names_regenerate(
     assert!(!outside.join(".env.local").exists());
     // generated secrets never become paste cards: a stale AUTH_SECRET regenerates
     need::need(&ctx, &proj, "test", &["AUTH_SECRET".to_string()], &Default::default()).unwrap();
-    db.mark_stale("AUTH_SECRET", "default", true, Some("reported ...")).unwrap();
+    db.mark_stale("AUTH_SECRET", "default", true, Some("reported ..."), Some(db::STALE_REPORT)).unwrap();
     let out = need::need(&ctx, &proj, "test", &["AUTH_SECRET".to_string()], &Default::default()).unwrap();
     assert!(matches!(&out[0], need::Outcome::Injected { generated: true, .. }), "{:?}", out[0]);
     assert!(!db.get_secret("AUTH_SECRET", "default").unwrap().unwrap().stale);
@@ -1011,7 +1011,7 @@ fn rotation_reports_projects_it_could_not_rewrite() {
     let cfg = Config { trust_roots: vec![proj_a.clone(), proj_b.clone()], ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
-    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     let t = tasks::create_secret_task(&ctx, &proj_a, "test", "GROQ_API_KEY", "default", &Default::default()).unwrap();
     tasks::answer_secret(&ctx, &t, SecretString::from("gsk_old_aaaaaaaaaaaaaaaa".to_string()), true).unwrap();
     need::need(&ctx, &proj_b, "test", &["GROQ_API_KEY".to_string()], &Default::default()).unwrap();
@@ -1037,7 +1037,7 @@ fn rotation_never_rewrites_a_project_without_a_standing_grant_and_ordinary_paste
     let cfg = Config { trust_roots: vec![proj_a.clone()], ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
-    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     let t = tasks::create_secret_task(&ctx, &proj_a, "test", "GROQ_API_KEY", "default", &Default::default()).unwrap();
     tasks::answer_secret(&ctx, &t, SecretString::from("gsk_old_aaaaaaaaaaaaaaaa".to_string()), true).unwrap();
     let once = tasks::create_approval_task_opts(&ctx, &proj_b, "run", &["GROQ_API_KEY@default".to_string()], false).unwrap();
@@ -1053,7 +1053,7 @@ fn rotation_never_rewrites_a_project_without_a_standing_grant_and_ordinary_paste
     // an ordinary paste in another project with a different value is NOT a rotation
     let proj_c = tmp("rotate-gate-c").canonicalize().unwrap();
     let cfg2 = Config { trust_roots: vec![proj_a.clone(), proj_c.clone()], ..Default::default() };
-    let ctx2 = tasks::Ctx { cfg: &cfg2, db: &db, stash: stash.as_ref() };
+    let ctx2 = tasks::Ctx { cfg: &cfg2, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     let tc = tasks::create_secret_task(&ctx2, &proj_c, "test", "OTHER_KEY", "default", &Default::default()).unwrap();
     tasks::answer_secret(&ctx2, &tc, SecretString::from("other-aaaaaaaaaaaaaaaa".to_string()), true).unwrap();
     need::need(&ctx2, &proj_a, "test", &["OTHER_KEY".to_string()], &Default::default()).unwrap();
@@ -1074,7 +1074,7 @@ fn an_ordinary_card_answered_after_a_stale_mark_elsewhere_does_not_propagate() {
     let cfg = Config { trust_roots: vec![proj_a.clone(), proj_b.clone()], ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
-    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     // A stores and B receives the key
     let t = tasks::create_secret_task(&ctx, &proj_a, "test", "GROQ_API_KEY", "default", &Default::default()).unwrap();
     tasks::answer_secret(&ctx, &t, SecretString::from("gsk_old_aaaaaaaaaaaaaaaa".to_string()), true).unwrap();
@@ -1084,14 +1084,14 @@ fn an_ordinary_card_answered_after_a_stale_mark_elsewhere_does_not_propagate() {
     let ordinary = tasks::create_secret_task(&ctx, &proj_c, "test", "GROQ_API_KEY", "default", &Default::default()).unwrap();
     assert_ne!(ordinary.expects, tasks::EXPECTS_REPLACE);
     // meanwhile the key is marked stale by a report elsewhere
-    db.mark_stale("GROQ_API_KEY", "default", true, Some("reported ...")).unwrap();
+    db.mark_stale("GROQ_API_KEY", "default", true, Some("reported ..."), Some(db::STALE_REPORT)).unwrap();
     // answering the ordinary card must not rewrite A and B
     let r = tasks::answer_secret(&ctx, &ordinary, SecretString::from("gsk_new_cccccccccccccccc".to_string()), true).unwrap();
     let tasks::AnswerResult::Stored { rotation, .. } = r else { panic!() };
     assert!(rotation.is_none());
     assert!(std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("gsk_old_"), "B untouched by an ordinary answer");
     // a REPLACEMENT card (the stale-miss branch) does propagate
-    db.mark_stale("GROQ_API_KEY", "default", true, Some("reported ...")).unwrap();
+    db.mark_stale("GROQ_API_KEY", "default", true, Some("reported ..."), Some(db::STALE_REPORT)).unwrap();
     let out = need::need(&ctx, &proj_a, "test", &["GROQ_API_KEY".to_string()], &Default::default()).unwrap();
     let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
     let card = db.get_task(&tid).unwrap().unwrap();
@@ -1099,4 +1099,320 @@ fn an_ordinary_card_answered_after_a_stale_mark_elsewhere_does_not_propagate() {
     tasks::answer_secret(&ctx, &card, SecretString::from("gsk_new_dddddddddddddddd".to_string()), true).unwrap();
     assert!(std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("gsk_new_dddd"), "B held the ORIGINAL stale value (the ordinary answer changed the stash in between); the replacement still reaches it");
     std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+
+// ---------------------------------------------------------------------------------------
+// verify-on-use (§14.7)
+
+fn verify_setup(tag: &str) -> (PathBuf, PathBuf) {
+    let home = tmp(&format!("verify-{tag}-home"));
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    std::env::set_var("TOKENSTASH_STASH", "insecure-file");
+    let proj = tmp(&format!("verify-{tag}-proj")).canonicalize().unwrap();
+    (home, proj)
+}
+
+fn seed(db: &Db, stash: &dyn stash::Stash, name: &str, value: &str, last_verified: Option<String>) {
+    stash.set(&stash::stash_key(name, "default"), &SecretString::from(value.to_string())).unwrap();
+    db.upsert_secret(&db::SecretMeta { name: name.into(), identity: "default".into(), provider: None, sensitive: false, source_url: None, created: now(), last_used: None, stale: false, last_verified, stale_reason: None, stale_source: None, next_probe: None, verify_off: false }).unwrap();
+}
+
+#[test]
+fn at_use_rejection_becomes_a_replace_card_and_writes_nothing() {
+    let _env = env_lock();
+    let (home, proj) = verify_setup("reject");
+    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let calls = std::cell::Cell::new(0);
+    let stub = |c: &registry::Check| { calls.set(calls.get() + 1); assert!(c.url.contains("api.openai.com")); validate::Liveness::Rejected(401) };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Stub(&stub) };
+    seed(&db, stash.as_ref(), "OPENAI_API_KEY", "sk-dead-aaaaaaaaaaaaaaaaaaaa", None);
+    let out = need::need(&ctx, &proj, "claude-code", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    let (tid, title) = match &out[0] { need::Outcome::Pending { task_id, title, .. } => (task_id.clone(), title.clone()), o => panic!("expected a replace card, got {o:?}") };
+    assert_eq!(calls.get(), 1);
+    assert!(!envfile::has(&proj, ".env.local", "OPENAI_API_KEY"), "a rejected key must not be written");
+    let t = db.get_task(&tid).unwrap().unwrap();
+    assert_eq!(t.expects, tasks::EXPECTS_REPLACE, "{title}");
+    assert!(t.why.as_deref().unwrap_or("").contains("rejected by OpenAI (HTTP 401)"), "{:?}", t.why);
+    assert!(t.why.as_deref().unwrap_or("").contains("found at use by claude-code"));
+    let m = db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap();
+    assert!(m.stale);
+    assert_eq!(m.stale_source.as_deref(), Some(db::STALE_PROBE));
+    assert!(db.recent_audit(10).unwrap().iter().any(|r| r.3 == "probe.rejected"));
+    // the value stays: a paste of the same value that the provider now accepts self-heals
+    assert!(stash.get(&stash::stash_key("OPENAI_API_KEY", "default")).unwrap().is_some());
+    // a stale key is never probed again on the next call; the card is simply reused
+    let out2 = need::need(&ctx, &proj, "claude-code", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    assert!(matches!(&out2[0], need::Outcome::Pending { task_id, .. } if *task_id == tid));
+    assert_eq!(calls.get(), 1);
+}
+
+#[test]
+fn at_use_ok_refreshes_and_respects_the_window() {
+    let _env = env_lock();
+    let (home, proj) = verify_setup("ok");
+    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let calls = std::cell::Cell::new(0);
+    let stub = |_: &registry::Check| { calls.set(calls.get() + 1); validate::Liveness::Ok };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Stub(&stub) };
+    seed(&db, stash.as_ref(), "OPENAI_API_KEY", "sk-live-aaaaaaaaaaaaaaaaaaaa", None);
+    let names = ["OPENAI_API_KEY".to_string()];
+    let out = need::need(&ctx, &proj, "t", &names, &need::NeedOpts::default()).unwrap();
+    assert!(matches!(out[0], need::Outcome::Injected { unverified: false, .. }), "{out:?}");
+    assert_eq!(calls.get(), 1);
+    let m = db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap();
+    assert!(m.last_verified.is_some());
+    assert!(m.next_probe.is_none(), "an Ok releases the lease; the window comes from last_verified");
+    // inside the window: no second probe
+    need::need(&ctx, &proj, "t", &names, &need::NeedOpts::default()).unwrap();
+    assert_eq!(calls.get(), 1);
+    // an old timestamp is due again; so is a future one (clock moved back) or garbage
+    for stamp in ["2020-01-01T00:00:00Z", "2999-01-01T00:00:00Z", "not a date"] {
+        db.conn.execute("UPDATE secrets SET last_verified=?1, next_probe=NULL", [stamp]).unwrap();
+        let before = calls.get();
+        need::need(&ctx, &proj, "t", &names, &need::NeedOpts::default()).unwrap();
+        assert_eq!(calls.get(), before + 1, "{stamp} must count as unverified");
+    }
+    // `always` probes every call; `never` never does
+    let cfg_always = Config { verify_every: config::VerifyEvery::Always, ..cfg.clone() };
+    let ctx_a = tasks::Ctx { cfg: &cfg_always, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Stub(&stub) };
+    let before = calls.get();
+    need::need(&ctx_a, &proj, "t", &names, &need::NeedOpts::default()).unwrap();
+    need::need(&ctx_a, &proj, "t", &names, &need::NeedOpts::default()).unwrap();
+    assert_eq!(calls.get(), before + 2);
+    let cfg_never = Config { verify_every: config::VerifyEvery::Never, ..cfg.clone() };
+    let ctx_n = tasks::Ctx { cfg: &cfg_never, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Stub(&stub) };
+    db.conn.execute("UPDATE secrets SET last_verified=NULL, next_probe=NULL", []).unwrap();
+    need::need(&ctx_n, &proj, "t", &names, &need::NeedOpts::default()).unwrap();
+    assert_eq!(calls.get(), before + 2);
+}
+
+#[test]
+fn at_use_unknown_delivers_unverified_with_backoff() {
+    let _env = env_lock();
+    let (home, proj) = verify_setup("unknown");
+    let cfg = Config { trust_roots: vec![proj.clone()], verify_every: config::VerifyEvery::Always, ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let calls = std::cell::Cell::new(0);
+    let verdict = std::cell::RefCell::new(validate::Liveness::Unknown("HTTP 503".into()));
+    let stub = |_: &registry::Check| { calls.set(calls.get() + 1); verdict.borrow().clone() };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Stub(&stub) };
+    seed(&db, stash.as_ref(), "OPENAI_API_KEY", "sk-live-aaaaaaaaaaaaaaaaaaaa", None);
+    let names = ["OPENAI_API_KEY".to_string()];
+    let out = need::need(&ctx, &proj, "t", &names, &need::NeedOpts::default()).unwrap();
+    assert!(matches!(out[0], need::Outcome::Injected { unverified: true, .. }), "{out:?}");
+    assert!(envfile::has(&proj, ".env.local", "OPENAI_API_KEY"), "an outage must not block delivery");
+    let m = db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap();
+    assert!(m.last_verified.is_none());
+    let np = m.next_probe.clone().unwrap();
+    assert!(np > now(), "backoff recorded");
+    // inside the backoff even `always` does not probe, and the caller is told
+    let out = need::need(&ctx, &proj, "t", &names, &need::NeedOpts::default()).unwrap();
+    assert!(matches!(out[0], need::Outcome::Injected { unverified: true, .. }));
+    assert_eq!(calls.get(), 1);
+    // rate-limited: a much longer backoff than an outage
+    db.conn.execute("UPDATE secrets SET next_probe=NULL", []).unwrap();
+    *verdict.borrow_mut() = validate::Liveness::Unknown("HTTP 429".into());
+    need::need(&ctx, &proj, "t", &names, &need::NeedOpts::default()).unwrap();
+    let m = db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap();
+    let in_50m = (chrono::Utc::now() + chrono::Duration::minutes(50)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    assert!(m.next_probe.unwrap() > in_50m, "429 backs off for an hour, not ten minutes");
+}
+
+#[test]
+fn at_use_probe_is_skipped_when_not_allowed() {
+    let _env = env_lock();
+    let (home, proj) = verify_setup("skip");
+    let cfg = Config { trust_roots: vec![proj.clone()], verify_every: config::VerifyEvery::Always, ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let calls = std::cell::Cell::new(0);
+    let stub = |_: &registry::Check| { calls.set(calls.get() + 1); validate::Liveness::Rejected(401) };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Stub(&stub) };
+    // registry says not at use (generic 400 reject / metered)
+    assert!(registry::lookup("GEMINI_API_KEY").unwrap().check.as_ref().map(|c| !c.at_use).unwrap());
+    assert!(registry::lookup("BRAVE_API_KEY").unwrap().check.as_ref().map(|c| !c.at_use).unwrap());
+    seed(&db, stash.as_ref(), "GEMINI_API_KEY", "AIzaSyDEADDEADDEADDEADDEADDEAD", None);
+    let out = need::need(&ctx, &proj, "t", &["GEMINI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    assert!(matches!(out[0], need::Outcome::Injected { unverified: false, .. }));
+    // no registry check at all
+    seed(&db, stash.as_ref(), "MY_CUSTOM_TOKEN", "custom-token-value-1234567890", None);
+    need::need(&ctx, &proj, "t", &["MY_CUSTOM_TOKEN".to_string()], &need::NeedOpts::default()).unwrap();
+    // the human stored it with --skip-check: verify_off
+    seed(&db, stash.as_ref(), "OPENAI_API_KEY", "sk-skip-aaaaaaaaaaaaaaaaaaaa", None);
+    db.set_verify_off("OPENAI_API_KEY", "default", true).unwrap();
+    let out = need::need(&ctx, &proj, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    assert!(matches!(out[0], need::Outcome::Injected { .. }), "{out:?}");
+    // a project that needs approval gets no probe: the probe transmits the key
+    let cfg_untrusted = Config { trust_roots: vec![], verify_every: config::VerifyEvery::Always, ..Default::default() };
+    let ctx_u = tasks::Ctx { cfg: &cfg_untrusted, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Stub(&stub) };
+    db.set_verify_off("OPENAI_API_KEY", "default", false).unwrap();
+    let out = need::need(&ctx_u, &proj, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    assert!(matches!(out[0], need::Outcome::Pending { .. }));
+    // a human-requested rotation is not re-probed either
+    db.mark_stale("OPENAI_API_KEY", "default", true, Some(Db::ROTATE_REASON), Some(db::STALE_ROTATE)).unwrap();
+    need::need(&ctx, &proj, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    assert_eq!(calls.get(), 0, "no probe may have run in this test");
+}
+
+#[test]
+fn skip_check_store_turns_verify_off_until_a_probe_says_ok() {
+    let _env = env_lock();
+    let (home, proj) = verify_setup("skipcheck");
+    let cfg = Config { trust_roots: vec![proj.clone()], verify_every: config::VerifyEvery::Always, ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let calls = std::cell::Cell::new(0);
+    let stub = |_: &registry::Check| { calls.set(calls.get() + 1); validate::Liveness::Rejected(401) };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Stub(&stub) };
+    let out = need::need(&ctx, &proj, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
+    // with the check: the paste itself is refused
+    let t = db.get_task(&tid).unwrap().unwrap();
+    assert!(tasks::answer_secret(&ctx, &t, SecretString::from("sk-restricted-aaaaaaaaaaaaaa".to_string()), false).is_err());
+    assert_eq!(calls.get(), 1);
+    // --skip-check: stored, and verify-on-use is off for this key
+    tasks::answer_secret(&ctx, &t, SecretString::from("sk-restricted-aaaaaaaaaaaaaa".to_string()), true).unwrap();
+    let m = db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap();
+    assert!(m.verify_off);
+    let out = need::need(&ctx, &proj, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    assert!(matches!(out[0], need::Outcome::Injected { .. }), "a key the human stored past the check must not be re-rejected: {out:?}");
+    assert_eq!(calls.get(), 1);
+    // a probe that says Ok (e.g. `check`) turns it back on
+    db.set_verified("OPENAI_API_KEY", "default").unwrap();
+    assert!(!db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap().verify_off);
+}
+
+#[test]
+fn approval_delivery_is_verified_too() {
+    let _env = env_lock();
+    let (home, proj) = verify_setup("approval");
+    let cfg = Config { trust_roots: vec![], verify_every: config::VerifyEvery::Always, ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let stub = |_: &registry::Check| validate::Liveness::Rejected(401);
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Stub(&stub) };
+    seed(&db, stash.as_ref(), "OPENAI_API_KEY", "sk-dead-aaaaaaaaaaaaaaaaaaaa", None);
+    let out = need::need(&ctx, &proj, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
+    assert!(tid.starts_with("a_"), "untrusted project: approval card first");
+    let err = tasks::answer_approval(&ctx, &db.get_task(&tid).unwrap().unwrap(), true).unwrap_err().to_string();
+    assert!(err.contains("replacement card"), "{err}");
+    assert!(!envfile::has(&proj, ".env.local", "OPENAI_API_KEY"), "approval must not bypass the probe");
+    assert!(db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap().stale);
+    let pid = proj.to_string_lossy().to_string();
+    let rt = db.open_secret_task(&pid, "OPENAI_API_KEY", "default").unwrap().expect("replacement card filed for this project");
+    assert_eq!(rt.expects, tasks::EXPECTS_REPLACE);
+}
+
+#[test]
+fn a_verdict_for_a_value_no_longer_stored_is_discarded() {
+    let _env = env_lock();
+    let (home, proj) = verify_setup("race");
+    let cfg = Config { trust_roots: vec![proj.clone()], verify_every: config::VerifyEvery::Always, ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    // while the probe is "in flight", another process replaces the key
+    let stub = |_: &registry::Check| {
+        stash.set(&stash::stash_key("OPENAI_API_KEY", "default"), &SecretString::from("sk-new-aaaaaaaaaaaaaaaaaaaaa".to_string())).unwrap();
+        validate::Liveness::Rejected(401)
+    };
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Stub(&stub) };
+    seed(&db, stash.as_ref(), "OPENAI_API_KEY", "sk-old-aaaaaaaaaaaaaaaaaaaaa", None);
+    let out = need::need(&ctx, &proj, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    assert!(matches!(out[0], need::Outcome::Injected { unverified: true, .. }), "{out:?}");
+    assert!(!db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap().stale, "the old value's verdict must not stale the new value");
+}
+
+#[test]
+fn verify_every_parses_strictly() {
+    use config::VerifyEvery::*;
+    assert_eq!(config::VerifyEvery::parse("24h").unwrap(), Every(std::time::Duration::from_secs(86400)));
+    assert_eq!(config::VerifyEvery::parse("30m").unwrap(), Every(std::time::Duration::from_secs(1800)));
+    assert_eq!(config::VerifyEvery::parse("always").unwrap(), Always);
+    assert_eq!(config::VerifyEvery::parse(" never ").unwrap(), Never);
+    for bad in ["0m", "0h", "5s", "", "daily", "h", "-1h"] {
+        assert!(config::VerifyEvery::parse(bad).is_err(), "{bad:?} must be rejected");
+    }
+    let c: Config = toml::from_str("verify_every = \"2h\"").unwrap();
+    assert_eq!(c.verify_every, Every(std::time::Duration::from_secs(7200)));
+    assert!(toml::from_str::<Config>("verify_every = \"sometimes\"").is_err());
+    assert_eq!(Config::default().verify_every, Every(std::time::Duration::from_secs(86400)));
+    let s = toml::to_string(&Config::default()).unwrap();
+    assert!(s.contains("verify_every = \"24h\""), "{s}");
+}
+
+#[test]
+fn registry_at_use_is_a_deliberate_allowlist() {
+    for p in registry::all() {
+        let Some(c) = &p.check else { continue };
+        if c.at_use {
+            assert!(!c.reject_status.contains(&400), "{}: a generic 400 reject cannot run unattended", p.name);
+            assert!(!c.url.contains("search"), "{}: a metered endpoint cannot run unattended", p.name);
+            assert!(c.url.starts_with("https://"), "{}", p.name);
+        }
+    }
+    assert!(registry::lookup("OPENAI_API_KEY").unwrap().check.as_ref().unwrap().at_use);
+    assert!(!registry::lookup("CLOUDFLARE_API_TOKEN").unwrap().check.as_ref().unwrap().at_use, "200 with status=expired in the body");
+}
+
+/// A one-shot loopback HTTP server: records the request head, answers with `response`.
+fn loopback(response: &'static str) -> (String, std::sync::mpsc::Receiver<String>, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/probe", l.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let h = std::thread::spawn(move || {
+        l.set_nonblocking(false).unwrap();
+        for _ in 0..2 {
+            let Ok((mut s, _)) = l.accept() else { return };
+            s.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+            if response.is_empty() { std::thread::sleep(std::time::Duration::from_secs(3)); return }
+            let _ = s.write_all(response.as_bytes());
+        }
+    });
+    (url, rx, h)
+}
+
+fn check_for(url: &str, auth: &str) -> registry::Check {
+    registry::Check { method: "GET".into(), url: url.into(), auth: auth.into(), headers: Default::default(), reject_status: vec![], at_use: true }
+}
+
+#[test]
+fn liveness_verdicts_over_loopback() {
+    let v = SecretString::from("sk-probe-value-000000000000".to_string());
+    let t = std::time::Duration::from_secs(1);
+    // 401 → Rejected, and the header is exactly the documented one
+    let (url, rx, _h) = loopback("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    assert_eq!(validate::liveness(&check_for(&url, "bearer"), &v, t), validate::Liveness::Rejected(401));
+    let req = rx.recv().unwrap();
+    assert!(req.contains("Authorization: Bearer sk-probe-value-000000000000"), "{req}");
+    // 403 → Unknown: a restricted key is a live key
+    let (url, _rx, _h) = loopback("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    assert!(matches!(validate::liveness(&check_for(&url, "bearer"), &v, t), validate::Liveness::Unknown(_)));
+    // 200 → Ok
+    let (url, _rx, _h) = loopback("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+    assert_eq!(validate::liveness(&check_for(&url, "header:xi-api-key"), &v, t), validate::Liveness::Ok);
+    // 302 → Unknown, and the redirect is NOT followed: the custom header never leaves for
+    // the target. The same listener plays both origins; exactly one request must arrive.
+    let (url, rx, h) = loopback("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    assert!(matches!(validate::liveness(&check_for(&url, "header:xi-api-key"), &v, t), validate::Liveness::Unknown(_)));
+    drop(rx);
+    let _ = h;
+    // no response inside the timeout → Unknown, and the error text does not carry the key
+    let (url, _rx, _h) = loopback("");
+    let started = std::time::Instant::now();
+    match validate::liveness(&check_for(&url, "query:key"), &v, t) {
+        validate::Liveness::Unknown(e) => assert!(!e.contains("sk-probe"), "{e}"),
+        o => panic!("{o:?}"),
+    }
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
 }
