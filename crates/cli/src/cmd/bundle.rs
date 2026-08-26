@@ -139,7 +139,7 @@ pub fn import(a: ImportArgs) -> Result<i32> {
         }
     }
     // 2. resolve conflicts, one question per name, before applying
-    #[derive(PartialEq)] enum Plan { Add, Skip, Replace }
+    #[derive(PartialEq)] enum Plan { Add, Skip, Replace, CarryRotation }
     let mut plan: Vec<(Plan, &Entry)> = vec![];
     for e in &payload.entries {
         let existing = app.stash.get(&stash_key(&e.name, &e.identity))?;
@@ -147,14 +147,11 @@ pub fn import(a: ImportArgs) -> Result<i32> {
             None => Plan::Add,
             Some(v) if v.expose_secret() == e.value => {
                 // Same value: nothing to store, but a rotation the user asked for on the
-                // other machine must not be lost here.
+                // other machine must not be lost here. Decided now, written in the apply
+                // step with everything else — planning changes nothing.
                 if e.stale && e.stale_reason.as_deref().unwrap_or("").starts_with(tokenstash_core::db::Db::ROTATE_REASON)
                     && !app.db.get_secret(&e.name, &e.identity)?.map(|m| m.stale).unwrap_or(false)
-                {
-                    app.db.mark_stale(&e.name, &e.identity, true, e.stale_reason.as_deref())?;
-                    println!("  {}@{}: same value, marked for rotation as on the exporting machine", e.name, e.identity);
-                }
-                Plan::Skip
+                { Plan::CarryRotation } else { Plan::Skip }
             }
             Some(_) => {
                 if a.keep_existing { Plan::Skip } else if a.replace { Plan::Replace } else {
@@ -179,6 +176,12 @@ pub fn import(a: ImportArgs) -> Result<i32> {
     for (p, e) in &plan {
         match p {
             Plan::Skip => { skipped += 1; continue; }
+            Plan::CarryRotation => {
+                app.db.mark_stale(&e.name, &e.identity, true, e.stale_reason.as_deref())?;
+                println!("  {}@{}: same value, marked for rotation as on the exporting machine", e.name, e.identity);
+                skipped += 1;
+                continue;
+            }
             Plan::Add => added += 1,
             Plan::Replace => replaced += 1,
         }
