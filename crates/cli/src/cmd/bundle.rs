@@ -32,7 +32,7 @@ pub struct ExportArgs {
     /// With --from-env: identity for everything imported.
     #[arg(long, default_value = "default", requires = "from_env")]
     pub identity: String,
-    /// With --from-env: skip the liveness sweep afterwards.
+    /// With --from-env: skip the liveness sweep afterwards (see import --no-verify).
     #[arg(long, requires = "from_env")]
     pub no_verify: bool,
 }
@@ -55,7 +55,7 @@ pub fn export(a: ExportArgs) -> Result<i32> {
     let mut missing = 0usize;
     for m in &secrets {
         match app.stash.get(&stash_key(&m.name, &m.identity))? {
-            Some(v) => entries.push(Entry { name: m.name.clone(), identity: m.identity.clone(), value: v.expose_secret().to_string(), provider: m.provider.clone(), sensitive: m.sensitive, source_url: m.source_url.clone(), created: m.created.clone(), last_used: m.last_used.clone(), stale: m.stale, stale_reason: m.stale_reason.clone() }),
+            Some(v) => entries.push(Entry { name: m.name.clone(), identity: m.identity.clone(), value: v.expose_secret().to_string(), provider: m.provider.clone(), sensitive: m.sensitive, source_url: m.source_url.clone(), created: m.created.clone(), last_used: m.last_used.clone(), stale: m.stale, stale_reason: m.stale_reason.clone(), stale_source: m.stale_source.clone(), verify_off: m.verify_off }),
             None => missing += 1,
         }
     }
@@ -118,7 +118,8 @@ pub struct ImportArgs {
     /// On a conflict, take the bundle's value.
     #[arg(long)]
     pub replace: bool,
-    /// Skip the liveness sweep after import (keys stay unverified).
+    /// Skip the liveness sweep after import. Imported keys are then not re-checked before use
+    /// either, until `tokenstash check` accepts them.
     #[arg(long)]
     pub no_verify: bool,
     /// Also apply the bundle's project bindings (which identity a project uses). Off by
@@ -243,7 +244,14 @@ pub fn import(a: ImportArgs) -> Result<i32> {
 /// The bundle carries the display reason only; the human's rotation is the one source
 /// that must survive the trip (a probe saying "live" must not cancel it on the new machine).
 fn stale_source_of(e: &Entry) -> &'static str {
-    if e.stale_reason.as_deref().unwrap_or("").starts_with(tokenstash_core::db::Db::ROTATE_REASON) { tokenstash_core::db::STALE_ROTATE } else { tokenstash_core::db::STALE_REPORT }
+    match e.stale_source.as_deref() {
+        Some(tokenstash_core::db::STALE_ROTATE) => tokenstash_core::db::STALE_ROTATE,
+        Some(tokenstash_core::db::STALE_PROBE) => tokenstash_core::db::STALE_PROBE,
+        Some(_) => tokenstash_core::db::STALE_REPORT,
+        // older bundle: only the human's rotation has a fixed text
+        None if e.stale_reason.as_deref().unwrap_or("").starts_with(tokenstash_core::db::Db::ROTATE_REASON) => tokenstash_core::db::STALE_ROTATE,
+        None => tokenstash_core::db::STALE_REPORT,
+    }
 }
 
 pub fn apply_entry(app: &App, e: &Entry, source: &str, no_verify: bool) -> Result<()> {
@@ -268,7 +276,7 @@ pub fn apply_entry(app: &App, e: &Entry, source: &str, no_verify: bool) -> Resul
         next_probe: None,
         // An import that skipped the sweep is the human saying "do not check these": the
         // sweep, when it runs, clears this for every key the provider accepts.
-        verify_off: no_verify,
+        verify_off: no_verify || e.verify_off,
     })?;
     app.db.audit(None, None, "import", Some(&e.name), Some(&e.identity), Some(source))?;
     Ok(())
@@ -380,7 +388,7 @@ pub fn from_env(a: FromEnvArgs) -> Result<i32> {
     for &i in &chosen {
         let cand = &c.candidates[i];
         let identity = tokenstash_core::envcrawl::identity_among(&c.candidates, i, &a.identity, |j| ticked[j]);
-        let e = Entry { name: cand.name.clone(), identity: identity.clone(), value: cand.value.expose_secret().to_string(), provider: cand.provider.clone(), sensitive: cand.sensitive, source_url: None, created: tokenstash_core::now(), last_used: None, stale: false, stale_reason: None };
+        let e = Entry { name: cand.name.clone(), identity: identity.clone(), value: cand.value.expose_secret().to_string(), provider: cand.provider.clone(), sensitive: cand.sensitive, source_url: None, created: tokenstash_core::now(), last_used: None, stale: false, stale_reason: None, stale_source: None, verify_off: false };
         bundle::validate_entry(&e).with_context(|| format!("row {} ({}@{})", i + 1, cand.name, identity))?;
         if let Some(pat) = tokenstash_core::registry::lookup(&e.name).and_then(|p| p.pattern.as_ref()) {
             if !tokenstash_core::validate::matches_pattern(pat, &cand.value)? {

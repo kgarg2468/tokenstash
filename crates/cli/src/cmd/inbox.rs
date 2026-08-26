@@ -202,7 +202,7 @@ fn handle(app: &App, mut req: Request, tokens: &inbox_auth::Tokens) -> Result<()
                             anyhow::bail!("approving needs the full inbox session: click the desktop notification or run `tokenstash open`, then reload this page");
                         }
                         match tasks::answer_approval(&ctx, &task, action == "allow")? {
-                            AnswerResult::Approved { injected } => Ok(format!("Approved; injected {}", if injected.is_empty() { "nothing new".into() } else { injected.join(", ") })),
+                            AnswerResult::Approved { injected, replaced } => Ok(format!("Approved; injected {}{}", if injected.is_empty() { "nothing new".into() } else { injected.join(", ") }, if replaced.is_empty() { String::new() } else { format!(". {} rejected by the provider at delivery — a Replace card is waiting", replaced.join(", ")) })),
                             _ => Ok("Denied".into()),
                         }
                     }

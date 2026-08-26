@@ -31,7 +31,7 @@ pub fn project_from(arg: &Option<PathBuf>) -> PathBuf {
 }
 
 pub fn agent_from(arg: &Option<String>) -> String {
-    arg.clone().unwrap_or_else(tokenstash_core::project::detect_agent)
+    tokenstash_core::need::clean_agent(&arg.clone().unwrap_or_else(tokenstash_core::project::detect_agent))
 }
 
 /// The inbox URL with NO session token. Every place an inbox link is built goes through here

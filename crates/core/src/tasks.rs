@@ -247,7 +247,9 @@ pub fn create_human_task(ctx: &Ctx, project: &Path, agent: &str, req: HumanReque
 #[derive(Debug)]
 pub enum AnswerResult {
     Stored { injected_to: Option<PathBuf>, sensitive: bool, liveness: Option<Liveness>, rotation: Option<RotationReport> },
-    Approved { injected: Vec<String> },
+    /// `replaced`: approved, but the provider rejected the stored key at delivery; a Replace
+    /// card is waiting for each of these instead of a value in the env file.
+    Approved { injected: Vec<String>, replaced: Vec<String> },
     Denied,
     Done,
 }
@@ -295,7 +297,12 @@ pub fn answer_secret(ctx: &Ctx, task: &Task, value: SecretString, skip_liveness:
     let injected_to = store_and_inject(
         ctx, &name, &task.identity, &value, provider.map(|p| p.provider.clone()), task.url.clone(), sensitive,
         Path::new(&task.project), &task.agent, Some(&task.id),
-        match liveness { Some(Liveness::Ok) => Verified::Ok, _ if skip_liveness => Verified::Skipped, _ => Verified::Unknown },
+        match liveness {
+            Some(Liveness::Ok) => Verified::Ok,
+            // "Skipped" only means something for a key that could have been checked.
+            _ if skip_liveness && provider.and_then(|p| p.check.as_ref()).is_some() => Verified::Skipped,
+            _ => Verified::Unknown,
+        },
     )?;
     // A replacement card's answer reaches every project that was ever given this key and
     // does not already hold the new value — whichever old value it holds (the stash may
@@ -393,6 +400,7 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, allow: bool) -> Result<AnswerResu
     // 2. Inject each requested identity. Failures are collected and surfaced after all
     //    entries are attempted; the approval itself is already recorded.
     let mut injected = vec![];
+    let mut replaced = vec![];
     let mut failures = vec![];
     let mut budget = crate::need::ProbeBudget::default();
     for entry in &task.names {
@@ -411,7 +419,7 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, allow: bool) -> Result<AnswerResu
                         let why = format!("Replace {n}: {reason}. The new value is written to {}.", project.join(&ctx.cfg.env_file).display());
                         let req = SecretRequest { why: Some(why), ..Default::default() };
                         create_replacement_task(ctx, project, &task.agent, n, identity, &req)?;
-                        failures.push(format!("{n}: {reason} — a replacement card has been filed"));
+                        replaced.push(n.to_string());
                     }
                     Err(e) => failures.push(format!("{n}: {e:#}")),
                 }
@@ -421,7 +429,7 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, allow: bool) -> Result<AnswerResu
     if !failures.is_empty() {
         bail!("approval recorded, but injection failed for {}. Re-run `need`; it will inject from the stash without asking again.", failures.join("; "));
     }
-    Ok(AnswerResult::Approved { injected })
+    Ok(AnswerResult::Approved { injected, replaced })
 }
 
 pub fn answer_human(ctx: &Ctx, task: &Task, note: Option<&str>) -> Result<AnswerResult> {
