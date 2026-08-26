@@ -292,11 +292,9 @@ pub fn check(a: CheckArgs) -> Result<i32> {
         require_human("check")?;
     }
     let app = App::open()?;
-    sweep(&app, &a.names, a.stale_only, !a.json)?;
+    let rows = sweep(&app, &a.names, a.stale_only, !a.json)?;
     if a.json {
-        // re-read the rows for a machine-readable view
-        let rows: Vec<serde_json::Value> = app.db.list_secrets()?.into_iter().filter(|m| a.names.is_empty() || a.names.contains(&m.name)).map(|m| serde_json::json!({ "name": m.name, "identity": m.identity, "stale": m.stale, "stale_reason": m.stale_reason, "last_verified": m.last_verified })).collect();
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+        println!("{}", serde_json::to_string_pretty(&rows.iter().map(|(n, i, st, stale)| serde_json::json!({ "name": n, "identity": i, "result": st, "stale": stale })).collect::<Vec<_>>())?);
     }
     Ok(0)
 }
@@ -304,7 +302,7 @@ pub fn check(a: CheckArgs) -> Result<i32> {
 /// The liveness sweep shared by `check` and `import`: every key with a registry check (or
 /// only `names`), probed sequentially with polite pacing. Rejected → stale, Ok → verified,
 /// Unknown → untouched. Never prints a value.
-pub fn sweep(app: &App, names: &[String], stale_only: bool, print: bool) -> Result<()> {
+pub fn sweep(app: &App, names: &[String], stale_only: bool, print: bool) -> Result<Vec<(String, String, String, bool)>> {
     let mut rows = vec![];
     for m in app.db.list_secrets()? {
         if !names.is_empty() && !names.contains(&m.name) { continue; }
@@ -332,11 +330,11 @@ pub fn sweep(app: &App, names: &[String], stale_only: bool, print: bool) -> Resu
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     if print {
-        if rows.is_empty() { println!("nothing to check"); return Ok(()); }
+        if rows.is_empty() { println!("nothing to check"); return Ok(rows); }
         println!("{:<36} {:<10} RESULT", "NAME", "IDENTITY");
         for (n, i, st, _) in &rows { println!("{n:<36} {i:<10} {st}"); }
         let stale = rows.iter().filter(|r| r.3).count();
         if stale > 0 { println!("\n{stale} stale — the next `tokenstash need` for each asks for a replacement (or run `tokenstash rotate NAME`)"); }
     }
-    Ok(())
+    Ok(rows)
 }
