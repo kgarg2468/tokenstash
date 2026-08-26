@@ -25,7 +25,8 @@ pub struct ExportArgs {
     #[arg(short, long)]
     pub out: Option<PathBuf>,
     /// Instead of writing a bundle: scan a directory tree for env files and import the keys
-    /// found there into the stash (onboarding).
+    /// found there into the stash (onboarding). Interactive, for a person at a terminal — the
+    /// table is an inventory of what you have, and a pty defeats the terminal check.
     #[arg(long, value_name = "DIR", conflicts_with = "out")]
     pub from_env: Option<PathBuf>,
     /// With --from-env: identity for everything imported.
@@ -288,29 +289,36 @@ pub fn from_env(a: FromEnvArgs) -> Result<i32> {
         println!("scanned {} env files; nothing that looks like a key", c.files_scanned);
         return Ok(0);
     }
-    println!("scanned {} env files; {} distinct values found
-", c.files_scanned, c.candidates.len());
-    let short = |p: &Path| tokenstash_core::project::short(p);
+    println!("scanned {} env files; {} distinct values found\n", c.files_scanned, c.candidates.len());
+    use tokenstash_core::envcrawl::{display_path, is_ambiguous, Confidence};
+    let short = |p: &Path| display_path(Path::new(&tokenstash_core::project::short(p)));
+    // What each row means, decided once: ticked by default only when it is a registry match
+    // with exactly one value for that name and nothing in the stash yet.
     let mut ticked: Vec<bool> = vec![];
+    let mut differs: Vec<bool> = vec![];
     for (i, cand) in c.candidates.iter().enumerate() {
         let identity = tokenstash_core::envcrawl::identity_for(&c.candidates, i, &a.identity);
         let existing = app.stash.get(&stash_key(&cand.name, &identity))?;
+        let ambiguous = is_ambiguous(&c.candidates, i);
         let (default_on, note) = match (&cand.confidence, &existing) {
             (_, Some(v)) if v.expose_secret() == cand.value.expose_secret() => (false, "already in the stash".to_string()),
-            (_, Some(_)) => (false, "DIFFERS from the stash (unticked; tick to replace)".to_string()),
-            (tokenstash_core::envcrawl::Confidence::Registry, None) => (true, cand.provider.clone().unwrap_or_default()),
-            (tokenstash_core::envcrawl::Confidence::RegistryShapeMismatch, None) => (false, format!("{} — does not look like a real key (placeholder?)", cand.provider.clone().unwrap_or_default())),
-            (tokenstash_core::envcrawl::Confidence::Heuristic, None) => (false, "unregistered; looks like a secret".to_string()),
+            (_, Some(_)) => (false, "DIFFERS from the stash — you will be asked before it replaces anything".to_string()),
+            (Confidence::Registry, None) if ambiguous => (false, format!("{} — several different values under this name; pick the real one", cand.provider.clone().unwrap_or_default())),
+            (Confidence::Registry, None) => (true, cand.provider.clone().unwrap_or_default()),
+            (Confidence::RegistryShapeMismatch, None) => (false, format!("{} — does not look like a real key (placeholder?)", cand.provider.clone().unwrap_or_default())),
+            (Confidence::Heuristic, None) => (false, "unregistered; looks like a secret".to_string()),
         };
         ticked.push(default_on);
+        differs.push(matches!((&cand.confidence, &existing), (_, Some(v)) if v.expose_secret() != cand.value.expose_secret()));
         let srcs: Vec<String> = cand.sources.iter().take(3).map(|p| short(p)).collect();
         let more = if cand.sources.len() > 3 { format!(" +{} more", cand.sources.len() - 3) } else { String::new() };
         let alias = if cand.aliases.is_empty() { String::new() } else { format!(" (also as {})", cand.aliases.join(", ")) };
-        println!("{:>3}. [{}] {}@{}{}  {}{}
-       {}{}", i + 1, if default_on { "x" } else { " " }, cand.name, identity, alias, if cand.sensitive { "SENSITIVE " } else { "" }, note, srcs.join(", "), more);
+        println!("{:>3}. [{}] {}  {}{}{}  {}", i + 1, if default_on { "x" } else { " " }, cand.name, tokenstash_core::redact::mask(&cand.value), alias, if cand.sensitive { "  SENSITIVE (asks once per project)" } else { "" }, note);
+        println!("       in {}{}", srcs.join(", "), more);
     }
-    println!("
-Type numbers to toggle (e.g. `3 7`), `all`, `none`, then Enter to import the ticked rows; `q` to quit.");
+    let on: Vec<String> = ticked.iter().enumerate().filter(|(_, t)| **t).map(|(i, _)| (i + 1).to_string()).collect();
+    println!("\nticked by default: {}", if on.is_empty() { "none".into() } else { on.join(" ") });
+    println!("Type numbers to toggle (e.g. `3 7`, `1-5`), `all`, `none`; Enter when done; `q` to quit.");
     loop {
         print!("> ");
         use std::io::Write;
@@ -320,31 +328,64 @@ Type numbers to toggle (e.g. `3 7`), `all`, `none`, then Enter to import the tic
         let t = line.trim();
         if t == "q" { println!("nothing imported"); return Ok(0); }
         if t.is_empty() { break; }
-        if t == "all" { ticked.iter_mut().for_each(|x| *x = true); }
+        // `all` never flips a row that would replace something already in the stash
+        if t == "all" { for (i, x) in ticked.iter_mut().enumerate() { if !differs[i] { *x = true; } } }
         else if t == "none" { ticked.iter_mut().for_each(|x| *x = false); }
         else {
             for tok in t.split_whitespace() {
+                if let Some((lo, hi)) = tok.split_once('-') {
+                    if let (Ok(lo), Ok(hi)) = (lo.parse::<usize>(), hi.parse::<usize>()) {
+                        for n in lo.max(1)..=hi.min(ticked.len()) { ticked[n - 1] = !ticked[n - 1]; }
+                        continue;
+                    }
+                }
                 match tok.parse::<usize>() { Ok(n) if n >= 1 && n <= ticked.len() => ticked[n - 1] = !ticked[n - 1], _ => println!("  ? {tok}") }
             }
         }
         let on: Vec<String> = ticked.iter().enumerate().filter(|(_, t)| **t).map(|(i, _)| (i + 1).to_string()).collect();
         println!("  ticked: {}", if on.is_empty() { "none".into() } else { on.join(" ") });
     }
+    // Explicit confirmation, with the rows named: a stray Enter must not import anything.
+    let chosen: Vec<usize> = (0..ticked.len()).filter(|&i| ticked[i]).collect();
+    if chosen.is_empty() { println!("nothing ticked; nothing imported"); return Ok(0); }
+    println!("\nabout to import {} key(s):", chosen.len());
+    for &i in &chosen {
+        let identity = tokenstash_core::envcrawl::identity_among(&c.candidates, i, &a.identity, |j| ticked[j]);
+        println!("  {}@{}{}", c.candidates[i].name, identity, if differs[i] { "  (REPLACES the value in the stash)" } else { "" });
+    }
+    print!("proceed? [y/N] ");
+    { use std::io::Write; std::io::stdout().flush()?; }
+    let mut ans = String::new();
+    std::io::stdin().read_line(&mut ans)?;
+    if !ans.trim().eq_ignore_ascii_case("y") { println!("nothing imported"); return Ok(0); }
     let mut n = 0;
-    let mut names = vec![];
-    for (i, cand) in c.candidates.iter().enumerate() {
-        if !ticked[i] { continue; }
-        let identity = tokenstash_core::envcrawl::identity_for(&c.candidates, i, &a.identity);
+    let mut pairs = vec![];
+    for &i in &chosen {
+        let cand = &c.candidates[i];
+        let identity = tokenstash_core::envcrawl::identity_among(&c.candidates, i, &a.identity, |j| ticked[j]);
+        if differs[i] {
+            // replacing a stash value is a per-key decision, and never a silent one
+            let local = app.db.get_secret(&cand.name, &identity)?;
+            if local.as_ref().map(|m| m.stale && m.stale_reason.as_deref().unwrap_or("").starts_with(tokenstash_core::db::Db::ROTATE_REASON)).unwrap_or(false) {
+                println!("  {}@{}: skipped — you asked to rotate this key; paste the NEW one via `tokenstash rotate`, not an old env file", cand.name, identity);
+                continue;
+            }
+            print!("  {}@{} differs from the stash (stored {}); replace it with the value from {}? [y/N] ", cand.name, identity, local.map(|m| m.created).unwrap_or_default(), short(&cand.sources[0]));
+            { use std::io::Write; std::io::stdout().flush()?; }
+            let mut ans = String::new();
+            std::io::stdin().read_line(&mut ans)?;
+            if !ans.trim().eq_ignore_ascii_case("y") { println!("  kept the stash value"); continue; }
+        }
         let e = Entry { name: cand.name.clone(), identity: identity.clone(), value: cand.value.expose_secret().to_string(), provider: cand.provider.clone(), sensitive: cand.sensitive, source_url: None, created: tokenstash_core::now(), last_used: None, stale: false, stale_reason: None };
         bundle::validate_entry(&e)?;
-        apply_entry(&app, &e, &format!("from env files under {}", short(&root)))?;
+        apply_entry(&app, &e, &format!("from {}", display_path(&cand.sources[0])))?;
         n += 1;
-        names.push(cand.name.clone());
+        pairs.push((cand.name.clone(), identity));
     }
     println!("✓ {n} imported. From now on any project under your trust roots gets these silently.");
-    if !a.no_verify && !names.is_empty() {
+    if !a.no_verify && !pairs.is_empty() {
         println!("verifying against providers (--no-verify to skip)…");
-        crate::cmd::admin::sweep(&app, &names, false, true)?;
+        crate::cmd::admin::sweep_pairs(&app, &pairs, true)?;
     }
     Ok(0)
 }
