@@ -354,7 +354,8 @@ pub fn from_env(a: FromEnvArgs) -> Result<i32> {
     println!("\nabout to import {} key(s):", chosen.len());
     for &i in &chosen {
         let identity = tokenstash_core::envcrawl::identity_among(&c.candidates, i, &a.identity, |j| ticked[j]);
-        println!("  {}@{}{}", c.candidates[i].name, identity, if differs[i] { "  (REPLACES the value in the stash)" } else { "" });
+        let replaces = app.stash.get(&stash_key(&c.candidates[i].name, &identity))?.map(|v| v.expose_secret() != c.candidates[i].value.expose_secret()).unwrap_or(false);
+        println!("  {}@{}{}", c.candidates[i].name, identity, if replaces { "  (REPLACES the value in the stash — you will be asked)" } else { "" });
     }
     print!("proceed? [y/N] ");
     { use std::io::Write; std::io::stdout().flush()?; }
@@ -366,7 +367,15 @@ pub fn from_env(a: FromEnvArgs) -> Result<i32> {
     for &i in &chosen {
         let cand = &c.candidates[i];
         let identity = tokenstash_core::envcrawl::identity_among(&c.candidates, i, &a.identity, |j| ticked[j]);
-        if differs[i] {
+        // The identity is final only now (numbered over the ticked set), so the "does this
+        // replace something" question is asked against THAT identity, not the preview's.
+        let existing = app.stash.get(&stash_key(&cand.name, &identity))?;
+        let replaces = existing.as_ref().map(|v| v.expose_secret() != cand.value.expose_secret()).unwrap_or(false);
+        if existing.as_ref().map(|v| v.expose_secret() == cand.value.expose_secret()).unwrap_or(false) {
+            println!("  {}@{}: already in the stash", cand.name, identity);
+            continue;
+        }
+        if replaces {
             // replacing a stash value is a per-key decision, and never a silent one
             let local = app.db.get_secret(&cand.name, &identity)?;
             if local.as_ref().map(|m| m.stale && m.stale_reason.as_deref().unwrap_or("").starts_with(tokenstash_core::db::Db::ROTATE_REASON)).unwrap_or(false) {
