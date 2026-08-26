@@ -82,10 +82,13 @@ pub fn need(a: NeedArgs) -> Result<i32> {
     } else {
         for o in &outcomes {
             match o {
-                Outcome::Injected { name, written_to, generated, .. } => {
+                Outcome::Injected { name, written_to, generated, unverified, .. } => {
                     let p = std::path::Path::new(written_to);
                     let rel = p.strip_prefix(&project).map(|r| r.display().to_string()).unwrap_or(written_to.clone());
                     println!("✓ {name} {} → {rel}", if *generated { "generated and injected" } else { "injected" });
+                    if *unverified {
+                        eprintln!("  {name}: provider unreachable, delivered without re-checking it");
+                    }
                 }
                 Outcome::Pending { name, task_id, .. } => {
                     println!("⏳ {name} pending — task {task_id} → {}", util::inbox_url_agent(&app.cfg, Some(task_id), state));

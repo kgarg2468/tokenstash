@@ -17,6 +17,46 @@ pub struct Ctx<'a> {
     pub cfg: &'a Config,
     pub db: &'a Db,
     pub stash: &'a dyn Stash,
+    /// How a liveness probe reaches the provider. `Network` in the binary; tests must use
+    /// `Off` or `Stub` — a unit test that sends a canary to api.openai.com is a bug.
+    pub probe: Probe<'a>,
+}
+
+/// The one seam between tokenstash and the provider's HTTP endpoint.
+#[derive(Clone, Copy)]
+pub enum Probe<'a> {
+    Network,
+    /// No probe ever runs (tests, or callers that must stay offline).
+    Off,
+    /// A canned verdict (tests). Receives the check so a test can assert which one ran.
+    Stub(&'a dyn Fn(&crate::registry::Check) -> Liveness),
+}
+
+impl Probe<'_> {
+    /// `None` when probing is off. Never logs the value.
+    pub fn run(&self, check: &crate::registry::Check, value: &SecretString, timeout: std::time::Duration) -> Option<Liveness> {
+        let _ = (value, timeout);
+        match self {
+            #[cfg(test)]
+            Probe::Network => panic!("unit tests must not probe the network: use Probe::Off or Probe::Stub"),
+            #[cfg(not(test))]
+            Probe::Network => Some(validate::liveness(check, value, timeout)),
+            Probe::Off => None,
+            Probe::Stub(f) => Some(f(check)),
+        }
+    }
+}
+
+/// What the human-side store knows about the value it is storing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verified {
+    /// The provider accepted it just now.
+    Ok,
+    /// No probe exists, or it could not be reached: unknown, verify-on-use stays on.
+    Unknown,
+    /// The human chose to skip the check: verify-on-use is off for this key until a probe
+    /// says Ok, so a probe that would keep rejecting cannot keep filing cards.
+    Skipped,
 }
 
 pub fn new_id(prefix: &str) -> String {
@@ -235,11 +275,12 @@ pub fn answer_secret(ctx: &Ctx, task: &Task, value: SecretString, skip_liveness:
     let mut liveness = None;
     if !skip_liveness {
         if let Some(check) = provider.and_then(|p| p.check.as_ref()) {
-            let l = validate::liveness(check, &value);
-            if let Liveness::Rejected(code) = l {
-                bail!("{} rejected this key (HTTP {code}). Not stored. Re-run with --skip-check to store anyway.", provider.map(|p| p.provider.as_str()).unwrap_or("provider"));
+            if let Some(l) = ctx.probe.run(check, &value, validate::TIMEOUT_HUMAN) {
+                if let Liveness::Rejected(code) = l {
+                    bail!("{} rejected this key (HTTP {code}). Not stored. Re-run with --skip-check to store anyway.", provider.map(|p| p.provider.as_str()).unwrap_or("provider"));
+                }
+                liveness = Some(l);
             }
-            liveness = Some(l);
         }
     }
     let sensitive = provider.map(|p| p.sensitive).unwrap_or(false)
@@ -254,7 +295,7 @@ pub fn answer_secret(ctx: &Ctx, task: &Task, value: SecretString, skip_liveness:
     let injected_to = store_and_inject(
         ctx, &name, &task.identity, &value, provider.map(|p| p.provider.clone()), task.url.clone(), sensitive,
         Path::new(&task.project), &task.agent, Some(&task.id),
-        matches!(liveness, Some(Liveness::Ok)),
+        match liveness { Some(Liveness::Ok) => Verified::Ok, _ if skip_liveness => Verified::Skipped, _ => Verified::Unknown },
     )?;
     // A replacement card's answer reaches every project that was ever given this key and
     // does not already hold the new value — whichever old value it holds (the stash may
@@ -282,7 +323,7 @@ pub fn store_and_inject(
     project: &Path,
     agent: &str,
     answering_task: Option<&str>,
-    verified: bool,
+    verified: Verified,
 ) -> Result<Option<PathBuf>> {
     ctx.stash.set(&stash_key(name, identity), value)?;
     let pid = project.to_string_lossy().to_string();
@@ -296,8 +337,11 @@ pub fn store_and_inject(
         created: crate::now(),
         last_used: Some(crate::now()),
         stale: false,
-        last_verified: if verified { Some(crate::now()) } else { None },
+        last_verified: if verified == Verified::Ok { Some(crate::now()) } else { None },
         stale_reason: None,
+        stale_source: None,
+        next_probe: None,
+        verify_off: verified == Verified::Skipped,
     })?;
     ctx.db.audit(Some(&pid), Some(agent), "store", Some(name), Some(identity), None)?;
     // The human just handled this key for this project: that is the approval.
@@ -350,6 +394,7 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, allow: bool) -> Result<AnswerResu
     //    entries are attempted; the approval itself is already recorded.
     let mut injected = vec![];
     let mut failures = vec![];
+    let mut budget = crate::need::ProbeBudget::default();
     for entry in &task.names {
         if entry == "*" {
             continue;
@@ -357,11 +402,16 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, allow: bool) -> Result<AnswerResu
         let (n, identity) = split_identity(entry);
         if let Some(v) = ctx.stash.get(&stash_key(n, identity))? {
             if project.is_dir() {
-                match crate::envfile::write(project, &ctx.cfg.env_file, n, &v) {
-                    Ok(_) => {
-                        ctx.db.touch_secret(n, identity)?;
-                        ctx.db.audit(Some(&pid), Some(&task.agent), "inject", Some(n), Some(identity), Some("after-approval"))?;
-                        injected.push(n.to_string());
+                // The approval is the authorization; delivery still verifies on use. A key
+                // the provider rejects becomes a Replace card for this project instead of
+                // a dead value in its env file.
+                match crate::need::deliver(ctx, project, &task.agent, n, identity, &v, Some("after-approval"), &mut budget) {
+                    Ok(crate::need::Delivery::Injected { .. }) => injected.push(n.to_string()),
+                    Ok(crate::need::Delivery::Rejected { reason }) => {
+                        let why = format!("Replace {n}: {reason}. The new value is written to {}.", project.join(&ctx.cfg.env_file).display());
+                        let req = SecretRequest { why: Some(why), ..Default::default() };
+                        create_replacement_task(ctx, project, &task.agent, n, identity, &req)?;
+                        failures.push(format!("{n}: {reason} — a replacement card has been filed"));
                     }
                     Err(e) => failures.push(format!("{n}: {e:#}")),
                 }
@@ -460,7 +510,7 @@ pub fn rotate(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &str
     if ctx.db.get_secret(name, identity)?.is_none() {
         bail!("{name}@{identity} is not in the stash; use `tokenstash need {name}` to add it");
     }
-    ctx.db.mark_stale(name, identity, true, Some(crate::db::Db::ROTATE_REASON))?;
+    ctx.db.mark_stale(name, identity, true, Some(crate::db::Db::ROTATE_REASON), Some(crate::db::STALE_ROTATE))?;
     ctx.db.audit(Some(&pid), Some(agent), "rotate", Some(name), Some(identity), None)?;
     let req = SecretRequest { why: Some(format!("Replace {name}: {}. Paste the new key first, then revoke the old one in the dashboard.", crate::db::Db::ROTATE_REASON)), ..Default::default() };
     create_replacement_task(ctx, project, agent, name, identity, &req)
@@ -512,7 +562,7 @@ pub fn report_bad(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: 
     let value = ctx.stash.get(&stash_key(name, identity))?;
     let has_check = provider.and_then(|p| p.check.as_ref()).is_some();
     let verdict = match (provider.and_then(|p| p.check.as_ref()), value.as_ref()) {
-        (Some(check), Some(v)) => Some(validate::liveness(check, v)),
+        (Some(check), Some(v)) => ctx.probe.run(check, v, validate::TIMEOUT_HUMAN),
         _ => None,
     };
     let date = crate::now();
@@ -524,7 +574,7 @@ pub fn report_bad(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: 
         }
         Some(Liveness::Rejected(code)) => {
             let reason = format!("rejected by {} (HTTP {code}) on {date}, reported by {agent} in {}", provider.map(|p| p.provider.as_str()).unwrap_or("the provider"), crate::project::short(project));
-            ctx.db.mark_stale(name, identity, true, Some(&reason))?;
+            ctx.db.mark_stale(name, identity, true, Some(&reason), Some(crate::db::STALE_REPORT))?;
             ctx.db.audit(Some(&pid), Some(agent), "report", Some(name), Some(identity), Some(&detail))?;
             Ok(ReportOutcome::MarkedStale)
         }
@@ -538,7 +588,7 @@ pub fn report_bad(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: 
         // who made it and that it is unverified.
         None if !has_check => {
             let reason = format!("reported rejected ({detail}) on {date} by {agent} in {} — unverified (no liveness check for this provider)", crate::project::short(project));
-            ctx.db.mark_stale(name, identity, true, Some(&reason))?;
+            ctx.db.mark_stale(name, identity, true, Some(&reason), Some(crate::db::STALE_REPORT))?;
             ctx.db.audit(Some(&pid), Some(agent), "report", Some(name), Some(identity), Some(&detail))?;
             Ok(ReportOutcome::MarkedStale)
         }

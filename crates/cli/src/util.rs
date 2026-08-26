@@ -19,7 +19,7 @@ impl App {
         Ok(Self { cfg, db, stash })
     }
     pub fn ctx(&self) -> Ctx<'_> {
-        Ctx { cfg: &self.cfg, db: &self.db, stash: self.stash.as_ref() }
+        Ctx { cfg: &self.cfg, db: &self.db, stash: self.stash.as_ref(), probe: tokenstash_core::tasks::Probe::Network }
     }
 }
 

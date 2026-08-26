@@ -340,6 +340,7 @@ pub fn init(a: InitArgs) -> Result<i32> {
     }
 
     if fresh {
+        println!("\nKeys are re-checked with their provider before an agent gets them (once a day, one free read-only request, verify_every in config.toml) so a revoked key becomes a Replace card instead of a 401.");
         println!("\nNext: from any project, run   tokenstash need OPENAI_API_KEY");
     }
     Ok(0)
