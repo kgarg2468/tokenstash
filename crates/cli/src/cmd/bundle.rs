@@ -362,11 +362,28 @@ pub fn from_env(a: FromEnvArgs) -> Result<i32> {
     let mut ans = String::new();
     std::io::stdin().read_line(&mut ans)?;
     if !ans.trim().eq_ignore_ascii_case("y") { println!("nothing imported"); return Ok(0); }
-    let mut n = 0;
-    let mut pairs = vec![];
+    // Validate every chosen row before anything is written: one bad row must not leave the
+    // earlier ones stored. Shape-mismatch rows are dropped here with a message, exactly as
+    // a paste would refuse them.
+    let mut prepared: Vec<(usize, Entry)> = vec![];
     for &i in &chosen {
         let cand = &c.candidates[i];
         let identity = tokenstash_core::envcrawl::identity_among(&c.candidates, i, &a.identity, |j| ticked[j]);
+        let e = Entry { name: cand.name.clone(), identity: identity.clone(), value: cand.value.expose_secret().to_string(), provider: cand.provider.clone(), sensitive: cand.sensitive, source_url: None, created: tokenstash_core::now(), last_used: None, stale: false, stale_reason: None };
+        bundle::validate_entry(&e).with_context(|| format!("row {} ({}@{})", i + 1, cand.name, identity))?;
+        if let Some(pat) = tokenstash_core::registry::lookup(&e.name).and_then(|p| p.pattern.as_ref()) {
+            if !tokenstash_core::validate::matches_pattern(pat, &cand.value)? {
+                println!("  {}@{}: skipped — the value does not look like a {} key (a paste would be refused too)", e.name, identity, cand.provider.clone().unwrap_or_default());
+                continue;
+            }
+        }
+        prepared.push((i, e));
+    }
+    let mut n = 0;
+    let mut pairs = vec![];
+    for (i, e) in prepared {
+        let cand = &c.candidates[i];
+        let identity = e.identity.clone();
         // The identity is final only now (numbered over the ticked set), so the "does this
         // replace something" question is asked against THAT identity, not the preview's.
         let existing = app.stash.get(&stash_key(&cand.name, &identity))?;
@@ -387,16 +404,6 @@ pub fn from_env(a: FromEnvArgs) -> Result<i32> {
             let mut ans = String::new();
             std::io::stdin().read_line(&mut ans)?;
             if !ans.trim().eq_ignore_ascii_case("y") { println!("  kept the stash value"); continue; }
-        }
-        let e = Entry { name: cand.name.clone(), identity: identity.clone(), value: cand.value.expose_secret().to_string(), provider: cand.provider.clone(), sensitive: cand.sensitive, source_url: None, created: tokenstash_core::now(), last_used: None, stale: false, stale_reason: None };
-        bundle::validate_entry(&e)?;
-        // What a paste would reject, the crawl rejects: a ticked row whose value does not
-        // match the provider's documented shape is skipped, not stored.
-        if let Some(pat) = tokenstash_core::registry::lookup(&e.name).and_then(|p| p.pattern.as_ref()) {
-            if !tokenstash_core::validate::matches_pattern(pat, &cand.value)? {
-                println!("  {}@{}: skipped — the value does not look like a {} key (a paste would be refused too)", e.name, identity, cand.provider.clone().unwrap_or_default());
-                continue;
-            }
         }
         apply_entry(&app, &e, &format!("from {}", display_path(&cand.sources[0])))?;
         n += 1;
