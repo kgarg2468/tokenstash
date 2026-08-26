@@ -138,25 +138,35 @@ pub fn parse_line(line: &str) -> Option<(String, String)> {
     }
     let (k, v) = line.split_once('=')?;
     let v = v.trim();
-    let val = if let Some(inner) = v.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+    // A quoted value ends at its closing quote; whatever follows (a trailing comment) is
+    // ignored. An unquoted value ends at a `#` that follows whitespace — a `#` inside a
+    // token (a password in a URL) is part of the value, as dotenv reads it.
+    let val = if let Some(inner) = v.strip_prefix('"') {
         let mut out = String::new();
         let mut chars = inner.chars();
+        let mut closed = false;
         while let Some(c) = chars.next() {
-            if c == '\\' {
-                match chars.next() {
+            match c {
+                '\\' => match chars.next() {
                     Some('n') => out.push('\n'),
                     Some(o) => out.push(o),
                     None => out.push('\\'),
-                }
-            } else {
-                out.push(c);
+                },
+                '"' => { closed = true; break; }
+                _ => out.push(c),
             }
         }
+        if !closed { return None; } // an unterminated (multi-line) value is not one line's worth
         out
-    } else if let Some(inner) = v.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
-        inner.to_string()
+    } else if let Some(inner) = v.strip_prefix('\'') {
+        let end = inner.find('\'')?;
+        inner[..end].to_string()
     } else {
-        v.split('#').next().unwrap_or("").trim().to_string()
+        let mut end = v.len();
+        for (i, c) in v.char_indices() {
+            if c == '#' && (i == 0 || v[..i].ends_with(|w: char| w.is_whitespace())) { end = i; break; }
+        }
+        v[..end].trim().to_string()
     };
     Some((k.trim().to_string(), val))
 }
