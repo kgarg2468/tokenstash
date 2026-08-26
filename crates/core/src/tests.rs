@@ -1064,3 +1064,39 @@ fn rotation_never_rewrites_a_project_without_a_standing_grant_and_ordinary_paste
     assert!(std::fs::read_to_string(proj_c.join(".env.local")).unwrap().contains("other-aaaa"), "C keeps its own value");
     std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
 }
+
+
+#[test]
+fn an_ordinary_card_answered_after_a_stale_mark_elsewhere_does_not_propagate() {
+    let _g = env_lock();
+    let (home, proj_a) = rot_ctx_home("ordinary-vs-stale");
+    let proj_b = tmp("ordinary-vs-stale-b").canonicalize().unwrap();
+    let cfg = Config { trust_roots: vec![proj_a.clone(), proj_b.clone()], ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    // A stores and B receives the key
+    let t = tasks::create_secret_task(&ctx, &proj_a, "test", "GROQ_API_KEY", "default", &Default::default()).unwrap();
+    tasks::answer_secret(&ctx, &t, SecretString::from("gsk_old_aaaaaaaaaaaaaaaa".to_string()), true).unwrap();
+    need::need(&ctx, &proj_b, "test", &["GROQ_API_KEY".to_string()], &Default::default()).unwrap();
+    // an ORDINARY card is filed in a third project (say the key was forgotten there and re-requested by hand)
+    let proj_c = tmp("ordinary-vs-stale-c").canonicalize().unwrap();
+    let ordinary = tasks::create_secret_task(&ctx, &proj_c, "test", "GROQ_API_KEY", "default", &Default::default()).unwrap();
+    assert_ne!(ordinary.expects, tasks::EXPECTS_REPLACE);
+    // meanwhile the key is marked stale by a report elsewhere
+    db.mark_stale("GROQ_API_KEY", "default", true, Some("reported ...")).unwrap();
+    // answering the ordinary card must not rewrite A and B
+    let r = tasks::answer_secret(&ctx, &ordinary, SecretString::from("gsk_new_cccccccccccccccc".to_string()), true).unwrap();
+    let tasks::AnswerResult::Stored { rotation, .. } = r else { panic!() };
+    assert!(rotation.is_none());
+    assert!(std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("gsk_old_"), "B untouched by an ordinary answer");
+    // a REPLACEMENT card (the stale-miss branch) does propagate
+    db.mark_stale("GROQ_API_KEY", "default", true, Some("reported ...")).unwrap();
+    let out = need::need(&ctx, &proj_a, "test", &["GROQ_API_KEY".to_string()], &Default::default()).unwrap();
+    let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
+    let card = db.get_task(&tid).unwrap().unwrap();
+    assert_eq!(card.expects, tasks::EXPECTS_REPLACE);
+    tasks::answer_secret(&ctx, &card, SecretString::from("gsk_new_dddddddddddddddd".to_string()), true).unwrap();
+    assert!(std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("gsk_new_cccc") || std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("gsk_old_"), "B held the OLD value at the time of the ordinary answer; the replacement compares against the value it replaces");
+    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+}

@@ -136,7 +136,7 @@ pub fn need(ctx: &Ctx, project: &Path, agent: &str, names: &[String], opts: &Nee
                     // a false positive); the card says why, so the human can judge the report.
                     let why = format!("Replace {name}: {}. The new value is written to {}.", m.stale_reason.clone().unwrap_or_else(|| "the stored key was marked stale".into()), project.join(&ctx.cfg.env_file).display());
                     let req = SecretRequest { why: Some(why), ..opts.req.clone() };
-                    let t = tasks::create_secret_task(ctx, project, agent, name, &identity, &req)?;
+                    let t = tasks::create_replacement_task(ctx, project, agent, name, &identity, &req)?;
                     outcomes.push(Outcome::Pending { name: name.clone(), identity: identity.clone(), task_id: t.id, title: t.title, url: t.url });
                 }
                 Gate::Open => {

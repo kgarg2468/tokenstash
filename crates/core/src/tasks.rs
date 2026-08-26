@@ -39,8 +39,23 @@ pub struct SecretRequest {
 
 /// Create (or reuse the open) secret task for `name` in `project`. Registry fills in gaps.
 pub fn create_secret_task(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &str, req: &SecretRequest) -> Result<Task> {
+    create_secret_task_kind(ctx, project, agent, name, identity, req, "secret")
+}
+
+/// A replacement card for a stale key: same shape, marked so its answer propagates.
+pub fn create_replacement_task(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &str, req: &SecretRequest) -> Result<Task> {
+    create_secret_task_kind(ctx, project, agent, name, identity, req, EXPECTS_REPLACE)
+}
+
+fn create_secret_task_kind(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &str, req: &SecretRequest, expects: &str) -> Result<Task> {
     let pid = project.to_string_lossy().to_string();
     if let Some(t) = ctx.db.open_secret_task(&pid, name, identity)? {
+        // An ordinary card reused for a replacement must carry the marker, or its answer
+        // would not propagate; the reverse never downgrades.
+        if expects == EXPECTS_REPLACE && t.expects != EXPECTS_REPLACE {
+            ctx.db.set_task_expects(&t.id, EXPECTS_REPLACE)?;
+            return Ok(Task { expects: EXPECTS_REPLACE.into(), ..t });
+        }
         return Ok(t);
     }
     let p = registry::lookup(name);
@@ -59,7 +74,7 @@ pub fn create_secret_task(ctx: &Ctx, project: &Path, agent: &str, name: &str, id
         why: req.why.clone(),
         url: req.url.clone().or_else(|| p.map(|p| p.url.clone())),
         steps: if !req.steps.is_empty() { req.steps.clone() } else { p.map(|p| p.steps.clone()).unwrap_or_default() },
-        expects: "secret".into(),
+        expects: expects.into(),
         pattern: req.pattern.clone().or_else(|| p.and_then(|p| p.pattern.clone())),
         names: vec![],
         status: TaskStatus::Pending,
@@ -91,6 +106,11 @@ pub fn create_approval_task(ctx: &Ctx, project: &Path, agent: &str, names: &[Str
 /// `merge=false` always files a fresh task: used for program-derived requests, where each
 /// invocation must be authorized on its own and must not piggyback on (or be granted by)
 /// another invocation's pending approval.
+/// Marker in `expects` for a secret task that REPLACES a stale value (a rotation or a
+/// reported-dead key). Only answers to such cards propagate to other projects; an ordinary
+/// paste card answered later, even if the key has since gone stale elsewhere, does not.
+pub const EXPECTS_REPLACE: &str = "replace";
+
 /// Marker in `expects` for an approval that must not become a standing grant: a program's
 /// own output chose the key (`run` shim), so the human authorises THIS injection only.
 pub const APPROVAL_ONCE: &str = "once";
@@ -230,8 +250,8 @@ pub fn answer_secret(ctx: &Ctx, task: &Task, value: SecretString, skip_liveness:
     // Rotation: when a STALE key is being replaced, remember the value so every other project
     // still holding it can be rewritten below. An ordinary paste that happens to differ from
     // a stored value (two projects with their own pending cards) is not a rotation.
-    let was_stale = ctx.db.get_secret(&name, &task.identity)?.map(|m| m.stale).unwrap_or(false);
-    let previous = if was_stale { ctx.stash.get(&stash_key(&name, &task.identity))? } else { None };
+    let is_replacement = task.expects == EXPECTS_REPLACE;
+    let previous = if is_replacement { ctx.stash.get(&stash_key(&name, &task.identity))? } else { None };
     let injected_to = store_and_inject(
         ctx, &name, &task.identity, &value, provider.map(|p| p.provider.clone()), task.url.clone(), sensitive,
         Path::new(&task.project), &task.agent, Some(&task.id),
@@ -445,7 +465,7 @@ pub fn rotate(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &str
     ctx.db.mark_stale(name, identity, true, Some(crate::db::Db::ROTATE_REASON))?;
     ctx.db.audit(Some(&pid), Some(agent), "rotate", Some(name), Some(identity), None)?;
     let req = SecretRequest { why: Some(format!("Replace {name}: {}. Paste the new key first, then revoke the old one in the dashboard.", crate::db::Db::ROTATE_REASON)), ..Default::default() };
-    create_secret_task(ctx, project, agent, name, identity, &req)
+    create_replacement_task(ctx, project, agent, name, identity, &req)
 }
 
 /// What a report changed. Never returned to the agent (see `report_bad`); for tests and

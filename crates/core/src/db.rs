@@ -444,6 +444,11 @@ impl Db {
         Ok(())
     }
 
+    pub fn set_task_expects(&self, id: &str, expects: &str) -> Result<()> {
+        self.conn.execute("UPDATE tasks SET expects=?2 WHERE id=?1", params![id, expects])?;
+        Ok(())
+    }
+
     pub fn update_task_names(&self, id: &str, names: &[String]) -> Result<()> {
         self.conn.execute(
             "UPDATE tasks SET names=?2 WHERE id=?1",
