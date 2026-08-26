@@ -211,6 +211,7 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
                     // the stored key at delivery and a Replace card was filed instead. Point
                     // the agent at that card, or "answered" reads as "injected".
                     let mut replacements = vec![];
+                    let mut in_flight = vec![];
                     if t.kind == tokenstash_core::db::TaskKind::Approval && t.status == tokenstash_core::db::TaskStatus::Answered {
                         for entry in &t.names {
                             if entry == "*" { continue; }
@@ -218,7 +219,14 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
                             if let Some(rt) = app.db.open_secret_task(&pid, n, identity)? {
                                 if rt.expects == tokenstash_core::tasks::EXPECTS_REPLACE {
                                     replacements.push(json!({ "name": n, "task_id": rt.id, "url": util::inbox_url_agent(&app.cfg, Some(&rt.id), crate::notify::inbox_state(&app.cfg)) }));
+                                    continue;
                                 }
+                            }
+                            // The approval is committed before delivery runs; between the two
+                            // there is neither a value in the env file nor a Replace card.
+                            // Say so rather than let "answered" read as "injected".
+                            if !tokenstash_core::envfile::has(&project, &app.cfg.env_file, n) {
+                                in_flight.push(n.to_string());
                             }
                         }
                     }
@@ -226,6 +234,9 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
                     if !replacements.is_empty() {
                         out["replacements"] = json!(replacements);
                         out["note"] = json!("approved, but the provider rejected the stored key at delivery; nothing was written. Poll the Replace task(s) listed in `replacements` instead.");
+                    } else if !in_flight.is_empty() {
+                        out["pending_delivery"] = json!(in_flight);
+                        out["note"] = json!("approved; delivery is still running for the names in `pending_delivery`. Check again before using them.");
                     }
                     Ok((out, false))
                 }
