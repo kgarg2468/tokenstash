@@ -934,22 +934,95 @@ fn report_bad_needs_standing_and_is_rate_limited() {
     let t = tasks::create_secret_task(&ctx, &proj, "test", "MY_CUSTOM_TOKEN", "default", &Default::default()).unwrap();
     tasks::answer_secret(&ctx, &t, SecretString::from("custom-aaaaaaaaaaaaaaaa".to_string()), true).unwrap();
     // a project that never received the key has no standing
-    assert_eq!(tasks::report_bad(&ctx, &stranger, "evil", "MY_CUSTOM_TOKEN", "default", Some(401), None).unwrap(), tasks::ReportOutcome::Ignored);
+    assert_eq!(tasks::report_bad(&ctx, &stranger, "evil", "MY_CUSTOM_TOKEN", "default", Some(401)).unwrap(), tasks::ReportOutcome::Ignored);
     assert!(!db.get_secret("MY_CUSTOM_TOKEN", "default").unwrap().unwrap().stale);
     // an unknown name is indistinguishable from an ignored one
-    assert_eq!(tasks::report_bad(&ctx, &proj, "test", "NOT_A_KEY", "default", Some(401), None).unwrap(), tasks::ReportOutcome::Ignored);
+    assert_eq!(tasks::report_bad(&ctx, &proj, "test", "NOT_A_KEY", "default", Some(401)).unwrap(), tasks::ReportOutcome::Ignored);
     // the delivering project can report; the message is scrubbed of the value
-    let r = tasks::report_bad(&ctx, &proj, "test", "MY_CUSTOM_TOKEN", "default", Some(401), Some("invalid key custom-aaaaaaaaaaaaaaaa rejected")).unwrap();
+    let r = tasks::report_bad(&ctx, &proj, "test", "MY_CUSTOM_TOKEN", "default", Some(401)).unwrap();
     assert_eq!(r, tasks::ReportOutcome::MarkedStale);
     let m = db.get_secret("MY_CUSTOM_TOKEN", "default").unwrap().unwrap();
     assert!(m.stale);
     assert!(m.stale_reason.as_deref().unwrap().contains("by test in"), "{:?}", m.stale_reason);
     let audit = db.recent_audit(5).unwrap();
     assert!(audit.iter().any(|a| a.3 == "report"));
-    assert!(!audit.iter().any(|a| a.6.as_deref().unwrap_or("").contains("custom-aaaaaaaaaaaaaaaa")), "the value must be scrubbed from the audit detail");
+    assert!(audit.iter().all(|a| !a.6.as_deref().unwrap_or("").contains("custom-")), "only the status is persisted, never provider text");
     // a second report inside the TTL is ignored (cooldown)
     db.mark_stale("MY_CUSTOM_TOKEN", "default", false, None).unwrap();
-    assert_eq!(tasks::report_bad(&ctx, &proj, "test", "MY_CUSTOM_TOKEN", "default", Some(401), None).unwrap(), tasks::ReportOutcome::Ignored);
+    assert_eq!(tasks::report_bad(&ctx, &proj, "test", "MY_CUSTOM_TOKEN", "default", Some(401)).unwrap(), tasks::ReportOutcome::Ignored);
     assert!(!db.get_secret("MY_CUSTOM_TOKEN", "default").unwrap().unwrap().stale);
+    // ...but a report about a NEWLY stored value is not shadowed by the old cooldown
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let t2 = tasks::create_secret_task(&ctx, &proj, "test", "MY_CUSTOM_TOKEN", "default", &Default::default()).unwrap();
+    tasks::answer_secret(&ctx, &t2, SecretString::from("custom-bbbbbbbbbbbbbbbb".to_string()), true).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    assert_eq!(tasks::report_bad(&ctx, &proj, "test", "MY_CUSTOM_TOKEN", "default", Some(401)).unwrap(), tasks::ReportOutcome::MarkedStale, "cooldown must reset when the value changes");
+    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+
+#[test]
+fn a_probe_ok_never_cancels_a_human_rotation() {
+    let dir = tmp("rotate-vs-verify");
+    let db = Db::open(&dir.join("t.db")).unwrap();
+    db.upsert_secret(&db::SecretMeta { name: "K".into(), identity: "default".into(), provider: None, sensitive: false, source_url: None, created: now(), last_used: None, stale: false, last_verified: None, stale_reason: None }).unwrap();
+    db.mark_stale("K", "default", true, Some(Db::ROTATE_REASON)).unwrap();
+    db.set_verified("K", "default").unwrap();
+    let m = db.get_secret("K", "default").unwrap().unwrap();
+    assert!(m.stale, "a human rotation survives a probe saying the old key is still live");
+    assert!(m.last_verified.is_some());
+    // a report-driven stale IS cleared by a probe Ok
+    db.mark_stale("K", "default", true, Some("rejected by X (HTTP 401) ...")).unwrap();
+    db.set_verified("K", "default").unwrap();
+    assert!(!db.get_secret("K", "default").unwrap().unwrap().stale);
+}
+
+#[test]
+fn a_stale_key_still_goes_through_the_trust_gate_and_generated_names_regenerate() {
+    let _g = env_lock();
+    let (home, proj) = rot_ctx_home("stale-gate");
+    let outside = tmp("stale-gate-outside").canonicalize().unwrap();
+    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let t = tasks::create_secret_task(&ctx, &proj, "test", "OPENAI_API_KEY", "default", &Default::default()).unwrap();
+    tasks::answer_secret(&ctx, &t, SecretString::from("sk-old-aaaaaaaaaaaaaaaa".to_string()), true).unwrap();
+    db.mark_stale("OPENAI_API_KEY", "default", true, Some("rejected ...")).unwrap();
+    // outside the trust roots: an APPROVAL card, not a paste card into the stranger's file
+    let out = need::need(&ctx, &outside, "test", &["OPENAI_API_KEY".to_string()], &Default::default()).unwrap();
+    let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
+    assert_eq!(db.get_task(&tid).unwrap().unwrap().kind, db::TaskKind::Approval);
+    assert!(!outside.join(".env.local").exists());
+    // generated secrets never become paste cards: a stale AUTH_SECRET regenerates
+    need::need(&ctx, &proj, "test", &["AUTH_SECRET".to_string()], &Default::default()).unwrap();
+    db.mark_stale("AUTH_SECRET", "default", true, Some("reported ...")).unwrap();
+    let out = need::need(&ctx, &proj, "test", &["AUTH_SECRET".to_string()], &Default::default()).unwrap();
+    assert!(matches!(&out[0], need::Outcome::Injected { generated: true, .. }), "{:?}", out[0]);
+    assert!(!db.get_secret("AUTH_SECRET", "default").unwrap().unwrap().stale);
+    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+#[test]
+fn rotation_reports_projects_it_could_not_rewrite() {
+    let _g = env_lock();
+    let (home, proj_a) = rot_ctx_home("rotate-skip");
+    let proj_b = tmp("rotate-skip-b").canonicalize().unwrap();
+    let cfg = Config { trust_roots: vec![proj_a.clone(), proj_b.clone()], ..Default::default() };
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref() };
+    let t = tasks::create_secret_task(&ctx, &proj_a, "test", "GROQ_API_KEY", "default", &Default::default()).unwrap();
+    tasks::answer_secret(&ctx, &t, SecretString::from("gsk_old_aaaaaaaaaaaaaaaa".to_string()), true).unwrap();
+    need::need(&ctx, &proj_b, "test", &["GROQ_API_KEY".to_string()], &Default::default()).unwrap();
+    // B commits its env file (the classic mistake) → the rewrite must refuse and say so
+    let git = |args: &[&str]| { std::process::Command::new("git").arg("-C").arg(&proj_b).args(args).env("GIT_AUTHOR_NAME","t").env("GIT_AUTHOR_EMAIL","t@t").env("GIT_COMMITTER_NAME","t").env("GIT_COMMITTER_EMAIL","t@t").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap(); };
+    git(&["init", "-q", "."]); git(&["add", "-f", ".env.local"]); git(&["commit", "-q", "-m", "oops"]);
+    let card = tasks::rotate(&ctx, &proj_a, "human", "GROQ_API_KEY", "default").unwrap();
+    let r = tasks::answer_secret(&ctx, &card, SecretString::from("gsk_new_bbbbbbbbbbbbbbbb".to_string()), true).unwrap();
+    let tasks::AnswerResult::Stored { rotation: Some(rep), .. } = r else { panic!("expected a rotation report") };
+    assert_eq!(rep.skipped.len(), 1, "{rep:?}");
+    assert!(rep.skipped[0].0 == proj_b.to_string_lossy() && rep.skipped[0].1.contains("tracked by git"));
+    assert!(std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("gsk_old_"), "B keeps the old value and the human is told");
     std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
 }

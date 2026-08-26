@@ -172,7 +172,13 @@ impl Db {
         for (col, ddl) in [("last_verified", "ALTER TABLE secrets ADD COLUMN last_verified TEXT"), ("stale_reason", "ALTER TABLE secrets ADD COLUMN stale_reason TEXT")] {
             let has: bool = conn.prepare("SELECT 1 FROM pragma_table_info('secrets') WHERE name=?1")?.exists([col])?;
             if !has {
-                conn.execute_batch(ddl)?;
+                // Two processes (CLI + MCP server) can race here; the loser's ALTER fails
+                // with "duplicate column", which is success.
+                if let Err(e) = conn.execute_batch(ddl) {
+                    if !e.to_string().contains("duplicate column") {
+                        return Err(e.into());
+                    }
+                }
             }
         }
         Ok(Self { conn })
@@ -189,7 +195,8 @@ impl Db {
             "INSERT INTO secrets (name, identity, provider, sensitive, source_url, created, last_used, stale, last_verified, stale_reason)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
              ON CONFLICT(name, identity) DO UPDATE SET provider=excluded.provider, sensitive=excluded.sensitive,
-               source_url=excluded.source_url, stale=excluded.stale, last_verified=excluded.last_verified, stale_reason=excluded.stale_reason",
+               source_url=excluded.source_url, stale=excluded.stale, last_verified=excluded.last_verified, stale_reason=excluded.stale_reason,
+               created=excluded.created, last_used=COALESCE(excluded.last_used, secrets.last_used)",
             params![m.name, m.identity, m.provider, m.sensitive as i32, m.source_url, m.created, m.last_used, m.stale as i32, m.last_verified, m.stale_reason],
         )?;
         Ok(())
@@ -257,10 +264,18 @@ impl Db {
         Ok(())
     }
 
+    /// Marker prefix for a stale set by the human (`rotate`). A probe saying "still live"
+    /// must not cancel a rotation the human asked for: the old key is live by design until
+    /// the new one lands.
+    pub const ROTATE_REASON: &'static str = "you asked to rotate it";
+
     pub fn set_verified(&self, name: &str, identity: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE secrets SET last_verified=?3, stale=0, stale_reason=NULL WHERE name=?1 AND identity=?2",
-            params![name, identity, crate::now()],
+            "UPDATE secrets SET last_verified=?3,
+                stale = CASE WHEN stale_reason LIKE ?4 THEN stale ELSE 0 END,
+                stale_reason = CASE WHEN stale_reason LIKE ?4 THEN stale_reason ELSE NULL END
+             WHERE name=?1 AND identity=?2",
+            params![name, identity, crate::now(), format!("{}%", Self::ROTATE_REASON)],
         )?;
         Ok(())
     }
@@ -287,7 +302,7 @@ impl Db {
     /// Most recent `report`/`false_report` audit row for (project, name, identity) after `since`.
     pub fn recent_report(&self, project: &str, name: &str, identity: &str, since: &str) -> Result<Option<String>> {
         Ok(self.conn.query_row(
-            "SELECT action FROM audit WHERE project=?1 AND name=?2 AND identity=?3 AND action IN ('report','false_report') AND ts > ?4 ORDER BY id DESC LIMIT 1",
+            "SELECT action FROM audit WHERE project=?1 AND name=?2 AND identity=?3 AND action IN ('report','false_report') AND ts >= ?4 ORDER BY id DESC LIMIT 1",
             params![project, name, identity, since],
             |r| r.get::<_, String>(0),
         ).optional()?)
