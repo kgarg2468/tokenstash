@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod answer;
+pub mod bundle;
 pub mod doctor;
 pub mod inbox;
 pub mod init;
