@@ -36,9 +36,9 @@ enum Cmd {
     ReportBad(cmd::admin::ReportBadArgs),
     /// Test every stored key against its provider and mark dead ones stale. For a person at a terminal.
     Check(cmd::admin::CheckArgs),
-    /// Write every secret to one passphrase-encrypted file, to move to another machine.
+    /// Write every secret to one passphrase-encrypted file, to move to another machine. For a person at a terminal (an agent with a shell can still run it under a pty; keep that in mind).
     Export(cmd::bundle::ExportArgs),
-    /// Merge a bundle from `export` into this machine's stash.
+    /// Merge a bundle from `export` into this machine's stash. For a person at a terminal.
     Import(cmd::bundle::ImportArgs),
     /// Bind a secret name to an identity for this project (work vs personal).
     Bind(cmd::admin::BindArgs),
