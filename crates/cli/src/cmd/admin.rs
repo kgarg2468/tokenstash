@@ -191,11 +191,31 @@ pub fn audit(a: AuditArgs) -> Result<i32> {
 
 // ---------- rotation ----------
 
+/// Human-only commands: a person at a terminal, not an agent. `rotate` asserts the human's
+/// intent on the card ("you asked to rotate it") and `check` sends every key to its provider
+/// and lists what you have; neither may be driven by a repo's instructions.
+fn require_human(what: &str) -> Result<()> {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() || tokenstash_core::project::detect_agent() != "unknown" {
+        bail!("`tokenstash {what}` is for a person at a terminal, not an agent. Run it yourself.");
+    }
+    Ok(())
+}
+
+/// The identity a name resolves to here, the way `need` resolves it: explicit flag, else
+/// the project's binding, else `default`. Without this a `--identity`-less command silently
+/// targets the wrong key in a project bound to `work`.
+fn resolve_identity(app: &App, project: &std::path::Path, name: &str, explicit: &Option<String>) -> Result<String> {
+    if let Some(i) = explicit { return Ok(i.clone()); }
+    Ok(app.db.binding(&project.to_string_lossy(), name)?.unwrap_or_else(|| "default".into()))
+}
+
 #[derive(Args)]
 pub struct RotateArgs {
     pub name: String,
-    #[arg(long, default_value = "default")]
-    pub identity: String,
+    /// Which identity (defaults to this project's binding, else `default`).
+    #[arg(long)]
+    pub identity: Option<String>,
     #[arg(long)]
     pub project: Option<PathBuf>,
 }
@@ -203,13 +223,16 @@ pub struct RotateArgs {
 /// Mark a key for replacement and file the paste card now. The old value stays in the
 /// stash until the new one lands; every project still holding it is rewritten then.
 pub fn rotate(a: RotateArgs) -> Result<i32> {
+    require_human("rotate")?;
     let app = App::open()?;
     let project = util::project_from(&a.project);
-    let agent = tokenstash_core::project::detect_agent();
-    let t = tokenstash_core::tasks::rotate(&app.ctx(), &project, &agent, &a.name, &a.identity)?;
+    let agent = "human".to_string();
+    let identity = resolve_identity(&app, &project, &a.name, &a.identity)?;
+    let a = RotateArgs { identity: Some(identity), ..a };
+    let t = tokenstash_core::tasks::rotate(&app.ctx(), &project, &agent, &a.name, a.identity.as_deref().unwrap())?;
     let state = crate::notify::ensure_inbox(&app.cfg);
     crate::notify::desktop(&app.cfg, &format!("Replace {}", a.name), "you asked to rotate it", &util::inbox_notice(&app.cfg, Some(&t.id), state));
-    println!("⏳ {}@{} marked for rotation — task {} → {}", a.name, a.identity, t.id, util::inbox_url_tty(&app.cfg, Some(&t.id), state, util::Stream::Stdout));
+    println!("⏳ {}@{} marked for rotation — task {} → {}", a.name, a.identity.as_deref().unwrap(), t.id, util::inbox_url_tty(&app.cfg, Some(&t.id), state, util::Stream::Stdout));
     println!("  paste the NEW key first; revoke the old one in the dashboard after it says stored");
     Ok(tokenstash_core::exit::PENDING)
 }
@@ -217,26 +240,29 @@ pub fn rotate(a: RotateArgs) -> Result<i32> {
 #[derive(Args)]
 pub struct ReportBadArgs {
     pub name: String,
-    #[arg(long, default_value = "default")]
-    pub identity: String,
+    /// Which identity (defaults to this project's binding, else `default`).
+    #[arg(long)]
+    pub identity: Option<String>,
     /// HTTP status the provider returned (401, 403, ...).
     #[arg(long)]
     pub status: Option<u16>,
-    /// The provider's error text, without the key.
+    /// Accepted for convenience and discarded: provider error text is agent-controlled and
+    /// may echo a key, so nothing from it is stored or shown.
     #[arg(long)]
     pub message: Option<String>,
-    #[arg(long)]
-    pub project: Option<PathBuf>,
 }
 
-/// Agent-facing. Always prints the same line whatever happened: the agent learns the
-/// outcome from its next `need` (card vs inject), never from here — otherwise this is a
-/// stash-existence oracle for a hostile repo.
+/// Agent-facing. The project is the current directory, never an argument: a report only
+/// counts from a project that received the key, and letting the caller name one would let a
+/// hostile repo borrow another project's standing. Always prints the same line whatever
+/// happened: the agent learns the outcome from its next `need` (card vs inject), never from
+/// here — otherwise this is a stash-existence oracle.
 pub fn report_bad(a: ReportBadArgs) -> Result<i32> {
     let app = App::open()?;
-    let project = util::project_from(&a.project);
+    let project = tokenstash_core::project::current();
     let agent = tokenstash_core::project::detect_agent();
-    let _ = tokenstash_core::tasks::report_bad(&app.ctx(), &project, &agent, &a.name, &a.identity, a.status, a.message.as_deref())?;
+    let identity = resolve_identity(&app, &project, &a.name, &a.identity)?;
+    let _ = tokenstash_core::tasks::report_bad(&app.ctx(), &project, &agent, &a.name, &identity, a.status)?;
     println!("ok — run `tokenstash need {}` again; if the key is dead the user will be asked for a replacement", a.name);
     Ok(0)
 }
@@ -255,9 +281,15 @@ pub struct CheckArgs {
 /// Sweep the stash through the registry's liveness probes. Human-only: it sends every key
 /// to its provider and prints an inventory, so it refuses to run for an agent or a pipe.
 pub fn check(a: CheckArgs) -> Result<i32> {
+    // --json is for a script the human runs (`check --json > report.json`): stdout is not a
+    // terminal then, so the guard is on stdin instead.
     use std::io::IsTerminal;
-    if !std::io::stdout().is_terminal() || tokenstash_core::project::detect_agent() != "unknown" {
-        bail!("`tokenstash check` is for a person at a terminal: it sends each key to its provider and lists what you have. Run it yourself.");
+    if a.json {
+        if !std::io::stdin().is_terminal() || tokenstash_core::project::detect_agent() != "unknown" {
+            bail!("`tokenstash check` is for a person at a terminal, not an agent. Run it yourself.");
+        }
+    } else {
+        require_human("check")?;
     }
     let app = App::open()?;
     let mut rows = vec![];

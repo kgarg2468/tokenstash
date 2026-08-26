@@ -105,23 +105,6 @@ pub fn need(ctx: &Ctx, project: &Path, agent: &str, names: &[String], opts: &Nee
                 ctx.db.audit(Some(&pid), Some(agent), "adopt", Some(name), Some(&identity), Some("found in the stash but not in this home's index"))?;
                 meta = Some(m);
             }
-            // A stale key is a miss: the value is still in the stash (a live re-paste of the
-            // same value self-heals a false positive), but nothing injects it. The card says
-            // why, so the human can judge the report before pasting a replacement.
-            if let Some(m) = meta.as_ref().filter(|m| m.stale) {
-                if !opts.force {
-                    let since = (chrono::Utc::now() - chrono::Duration::hours(ctx.cfg.task_ttl_hours as i64)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-                    if let Some(d) = ctx.db.recent_denial(&pid, name, &identity, &since)? {
-                        outcomes.push(Outcome::Denied { name: name.clone(), task_id: d.id });
-                        continue;
-                    }
-                }
-                let why = format!("Replace {name}: {}", m.stale_reason.clone().unwrap_or_else(|| "the stored key was marked stale".into()));
-                let req = SecretRequest { why: Some(why), ..opts.req.clone() };
-                let t = tasks::create_secret_task(ctx, project, agent, name, &identity, &req)?;
-                outcomes.push(Outcome::Pending { name: name.clone(), identity: identity.clone(), task_id: t.id, title: t.title, url: t.url });
-                continue;
-            }
             let sensitive = meta.as_ref().map(|m| m.sensitive).unwrap_or_else(|| provider.map(|p| p.sensitive).unwrap_or(false));
             let gate = if opts.require_approval {
                 Gate::NeedsApproval { reason: GateReason::Sensitive }
@@ -129,6 +112,33 @@ pub fn need(ctx: &Ctx, project: &Path, agent: &str, names: &[String], opts: &Nee
                 trust::gate(ctx.db, ctx.cfg, project, name, sensitive)?
             };
             match gate {
+                // A stale key is a miss, but only once the project has passed the same gate a
+                // fresh injection would: a project that would need approval to receive this
+                // key must not get a paste card for its replacement instead.
+                Gate::Open if meta.as_ref().map(|m| m.stale).unwrap_or(false) => {
+                    let m = meta.as_ref().unwrap();
+                    // Generated secrets are never pasted: regenerate.
+                    if let Some(spec) = provider.and_then(|p| p.generate.as_deref()) {
+                        if let Some(v) = generate(spec) {
+                            let p = tasks::store_and_inject(ctx, name, &identity, &v, provider.map(|p| p.provider.clone()), None, false, project, agent, None, false)?;
+                            outcomes.push(Outcome::Injected { name: name.clone(), identity, written_to: p.map(|p| p.display().to_string()).unwrap_or_default(), generated: true });
+                            continue;
+                        }
+                    }
+                    if !opts.force {
+                        let since = (chrono::Utc::now() - chrono::Duration::hours(ctx.cfg.task_ttl_hours as i64)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                        if let Some(d) = ctx.db.recent_denial(&pid, name, &identity, &since)? {
+                            outcomes.push(Outcome::Denied { name: name.clone(), task_id: d.id });
+                            continue;
+                        }
+                    }
+                    // The value stays in the stash (a live re-paste of the same value self-heals
+                    // a false positive); the card says why, so the human can judge the report.
+                    let why = format!("Replace {name}: {}. The new value is written to {}.", m.stale_reason.clone().unwrap_or_else(|| "the stored key was marked stale".into()), project.join(&ctx.cfg.env_file).display());
+                    let req = SecretRequest { why: Some(why), ..opts.req.clone() };
+                    let t = tasks::create_secret_task(ctx, project, agent, name, &identity, &req)?;
+                    outcomes.push(Outcome::Pending { name: name.clone(), identity: identity.clone(), task_id: t.id, title: t.title, url: t.url });
+                }
                 Gate::Open => {
                     let p = crate::envfile::write(project, &ctx.cfg.env_file, name, &value)?;
                     ctx.db.touch_secret(name, &identity)?;

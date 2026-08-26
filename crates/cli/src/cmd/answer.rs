@@ -63,7 +63,12 @@ pub fn answer(a: AnswerArgs) -> Result<i32> {
                 bail!("empty value; nothing stored");
             }
             match tasks::answer_secret(&ctx, &task, SecretString::from(raw), a.skip_check)? {
-                AnswerResult::Stored { injected_to, sensitive, liveness } => {
+                AnswerResult::Stored { injected_to, sensitive, liveness, rotation } => {
+                    if let Some(r) = &rotation {
+                        for p in &r.rewritten { println!("  also updated → {}", tokenstash_core::project::short(std::path::Path::new(p))); }
+                        for (p, why) in &r.skipped { println!("  ! still holds the OLD value: {} — {why}", tokenstash_core::project::short(std::path::Path::new(p))); }
+                        if !r.skipped.is_empty() { println!("  fix those before revoking the old key"); }
+                    }
                     println!("✓ {name} stored in the {} stash", app.stash.backend());
                     if let Some(l) = liveness { println!("  liveness: {}", describe(&l)); }
                     if sensitive { println!("  tagged sensitive: will ask once per project"); }
