@@ -42,7 +42,7 @@ Same exit codes. `--expects text` when you need an answer back (it arrives in th
 
 ## When a provider rejects a key
 
-If an API call fails with 401/403 (or the provider's documented bad-key status) **and your request was well-formed** — same shape as a call that worked, auth header exactly as documented — tell tokenstash, not the user:
+If an API call fails with 401 (or the provider's documented bad-key status) **and your request was well-formed** — same shape as a call that worked, auth header exactly as documented — tell tokenstash, not the user:
 
 ```
 tokenstash report-bad OPENAI_API_KEY --status 401

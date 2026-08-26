@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Directories whose projects get silent injection of non-sensitive keys.
     #[serde(default)]
@@ -55,16 +56,17 @@ impl VerifyEvery {
             "never" => return Ok(VerifyEvery::Never),
             _ => {}
         }
-        let (num, unit) = s.split_at(s.len().saturating_sub(1));
-        let n: u64 = num.parse().map_err(|_| format!("verify_every: expected \"always\", \"never\", \"<n>h\" or \"<n>m\", got {s:?}"))?;
+        let bad = || format!("verify_every: expected \"always\", \"never\", \"<n>h\" or \"<n>m\", got {s:?}");
+        let (num, per_unit) = if let Some(n) = s.strip_suffix('h') { (n, 3600u64) } else if let Some(n) = s.strip_suffix('m') { (n, 60u64) } else { return Err(bad()) };
+        if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(bad());
+        }
+        let n: u64 = num.parse().map_err(|_| bad())?;
         if n == 0 {
             return Err("verify_every: the interval must be at least 1m (use \"always\" for every call)".into());
         }
-        match unit {
-            "h" => Ok(VerifyEvery::Every(std::time::Duration::from_secs(n * 3600))),
-            "m" => Ok(VerifyEvery::Every(std::time::Duration::from_secs(n * 60))),
-            _ => Err(format!("verify_every: expected \"always\", \"never\", \"<n>h\" or \"<n>m\", got {s:?}")),
-        }
+        let secs = n.checked_mul(per_unit).filter(|&x| x <= 366 * 24 * 3600).ok_or_else(|| format!("verify_every: {s} is longer than a year; use \"never\""))?;
+        Ok(VerifyEvery::Every(std::time::Duration::from_secs(secs)))
     }
 }
 
