@@ -30,10 +30,10 @@ pub struct ExportArgs {
     #[arg(long, value_name = "DIR", conflicts_with = "out")]
     pub from_env: Option<PathBuf>,
     /// With --from-env: identity for everything imported.
-    #[arg(long, default_value = "default")]
+    #[arg(long, default_value = "default", requires = "from_env")]
     pub identity: String,
     /// With --from-env: skip the liveness sweep afterwards.
-    #[arg(long)]
+    #[arg(long, requires = "from_env")]
     pub no_verify: bool,
 }
 
@@ -390,6 +390,14 @@ pub fn from_env(a: FromEnvArgs) -> Result<i32> {
         }
         let e = Entry { name: cand.name.clone(), identity: identity.clone(), value: cand.value.expose_secret().to_string(), provider: cand.provider.clone(), sensitive: cand.sensitive, source_url: None, created: tokenstash_core::now(), last_used: None, stale: false, stale_reason: None };
         bundle::validate_entry(&e)?;
+        // What a paste would reject, the crawl rejects: a ticked row whose value does not
+        // match the provider's documented shape is skipped, not stored.
+        if let Some(pat) = tokenstash_core::registry::lookup(&e.name).and_then(|p| p.pattern.as_ref()) {
+            if !tokenstash_core::validate::matches_pattern(pat, &cand.value)? {
+                println!("  {}@{}: skipped — the value does not look like a {} key (a paste would be refused too)", e.name, identity, cand.provider.clone().unwrap_or_default());
+                continue;
+            }
+        }
         apply_entry(&app, &e, &format!("from {}", display_path(&cand.sources[0])))?;
         n += 1;
         pairs.push((cand.name.clone(), identity));
