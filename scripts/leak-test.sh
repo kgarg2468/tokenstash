@@ -376,6 +376,38 @@ if grep -rl "$OLDCANARY" "$OUT" "$WEB"; then echo "LEAK: the pre-rotation value 
 if strings "$TOKENSTASH_HOME/tokenstash.db"* | grep -q "$OLDCANARY\|$NEWCANARY"; then echo "LEAK: a rotation value is in the database"; fail=1; fi
 if grep -rl "$NEWCANARY" "$OUT" "$WEB"; then echo "LEAK: the rotated value appears in output"; fail=1; fi
 
+# ── bundle: export/import never leak, refuse a pipe, round-trip under a pty ──────────
+"$TS" export -o "$OUT/should-not-exist.bundle" </dev/null >"$OUT/export-pipe.txt" 2>&1 && { echo "FAIL: export ran without a terminal"; fail=1; }
+[ -e "$OUT/should-not-exist.bundle" ] && { echo "FAIL: export wrote a bundle without a terminal"; fail=1; }
+if script -qec true /dev/null >/dev/null 2>&1; then
+  BDIR="$(mktemp -d)"; PW="leak-test-passphrase-$RANDOM$RANDOM"
+  # export: passphrase typed twice
+  # (type after the prompt is up: a pty echoes input typed before rpassword disables echo)
+  (sleep 1; printf '%s\n' "$PW"; sleep 1; printf '%s\n' "$PW") | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_CI -u OPENAI_CODEX -u CURSOR_TRACE_ID -u CURSOR_AGENT -u GEMINI_CLI -u OPENCODE -u TOKENSTASH_AGENT \
+    script -qec "$TS export -o $BDIR/t.bundle" /dev/null >"$OUT/export.txt" 2>&1 || true
+  [ -s "$BDIR/t.bundle" ] || { echo "FAIL: export wrote no bundle"; sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$OUT/export.txt" | tail -3; fail=1; }
+  if [ -s "$BDIR/t.bundle" ]; then
+    MODE="$(stat -c '%a' "$BDIR/t.bundle" 2>/dev/null || stat -f '%Lp' "$BDIR/t.bundle")"; [ "$MODE" = 600 ] || { echo "FAIL: bundle is $MODE, expected 600"; fail=1; }
+    grep -aq "$CANARY" "$BDIR/t.bundle" && { echo "LEAK: bundle contains a plaintext value"; fail=1; }
+    grep -aq "OPENAI_API_KEY" "$BDIR/t.bundle" && { echo "LEAK: bundle contains a plaintext name"; fail=1; }
+    grep -q "$CANARY\|$PW" "$OUT/export.txt" && { echo "LEAK: export output contains a value or the passphrase"; fail=1; }
+    # import into a fresh home: values arrive, nothing printed, no approvals granted
+    HOME3="$(mktemp -d)"; cp "$TOKENSTASH_HOME/config.toml" "$HOME3/config.toml"
+    (sleep 1; printf '%s\n' "$PW") | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_CI -u OPENAI_CODEX -u CURSOR_TRACE_ID -u CURSOR_AGENT -u GEMINI_CLI -u OPENCODE -u TOKENSTASH_AGENT TOKENSTASH_HOME="$HOME3" \
+      script -qec "$TS import $BDIR/t.bundle --no-verify" /dev/null >"$OUT/import.txt" 2>&1 || true
+    grep -q "added" "$OUT/import.txt" || { echo "FAIL: import did not report what it added"; sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$OUT/import.txt" | tail -3; fail=1; }
+    grep -q "$CANARY\|$PW" "$OUT/import.txt" && { echo "LEAK: import output contains a value or the passphrase"; fail=1; }
+    TOKENSTASH_HOME="$HOME3" "$TS" list >"$OUT/import-list.txt" 2>&1; grep -q "OPENAI_API_KEY" "$OUT/import-list.txt" || { echo "FAIL: imported key is not indexed in the new home"; fail=1; }
+    [ "$(TOKENSTASH_HOME="$HOME3" "$TS" audit 2>/dev/null | grep -c 'approve')" = 0 ] || { echo "FAIL: import granted approvals"; fail=1; }
+    # a wrong passphrase imports nothing
+    HOME4="$(mktemp -d)"; cp "$TOKENSTASH_HOME/config.toml" "$HOME4/config.toml"
+    (sleep 1; printf 'wrong-passphrase-xx\n') | env -u CLAUDECODE TOKENSTASH_HOME="$HOME4" script -qec "$TS import $BDIR/t.bundle --no-verify" /dev/null >"$OUT/import-wrong.txt" 2>&1 || true
+    TOKENSTASH_HOME="$HOME4" "$TS" list 2>/dev/null | grep -q "OPENAI_API_KEY" && { echo "FAIL: a wrong passphrase imported keys"; fail=1; }
+    for h in "$HOME3" "$HOME4"; do TOKENSTASH_HOME="$h" "$TS" list 2>/dev/null | awk '$1 ~ /^[A-Z][A-Z0-9_]*$/ {print $1,$2}' | while read -r n i; do TOKENSTASH_HOME="$h" "$TS" forget "$n" --identity "$i" >/dev/null 2>&1 || true; done; rm -rf "$h"; done
+  fi
+  rm -rf "$BDIR"
+fi
+
 # exit-code contract
 rc=0; "$TS" need OPENAI_API_KEY --agent ci >/dev/null 2>&1 || rc=$?; [ $rc -eq 0 ] || { echo "hit should exit 0 (got $rc)"; fail=1; }
 rc=0; "$TS" need NEVER_SEEN_KEY --agent ci >/dev/null 2>&1 || rc=$?; [ $rc -eq 10 ] || { echo "miss should exit 10 (got $rc)"; fail=1; }

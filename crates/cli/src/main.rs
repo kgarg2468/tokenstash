@@ -36,6 +36,10 @@ enum Cmd {
     ReportBad(cmd::admin::ReportBadArgs),
     /// Test every stored key against its provider and mark dead ones stale. For a person at a terminal.
     Check(cmd::admin::CheckArgs),
+    /// Write every secret to one passphrase-encrypted file, to move to another machine.
+    Export(cmd::bundle::ExportArgs),
+    /// Merge a bundle from `export` into this machine's stash.
+    Import(cmd::bundle::ImportArgs),
     /// Bind a secret name to an identity for this project (work vs personal).
     Bind(cmd::admin::BindArgs),
     /// Manage trust roots (directories whose projects get silent injection).
@@ -81,6 +85,8 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Rotate(a) => cmd::admin::rotate(a),
         Cmd::ReportBad(a) => cmd::admin::report_bad(a),
         Cmd::Check(a) => cmd::admin::check(a),
+        Cmd::Export(a) => cmd::bundle::export(a),
+        Cmd::Import(a) => cmd::bundle::import(a),
         Cmd::Bind(a) => cmd::admin::bind(a),
         Cmd::Trust(a) => cmd::admin::trust(a),
         Cmd::Audit(a) => cmd::admin::audit(a),
