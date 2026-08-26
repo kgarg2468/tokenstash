@@ -206,7 +206,29 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
             // that project's path and state to a model that has no business with it.
             let pid = project.to_string_lossy().to_string();
             match app.db.find_task(id)?.filter(|t| t.project == pid) {
-                Some(t) => Ok((json!({ "task_id": t.id, "kind": t.kind, "status": t.status, "name": t.name, "title": t.title, "note": t.note, "env_file": std::path::Path::new(&t.project).join(&app.cfg.env_file) }), false)),
+                Some(t) => {
+                    // An approval can be answered yet deliver nothing: the provider rejected
+                    // the stored key at delivery and a Replace card was filed instead. Point
+                    // the agent at that card, or "answered" reads as "injected".
+                    let mut replacements = vec![];
+                    if t.kind == tokenstash_core::db::TaskKind::Approval && t.status == tokenstash_core::db::TaskStatus::Answered {
+                        for entry in &t.names {
+                            if entry == "*" { continue; }
+                            let (n, identity) = tokenstash_core::tasks::split_identity(entry);
+                            if let Some(rt) = app.db.open_secret_task(&pid, n, identity)? {
+                                if rt.expects == tokenstash_core::tasks::EXPECTS_REPLACE {
+                                    replacements.push(json!({ "name": n, "task_id": rt.id, "url": util::inbox_url_agent(&app.cfg, Some(&rt.id), crate::notify::inbox_state(&app.cfg)) }));
+                                }
+                            }
+                        }
+                    }
+                    let mut out = json!({ "task_id": t.id, "kind": t.kind, "status": t.status, "name": t.name, "title": t.title, "note": t.note, "env_file": std::path::Path::new(&t.project).join(&app.cfg.env_file) });
+                    if !replacements.is_empty() {
+                        out["replacements"] = json!(replacements);
+                        out["note"] = json!("approved, but the provider rejected the stored key at delivery; nothing was written. Poll the Replace task(s) listed in `replacements` instead.");
+                    }
+                    Ok((out, false))
+                }
                 None => Ok((json!({ "error": format!("no task {id} in this project") }), true)),
             }
         }
