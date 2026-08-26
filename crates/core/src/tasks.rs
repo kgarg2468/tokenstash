@@ -227,10 +227,19 @@ pub fn answer_secret(ctx: &Ctx, task: &Task, value: SecretString, skip_liveness:
             Some(sp) => validate::matches_pattern(sp, &value)?,
             None => false,
         };
+    // Rotation: remember the value being replaced so every other project still holding it
+    // can be rewritten below. Read before the store overwrites it.
+    let previous = ctx.stash.get(&stash_key(&name, &task.identity))?;
     let injected_to = store_and_inject(
         ctx, &name, &task.identity, &value, provider.map(|p| p.provider.clone()), task.url.clone(), sensitive,
         Path::new(&task.project), &task.agent, Some(&task.id),
+        matches!(liveness, Some(Liveness::Ok)),
     )?;
+    if let Some(old) = previous {
+        if old.expose_secret() != value.expose_secret() {
+            rewrite_replaced_value(ctx, &name, &task.identity, &old, &value, &task.project)?;
+        }
+    }
     Ok(AnswerResult::Stored { injected_to, sensitive, liveness })
 }
 
@@ -253,6 +262,7 @@ pub fn store_and_inject(
     project: &Path,
     agent: &str,
     answering_task: Option<&str>,
+    verified: bool,
 ) -> Result<Option<PathBuf>> {
     ctx.stash.set(&stash_key(name, identity), value)?;
     let pid = project.to_string_lossy().to_string();
@@ -266,6 +276,8 @@ pub fn store_and_inject(
         created: crate::now(),
         last_used: Some(crate::now()),
         stale: false,
+        last_verified: if verified { Some(crate::now()) } else { None },
+        stale_reason: None,
     })?;
     ctx.db.audit(Some(&pid), Some(agent), "store", Some(name), Some(identity), None)?;
     // The human just handled this key for this project: that is the approval.
@@ -366,4 +378,119 @@ pub fn deny(ctx: &Ctx, task: &Task, note: Option<&str>) -> Result<AnswerResult> 
 
 pub fn expire(ctx: &Ctx) -> Result<usize> {
     ctx.db.expire_overdue()
+}
+
+/// After a key is replaced, every other project whose env file still holds the OLD value
+/// gets the new one — otherwise each of them fails next week and files its own card. The
+/// comparison happens here, value to value, and is never shown. Projects that no longer
+/// exist, or whose file no longer holds the old value, are left alone.
+pub fn rewrite_replaced_value(ctx: &Ctx, name: &str, identity: &str, old: &SecretString, new: &SecretString, answering_project: &str) -> Result<()> {
+    for project in ctx.db.delivered_projects(name, identity)? {
+        if project == answering_project {
+            continue;
+        }
+        let dir = Path::new(&project);
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(env_path) = crate::envfile::resolve(dir, &ctx.cfg.env_file) else { continue };
+        let Ok(text) = std::fs::read_to_string(&env_path) else { continue };
+        let holds_old = text.lines().filter_map(crate::envfile::parse_line).any(|(k, v)| k == name && v == old.expose_secret());
+        if !holds_old {
+            continue;
+        }
+        match crate::envfile::write(dir, &ctx.cfg.env_file, name, new) {
+            Ok(_) => { ctx.db.audit(Some(&project), None, "inject", Some(name), Some(identity), Some("after-rotation"))?; }
+            Err(e) => { ctx.db.audit(Some(&project), None, "rotate.skip", Some(name), Some(identity), Some(&format!("{e:#}")))?; }
+        }
+    }
+    Ok(())
+}
+
+/// The human asked to replace a key: mark it stale and file the replacement card now.
+pub fn rotate(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &str) -> Result<Task> {
+    let pid = project.to_string_lossy().to_string();
+    if ctx.db.get_secret(name, identity)?.is_none() {
+        bail!("{name}@{identity} is not in the stash; use `tokenstash need {name}` to add it");
+    }
+    ctx.db.mark_stale(name, identity, true, Some("you asked to rotate it"))?;
+    ctx.db.audit(Some(&pid), Some(agent), "rotate", Some(name), Some(identity), None)?;
+    let req = SecretRequest { why: Some(format!("Replace {name}: you asked to rotate it. Paste the new key first, then revoke the old one in the dashboard.")), ..Default::default() };
+    create_secret_task(ctx, project, agent, name, identity, &req)
+}
+
+/// What a report changed. Never returned to the agent (see `report_bad`); for tests and
+/// the CLI's own output.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReportOutcome {
+    /// Not delivered here, on cooldown, unknown: nothing changed.
+    Ignored,
+    /// The registry probe accepted the key: the report was wrong.
+    FalseReport,
+    /// Marked stale (by probe verdict, or by the report when no probe exists).
+    MarkedStale,
+}
+
+/// An agent says a provider rejected a key. The agent is the only sensor tokenstash has —
+/// it is never in the request path — but its word is a claim, not a verdict:
+/// - only a project that actually received the key can report it (otherwise: ignored, and
+///   the caller cannot tell — no stash-existence oracle);
+/// - when the registry has a liveness check, the probe decides: a hostile repo cannot make
+///   the provider reject a live key;
+/// - one report per (project, key) per task_ttl_hours; a probe that says Ok records a
+///   false report and further reports are ignored for the window.
+///
+/// The replacement card always names the reporting project and agent.
+pub fn report_bad(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &str, status: Option<u16>, message: Option<&str>) -> Result<ReportOutcome> {
+    let pid = project.to_string_lossy().to_string();
+    if !ctx.db.has_delivered(&pid, name, identity)? {
+        return Ok(ReportOutcome::Ignored);
+    }
+    let Some(_meta) = ctx.db.get_secret(name, identity)? else { return Ok(ReportOutcome::Ignored) };
+    let since = (chrono::Utc::now() - chrono::Duration::hours(ctx.cfg.task_ttl_hours as i64)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    if ctx.db.recent_report(&pid, name, identity, &since)?.is_some() {
+        return Ok(ReportOutcome::Ignored);
+    }
+    // The agent may paste the provider's whole error, and some providers echo a key prefix
+    // into it: scrub the delivered value before anything is persisted.
+    let detail = {
+        let mut d = format!("HTTP {}", status.map(|s| s.to_string()).unwrap_or_else(|| "?".into()));
+        if let Some(m) = message {
+            let r = match ctx.stash.get(&stash_key(name, identity))? {
+                Some(v) => crate::redact::Redactor::new().with(&v).redact(m),
+                None => m.to_string(),
+            };
+            d.push_str(": ");
+            d.push_str(r.chars().take(200).collect::<String>().as_str());
+        }
+        d
+    };
+    let provider = registry::lookup(name);
+    let value = ctx.stash.get(&stash_key(name, identity))?;
+    let verdict = match (provider.and_then(|p| p.check.as_ref()), value.as_ref()) {
+        (Some(check), Some(v)) => Some(validate::liveness(check, v)),
+        _ => None,
+    };
+    let date = crate::now();
+    match verdict {
+        Some(Liveness::Ok) => {
+            ctx.db.set_verified(name, identity)?;
+            ctx.db.audit(Some(&pid), Some(agent), "false_report", Some(name), Some(identity), Some(&detail))?;
+            Ok(ReportOutcome::FalseReport)
+        }
+        Some(Liveness::Rejected(code)) => {
+            let reason = format!("rejected by {} (HTTP {code}) on {date}, reported by {agent} in {}", provider.map(|p| p.provider.as_str()).unwrap_or("the provider"), crate::project::short(project));
+            ctx.db.mark_stale(name, identity, true, Some(&reason))?;
+            ctx.db.audit(Some(&pid), Some(agent), "report", Some(name), Some(identity), Some(&detail))?;
+            Ok(ReportOutcome::MarkedStale)
+        }
+        // No probe available (or network unknown): the report stands, and the card says
+        // exactly who made it.
+        _ => {
+            let reason = format!("reported rejected ({detail}) on {date} by {agent} in {} — unverified, no liveness check for this provider", crate::project::short(project));
+            ctx.db.mark_stale(name, identity, true, Some(&reason))?;
+            ctx.db.audit(Some(&pid), Some(agent), "report", Some(name), Some(identity), Some(&detail))?;
+            Ok(ReportOutcome::MarkedStale)
+        }
+    }
 }

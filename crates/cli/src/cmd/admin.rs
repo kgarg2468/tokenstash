@@ -71,8 +71,11 @@ pub fn list(a: ListArgs) -> Result<i32> {
     for s in &secrets {
         let mut flags = vec![];
         if s.sensitive { flags.push("sensitive"); }
-        if s.stale { flags.push("stale"); }
+        if s.stale { flags.push("STALE"); }
         println!("{:<36} {:<10} {:<18} {:<10} {}", s.name, s.identity, s.provider.clone().unwrap_or_default(), flags.join(","), s.last_used.clone().unwrap_or_default());
+    }
+    for s in secrets.iter().filter(|s| s.stale) {
+        println!("  {}@{}: {}", s.name, s.identity, s.stale_reason.clone().unwrap_or_else(|| "stale".into()));
     }
     println!("\n{} secrets in the {} stash (values never shown)", secrets.len(), app.stash.backend());
     Ok(0)
@@ -183,5 +186,115 @@ pub fn audit(a: AuditArgs) -> Result<i32> {
             detail.unwrap_or_default()
         );
     }
+    Ok(0)
+}
+
+// ---------- rotation ----------
+
+#[derive(Args)]
+pub struct RotateArgs {
+    pub name: String,
+    #[arg(long, default_value = "default")]
+    pub identity: String,
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+}
+
+/// Mark a key for replacement and file the paste card now. The old value stays in the
+/// stash until the new one lands; every project still holding it is rewritten then.
+pub fn rotate(a: RotateArgs) -> Result<i32> {
+    let app = App::open()?;
+    let project = util::project_from(&a.project);
+    let agent = tokenstash_core::project::detect_agent();
+    let t = tokenstash_core::tasks::rotate(&app.ctx(), &project, &agent, &a.name, &a.identity)?;
+    let state = crate::notify::ensure_inbox(&app.cfg);
+    crate::notify::desktop(&app.cfg, &format!("Replace {}", a.name), "you asked to rotate it", &util::inbox_notice(&app.cfg, Some(&t.id), state));
+    println!("⏳ {}@{} marked for rotation — task {} → {}", a.name, a.identity, t.id, util::inbox_url_tty(&app.cfg, Some(&t.id), state, util::Stream::Stdout));
+    println!("  paste the NEW key first; revoke the old one in the dashboard after it says stored");
+    Ok(tokenstash_core::exit::PENDING)
+}
+
+#[derive(Args)]
+pub struct ReportBadArgs {
+    pub name: String,
+    #[arg(long, default_value = "default")]
+    pub identity: String,
+    /// HTTP status the provider returned (401, 403, ...).
+    #[arg(long)]
+    pub status: Option<u16>,
+    /// The provider's error text, without the key.
+    #[arg(long)]
+    pub message: Option<String>,
+    #[arg(long)]
+    pub project: Option<PathBuf>,
+}
+
+/// Agent-facing. Always prints the same line whatever happened: the agent learns the
+/// outcome from its next `need` (card vs inject), never from here — otherwise this is a
+/// stash-existence oracle for a hostile repo.
+pub fn report_bad(a: ReportBadArgs) -> Result<i32> {
+    let app = App::open()?;
+    let project = util::project_from(&a.project);
+    let agent = tokenstash_core::project::detect_agent();
+    let _ = tokenstash_core::tasks::report_bad(&app.ctx(), &project, &agent, &a.name, &a.identity, a.status, a.message.as_deref())?;
+    println!("ok — run `tokenstash need {}` again; if the key is dead the user will be asked for a replacement", a.name);
+    Ok(0)
+}
+
+#[derive(Args)]
+pub struct CheckArgs {
+    /// Only these names (default: every key with a registry liveness check).
+    pub names: Vec<String>,
+    /// Only re-test keys currently marked stale (and un-mark them if the provider accepts).
+    #[arg(long)]
+    pub stale_only: bool,
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Sweep the stash through the registry's liveness probes. Human-only: it sends every key
+/// to its provider and prints an inventory, so it refuses to run for an agent or a pipe.
+pub fn check(a: CheckArgs) -> Result<i32> {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() || tokenstash_core::project::detect_agent() != "unknown" {
+        bail!("`tokenstash check` is for a person at a terminal: it sends each key to its provider and lists what you have. Run it yourself.");
+    }
+    let app = App::open()?;
+    let mut rows = vec![];
+    for m in app.db.list_secrets()? {
+        if !a.names.is_empty() && !a.names.contains(&m.name) { continue; }
+        if a.stale_only && !m.stale { continue; }
+        let Some(check) = tokenstash_core::registry::lookup(&m.name).and_then(|p| p.check.clone()) else {
+            rows.push((m.name.clone(), m.identity.clone(), "no check".to_string(), m.stale));
+            continue;
+        };
+        let Some(v) = app.stash.get(&stash_key(&m.name, &m.identity))? else {
+            rows.push((m.name.clone(), m.identity.clone(), "not in stash".to_string(), m.stale));
+            continue;
+        };
+        let verdict = tokenstash_core::validate::liveness(&check, &v);
+        let status = match verdict {
+            tokenstash_core::validate::Liveness::Ok => { app.db.set_verified(&m.name, &m.identity)?; "ok".to_string() }
+            tokenstash_core::validate::Liveness::Rejected(code) => {
+                let reason = format!("rejected by the provider (HTTP {code}) on {} during `tokenstash check`", tokenstash_core::now());
+                app.db.mark_stale(&m.name, &m.identity, true, Some(&reason))?;
+                app.db.audit(None, None, "check.rejected", Some(&m.name), Some(&m.identity), Some(&format!("HTTP {code}")))?;
+                format!("REJECTED (HTTP {code}) → stale")
+            }
+            tokenstash_core::validate::Liveness::Unknown(e) => format!("unknown ({})", e.chars().take(40).collect::<String>()),
+        };
+        let stale_now = app.db.get_secret(&m.name, &m.identity)?.map(|x| x.stale).unwrap_or(false);
+        rows.push((m.name.clone(), m.identity.clone(), status, stale_now));
+        std::thread::sleep(std::time::Duration::from_millis(200)); // polite pacing
+    }
+    if a.json {
+        println!("{}", serde_json::to_string_pretty(&rows.iter().map(|(n, i, st, stale)| serde_json::json!({ "name": n, "identity": i, "result": st, "stale": stale })).collect::<Vec<_>>())?);
+        return Ok(0);
+    }
+    if rows.is_empty() { println!("nothing to check"); return Ok(0); }
+    println!("{:<36} {:<10} RESULT", "NAME", "IDENTITY");
+    for (n, i, st, _) in &rows { println!("{n:<36} {i:<10} {st}"); }
+    let stale = rows.iter().filter(|r| r.3).count();
+    if stale > 0 { println!("\n{stale} stale — the next `tokenstash need` for each asks for a replacement (or run `tokenstash rotate NAME`)"); }
     Ok(0)
 }

@@ -30,6 +30,12 @@ enum Cmd {
     List(cmd::admin::ListArgs),
     /// Delete a secret from the stash.
     Forget(cmd::admin::ForgetArgs),
+    /// Replace a key: marks it stale and asks you for the new value now.
+    Rotate(cmd::admin::RotateArgs),
+    /// Agent-facing: a provider rejected a key tokenstash injected (401/403). Never ask the user in chat; call this, then `need` again.
+    ReportBad(cmd::admin::ReportBadArgs),
+    /// Test every stored key against its provider and mark dead ones stale. For a person at a terminal.
+    Check(cmd::admin::CheckArgs),
     /// Bind a secret name to an identity for this project (work vs personal).
     Bind(cmd::admin::BindArgs),
     /// Manage trust roots (directories whose projects get silent injection).
@@ -72,6 +78,9 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Tasks(a) => cmd::admin::tasks(a),
         Cmd::List(a) => cmd::admin::list(a),
         Cmd::Forget(a) => cmd::admin::forget(a),
+        Cmd::Rotate(a) => cmd::admin::rotate(a),
+        Cmd::ReportBad(a) => cmd::admin::report_bad(a),
+        Cmd::Check(a) => cmd::admin::check(a),
         Cmd::Bind(a) => cmd::admin::bind(a),
         Cmd::Trust(a) => cmd::admin::trust(a),
         Cmd::Audit(a) => cmd::admin::audit(a),
