@@ -334,6 +334,29 @@ grep -q "OTHER_PROJECT_KEY" "$OUT/mcp-scope.txt" && { echo "FAIL: MCP revealed a
 grep -q '"all"' "$OUT/mcp-scope.txt" && { echo "FAIL: task_list still advertises an all-projects switch"; fail=1; }
 rm -rf "$(dirname "$OTHER")"
 
+# ── rotation: report-bad is not an oracle, check never prints a value ─────────────
+# Same line whether the name exists, was delivered here, or not at all.
+"$TS" report-bad OPENAI_API_KEY --status 401 --message "invalid key $CANARY" >"$OUT/report1.txt" 2>&1 || true
+"$TS" report-bad NOT_A_REAL_NAME --status 401 >"$OUT/report2.txt" 2>&1 || true
+diff <(sed 's/OPENAI_API_KEY\|NOT_A_REAL_NAME/NAME/' "$OUT/report1.txt") <(sed 's/OPENAI_API_KEY\|NOT_A_REAL_NAME/NAME/' "$OUT/report2.txt") >/dev/null || { echo "FAIL: report-bad answers differently for a real vs unknown name (oracle)"; fail=1; }
+grep -q "$CANARY" "$OUT/report1.txt" && { echo "LEAK: report-bad echoed the value"; fail=1; }
+"$TS" audit >"$OUT/audit-after-report.txt" 2>&1; grep -q "$CANARY" "$OUT/audit-after-report.txt" && { echo "LEAK: the reported message reached the audit log unscrubbed"; fail=1; }
+# check refuses a pipe (it is for a person at a terminal); the refusal must not list keys
+"$TS" check >"$OUT/check-pipe.txt" 2>&1 && { echo "FAIL: check ran without a terminal"; fail=1; }
+grep -q "OPENAI_API_KEY" "$OUT/check-pipe.txt" && { echo "FAIL: check's refusal listed a key name"; fail=1; }
+# rotate marks stale and files a card; the old value stays out of every output
+"$TS" rotate OPENAI_API_KEY >"$OUT/rotate.txt" 2>&1 || true
+"$TS" list >"$OUT/list-stale.txt" 2>&1
+grep -q "STALE" "$OUT/list-stale.txt" || { echo "FAIL: rotate did not mark the key stale"; fail=1; }
+grep -q "$CANARY" "$OUT/rotate.txt" "$OUT/list-stale.txt" && { echo "LEAK: rotation output contains the value"; fail=1; }
+RTID=$("$TS" tasks --json | python3 -c "import json,sys;l=[t for t in json.load(sys.stdin) if t.get('name')=='OPENAI_API_KEY' and t['status']=='pending'];print(l[0]['id'] if l else '')")
+[ -n "$RTID" ] || { echo "FAIL: rotate filed no replacement card"; fail=1; }
+NEWCANARY="sk-ROTATEDCANARY-$(date +%s)-0123456789abcdef"
+echo "$NEWCANARY" | "$TS" answer "$RTID" --stdin --skip-check >"$OUT/rotate-answer.txt" 2>&1 || true
+grep -q "OPENAI_API_KEY=$NEWCANARY" "$PROJ/.env.local" || { echo "FAIL: the rotated value did not land in the env file"; fail=1; }
+"$TS" list | grep -q "STALE" && { echo "FAIL: answering the rotation card did not clear stale"; fail=1; }
+CANARY="$NEWCANARY"
+
 # exit-code contract
 rc=0; "$TS" need OPENAI_API_KEY --agent ci >/dev/null 2>&1 || rc=$?; [ $rc -eq 0 ] || { echo "hit should exit 0 (got $rc)"; fail=1; }
 rc=0; "$TS" need NEVER_SEEN_KEY --agent ci >/dev/null 2>&1 || rc=$?; [ $rc -eq 10 ] || { echo "miss should exit 10 (got $rc)"; fail=1; }

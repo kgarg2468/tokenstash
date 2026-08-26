@@ -40,8 +40,18 @@ tokenstash ask "Add TXT record for resend.dev" --url https://dash.cloudflare.com
 
 Same exit codes. `--expects text` when you need an answer back (it arrives in the task note via `tokenstash tasks --history --json`). Text answers are for questions — a region, a project id, a yes/no with context — never for secrets; those go through `need`.
 
+## When a provider rejects a key
+
+If an API call fails with 401/403 (or the provider's documented bad-key status) **and your request was well-formed** — same shape as a call that worked, auth header exactly as documented — tell tokenstash, not the user:
+
+```
+tokenstash report-bad OPENAI_API_KEY --status 401
+```
+
+Then run `need` again. A dead key is treated as missing: the user gets one card to replace it. Never ask the user to paste or rotate a key in chat. 400/404/422 are not auth failures — fix the request. Report once; if the next `need` still injects the same key, the provider accepted it, so look at your request. If the user asks you to rotate a key: `tokenstash rotate NAME`.
+
 ## If MCP tools are available
-Prefer the `secrets_request` / `human_request` / `task_check` tools — same semantics, structured results.
+Prefer the `secrets_request` / `human_request` / `task_check` / `secrets_report_invalid` tools — same semantics, structured results.
 
 ## Running things
 `tokenstash run -- npm run dev` loads the env file and, if the process dies on a missing known key, files the task and restarts after the human answers.
