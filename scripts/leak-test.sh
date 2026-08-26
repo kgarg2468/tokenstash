@@ -383,7 +383,7 @@ if script -qec true /dev/null >/dev/null 2>&1; then
   BDIR="$(mktemp -d)"; PW="leak-test-passphrase-$RANDOM$RANDOM"
   # export: passphrase typed twice
   # (type after the prompt is up: a pty echoes input typed before rpassword disables echo)
-  (sleep 1; printf '%s\n' "$PW"; sleep 1; printf '%s\n' "$PW") | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_CI -u OPENAI_CODEX -u CURSOR_TRACE_ID -u CURSOR_AGENT -u GEMINI_CLI -u OPENCODE -u TOKENSTASH_AGENT \
+  (sleep 2; printf '%s\n' "$PW"; sleep 2; printf '%s\n' "$PW") | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_CI -u OPENAI_CODEX -u CURSOR_TRACE_ID -u CURSOR_AGENT -u GEMINI_CLI -u OPENCODE -u TOKENSTASH_AGENT \
     script -qec "$TS export -o $BDIR/t.bundle" /dev/null >"$OUT/export.txt" 2>&1 || true
   [ -s "$BDIR/t.bundle" ] || { echo "FAIL: export wrote no bundle"; sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$OUT/export.txt" | tail -3; fail=1; }
   if [ -s "$BDIR/t.bundle" ]; then
@@ -393,7 +393,7 @@ if script -qec true /dev/null >/dev/null 2>&1; then
     grep -q "$CANARY\|$PW" "$OUT/export.txt" && { echo "LEAK: export output contains a value or the passphrase"; fail=1; }
     # import into a fresh home: values arrive, nothing printed, no approvals granted
     HOME3="$(mktemp -d)"; cp "$TOKENSTASH_HOME/config.toml" "$HOME3/config.toml"
-    (sleep 1; printf '%s\n' "$PW") | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_CI -u OPENAI_CODEX -u CURSOR_TRACE_ID -u CURSOR_AGENT -u GEMINI_CLI -u OPENCODE -u TOKENSTASH_AGENT TOKENSTASH_HOME="$HOME3" \
+    (sleep 2; printf '%s\n' "$PW") | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_CI -u OPENAI_CODEX -u CURSOR_TRACE_ID -u CURSOR_AGENT -u GEMINI_CLI -u OPENCODE -u TOKENSTASH_AGENT TOKENSTASH_HOME="$HOME3" \
       script -qec "$TS import $BDIR/t.bundle --no-verify" /dev/null >"$OUT/import.txt" 2>&1 || true
     grep -q "added" "$OUT/import.txt" || { echo "FAIL: import did not report what it added"; sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$OUT/import.txt" | tail -3; fail=1; }
     grep -q "$CANARY\|$PW" "$OUT/import.txt" && { echo "LEAK: import output contains a value or the passphrase"; fail=1; }
@@ -401,7 +401,8 @@ if script -qec true /dev/null >/dev/null 2>&1; then
     [ "$(TOKENSTASH_HOME="$HOME3" "$TS" audit 2>/dev/null | grep -c 'approve')" = 0 ] || { echo "FAIL: import granted approvals"; fail=1; }
     # a wrong passphrase imports nothing
     HOME4="$(mktemp -d)"; cp "$TOKENSTASH_HOME/config.toml" "$HOME4/config.toml"
-    (sleep 1; printf 'wrong-passphrase-xx\n') | env -u CLAUDECODE TOKENSTASH_HOME="$HOME4" script -qec "$TS import $BDIR/t.bundle --no-verify" /dev/null >"$OUT/import-wrong.txt" 2>&1 || true
+    (sleep 2; printf 'wrong-passphrase-xx\n') | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_CI -u OPENAI_CODEX -u CURSOR_TRACE_ID -u CURSOR_AGENT -u GEMINI_CLI -u OPENCODE -u TOKENSTASH_AGENT TOKENSTASH_HOME="$HOME4" script -qec "$TS import $BDIR/t.bundle --no-verify" /dev/null >"$OUT/import-wrong.txt" 2>&1 || true
+    grep -q "wrong passphrase" "$OUT/import-wrong.txt" || { echo "FAIL: the wrong-passphrase import did not run or did not refuse"; fail=1; }
     TOKENSTASH_HOME="$HOME4" "$TS" list 2>/dev/null | grep -q "OPENAI_API_KEY" && { echo "FAIL: a wrong passphrase imported keys"; fail=1; }
     for h in "$HOME3" "$HOME4"; do TOKENSTASH_HOME="$h" "$TS" list 2>/dev/null | awk '$1 ~ /^[A-Z][A-Z0-9_]*$/ {print $1,$2}' | while read -r n i; do TOKENSTASH_HOME="$h" "$TS" forget "$n" --identity "$i" >/dev/null 2>&1 || true; done; rm -rf "$h"; done
   fi

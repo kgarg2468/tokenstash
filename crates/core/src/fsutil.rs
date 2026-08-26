@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Write `contents` to `path` such that:
 /// - the file is 0600 from the first byte (created with that mode, O_EXCL temp file);
@@ -11,6 +11,12 @@ use std::path::{Path, PathBuf};
 /// - the write is atomic: on any failure the previous file is untouched;
 /// - the temp file is never left behind.
 pub fn write_atomic_private(path: &Path, contents: &str) -> Result<()> {
+    write_atomic_private_bytes(path, contents.as_bytes())
+}
+
+/// Byte-oriented implementation (the bundle is binary). Same guarantees: refuses a symlink
+/// or non-file destination, O_EXCL temp at 0600, fsync, rename, temp removed on any failure.
+pub fn write_atomic_private_bytes(path: &Path, contents: &[u8]) -> Result<()> {
     if let Ok(md) = fs::symlink_metadata(path) {
         if md.file_type().is_symlink() {
             bail!("{} is a symlink; refusing to write a secret through it", path.display());
@@ -32,7 +38,7 @@ pub fn write_atomic_private(path: &Path, contents: &str) -> Result<()> {
         opts.mode(0o600);
     }
     let mut f = opts.open(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-    f.write_all(contents.as_bytes())?;
+    f.write_all(contents)?;
     f.sync_all()?;
     drop(f);
     fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
@@ -90,29 +96,4 @@ impl Drop for RemoveOnDrop {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
     }
-}
-
-/// Byte-oriented twin of [`write_atomic_private`] for binary artefacts (the bundle).
-pub fn write_atomic_private_bytes(path: &Path, contents: &[u8]) -> Result<()> {
-    if let Ok(md) = fs::symlink_metadata(path) {
-        if md.file_type().is_symlink() {
-            bail!("{} is a symlink; refusing to write through it", path.display());
-        }
-    }
-    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-    let tmp = dir.join(format!(".{}.tmp-{}", path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(), std::process::id()));
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-    use std::io::Write;
-    let res = f.write_all(contents).and_then(|_| f.sync_all());
-    if let Err(e) = res { let _ = fs::remove_file(&tmp); return Err(e.into()); }
-    drop(f);
-    fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))?;
-    Ok(())
 }

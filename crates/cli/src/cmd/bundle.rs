@@ -30,6 +30,7 @@ pub fn export(a: ExportArgs) -> Result<i32> {
     require_human("export")?;
     let app = App::open()?;
     let out = a.out.unwrap_or_else(|| PathBuf::from("tokenstash.bundle"));
+    let out = if out.is_absolute() { out } else { std::env::current_dir()?.join(out) };
     refuse_bad_destination(&out)?;
     let secrets = app.db.list_secrets()?;
     if secrets.is_empty() {
@@ -40,7 +41,7 @@ pub fn export(a: ExportArgs) -> Result<i32> {
     let mut missing = 0usize;
     for m in &secrets {
         match app.stash.get(&stash_key(&m.name, &m.identity))? {
-            Some(v) => entries.push(Entry { name: m.name.clone(), identity: m.identity.clone(), value: v.expose_secret().to_string(), provider: m.provider.clone(), sensitive: m.sensitive, source_url: m.source_url.clone(), created: m.created.clone(), last_used: m.last_used.clone(), stale: m.stale }),
+            Some(v) => entries.push(Entry { name: m.name.clone(), identity: m.identity.clone(), value: v.expose_secret().to_string(), provider: m.provider.clone(), sensitive: m.sensitive, source_url: m.source_url.clone(), created: m.created.clone(), last_used: m.last_used.clone(), stale: m.stale, stale_reason: m.stale_reason.clone() }),
             None => missing += 1,
         }
     }
@@ -51,6 +52,10 @@ pub fn export(a: ExportArgs) -> Result<i32> {
     println!("Choose a passphrase (12+ characters), or press Enter to generate one.");
     let pw = rpassword::prompt_password("passphrase: ")?;
     let pw = if pw.is_empty() {
+        use std::io::IsTerminal;
+        if !std::io::stdout().is_terminal() {
+            bail!("stdout is not a terminal, so a generated passphrase would land in a file or a pipe; choose one instead");
+        }
         let g = bundle::generate_passphrase();
         println!("\nGenerated passphrase — write it down now, it is shown once:\n\n    {}\n", g.expose_secret());
         g
@@ -69,7 +74,7 @@ pub fn export(a: ExportArgs) -> Result<i32> {
 /// A bundle holds every value: never into a git-tracked path, a project's env-file
 /// location, or a device/pipe.
 fn refuse_bad_destination(p: &Path) -> Result<()> {
-    if p.starts_with("/dev") { bail!("refusing to write the bundle to {}", p.display()); }
+    if p.starts_with("/dev") || p.starts_with("/proc") { bail!("refusing to write the bundle to {}", p.display()); }
     let parent = p.parent().filter(|d| !d.as_os_str().is_empty()).map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
     if let Some(root) = tokenstash_core::envfile::owned_git_root(&parent).ok().flatten() {
         if tokenstash_core::envfile::is_git_tracked(&root, p) {
@@ -92,21 +97,30 @@ pub struct ImportArgs {
     /// Skip the liveness sweep after import (keys stay unverified).
     #[arg(long)]
     pub no_verify: bool,
+    /// Also apply the bundle's project bindings (which identity a project uses). Off by
+    /// default: a binding changes which value a project receives, so it is listed, not applied.
+    #[arg(long)]
+    pub apply_bindings: bool,
 }
 
 pub fn import(a: ImportArgs) -> Result<i32> {
     require_human("import")?;
     let app = App::open()?;
+    let size = std::fs::metadata(&a.bundle).with_context(|| format!("reading {}", a.bundle.display()))?.len();
+    if size as usize > bundle::MAX_BUNDLE_BYTES {
+        bail!("{} is {size} bytes; a bundle is never that large", a.bundle.display());
+    }
     let bytes = std::fs::read(&a.bundle).with_context(|| format!("reading {}", a.bundle.display()))?;
     let pw = SecretString::from(rpassword::prompt_password("passphrase: ")?);
     let payload = bundle::open(&bytes, &pw)?;
     println!("bundle from {} ({} entries, {} bindings)", payload.created, payload.entries.len(), payload.bindings.len());
 
-    // 1. validate everything before touching anything
+    // 1. validate everything before touching anything: one bad entry refuses the whole file
+    if payload.entries.len() > bundle::MAX_ENTRIES {
+        bail!("bundle has {} entries; refusing more than {}", payload.entries.len(), bundle::MAX_ENTRIES);
+    }
     for e in &payload.entries {
-        if e.value.chars().count() < tokenstash_core::tasks::MIN_SECRET_CHARS {
-            bail!("entry {}@{} is shorter than {} characters; refusing the whole import", e.name, e.identity, tokenstash_core::tasks::MIN_SECRET_CHARS);
-        }
+        bundle::validate_entry(e).context("refusing the whole import")?;
     }
     // 2. resolve conflicts, one question per name, before applying
     #[derive(PartialEq)] enum Plan { Add, Skip, Replace }
@@ -136,22 +150,40 @@ pub fn import(a: ImportArgs) -> Result<i32> {
         }
         app.stash.set(&stash_key(&e.name, &e.identity), &SecretString::from(e.value.clone()))?;
         let provider = tokenstash_core::registry::lookup(&e.name);
+        let value = SecretString::from(e.value.clone());
+        // Sensitivity is re-derived here exactly as a paste derives it; the bundle cannot
+        // downgrade a registry-sensitive name or a live-mode value.
+        let by_pattern = match provider.and_then(|p| p.sensitive_pattern.as_ref()) {
+            Some(sp) => tokenstash_core::validate::matches_pattern(sp, &value)?,
+            None => false,
+        };
         app.db.upsert_secret(&tokenstash_core::db::SecretMeta {
             name: e.name.clone(), identity: e.identity.clone(),
             provider: e.provider.clone().or_else(|| provider.map(|p| p.provider.clone())),
-            sensitive: e.sensitive || provider.map(|p| p.sensitive).unwrap_or(false),
+            sensitive: e.sensitive || provider.map(|p| p.sensitive).unwrap_or(false) || by_pattern,
             source_url: e.source_url.clone().or_else(|| provider.map(|p| p.url.clone())),
-            created: tokenstash_core::now(), last_used: e.last_used.clone(), stale: e.stale,
-            last_verified: None, stale_reason: if e.stale { Some("stale on the exporting machine".into()) } else { None },
+            created: e.created.clone(), last_used: e.last_used.clone(), stale: e.stale,
+            last_verified: None,
+            stale_reason: if e.stale { e.stale_reason.clone().or_else(|| Some("stale on the exporting machine".into())) } else { None },
         })?;
         app.db.audit(None, None, "import", Some(&e.name), Some(&e.identity), Some(&format!("from {}", a.bundle.display())))?;
     }
     let mut bound = 0;
     for b in &payload.bindings {
-        if Path::new(&b.project).is_dir() { app.db.set_binding(&b.project, &b.name, &b.identity)?; bound += 1; }
+        let dir = Path::new(&b.project);
+        if !dir.is_absolute() || !dir.is_dir() { continue; }
+        if a.apply_bindings {
+            app.db.set_binding(&b.project, &b.name, &b.identity)?;
+            bound += 1;
+            println!("  binding applied: {} → {}@{}", tokenstash_core::project::short(dir), b.name, b.identity);
+        } else {
+            println!("  binding NOT applied (use --apply-bindings): {} → {}@{}", tokenstash_core::project::short(dir), b.name, b.identity);
+        }
     }
-    println!("✓ {added} added, {replaced} replaced, {skipped} unchanged; {bound} of {} bindings applied (the rest name paths that do not exist here)", payload.bindings.len());
-    let names: Vec<String> = plan.iter().filter(|(p, _)| *p != Plan::Skip).map(|(_, e)| e.name.clone()).collect();
+    println!("✓ {added} added, {replaced} replaced, {skipped} unchanged; {bound} of {} bindings applied", payload.bindings.len());
+    // Keys that arrived stale are already a miss; verifying them gains nothing, and a probe
+    // saying "still live" must not un-stale a rotation the user asked for on the old machine.
+    let names: Vec<String> = plan.iter().filter(|(p, e)| *p != Plan::Skip && !e.stale).map(|(_, e)| e.name.clone()).collect();
     drop(plan);
     drop(payload);
 
