@@ -48,7 +48,9 @@ If an API call fails with 401/403 (or the provider's documented bad-key status) 
 tokenstash report-bad OPENAI_API_KEY --status 401
 ```
 
-Then run `need` again. A dead key is treated as missing: the user gets one card to replace it. Never ask the user to paste or rotate a key in chat. 400/404/422 from a well-formed request are not auth failures — fix the request. Report once; if the next `need` still injects the same key, the provider accepted it, so look at your request. If the user wants to rotate a key themselves, tell them to run `tokenstash rotate NAME` in a terminal (it refuses to run for an agent).
+Then run `need` again. A dead key is treated as missing: the user gets one card to replace it. Never ask the user to paste or rotate a key in chat. 400/404/422 from a well-formed request are not auth failures — fix the request; 403 means the key is live but lacks permission — tell the user which scope is missing. Report once; if the next `need` still injects the same key, the provider accepted it, so look at your request. If the user wants to rotate a key themselves, tell them to run `tokenstash rotate NAME` in a terminal (it refuses to run for an agent).
+
+Usually you will not see the 401 at all: before delivering a key it has not checked in the last day, tokenstash re-checks it with the provider (one free request). A rejected key comes back from `need` as a pending **Replace** card instead of being written. Treat it like any other pending card — give the user the link, keep working — and do not report it as well.
 
 ## If MCP tools are available
 Prefer the `secrets_request` / `human_request` / `task_check` / `secrets_report_invalid` tools — same semantics, structured results.

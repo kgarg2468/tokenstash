@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 const RAW: &str = include_str!("../../../registry/providers.json");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Check {
     /// GET | POST
     #[serde(default = "default_get")]
@@ -23,6 +24,14 @@ pub struct Check {
     /// is decorative: `liveness` treats every other status as "accept".
     #[serde(default)]
     pub reject_status: Vec<u16>,
+    /// May this probe run unattended every time an agent `need`s the key (verify-on-use)?
+    /// An explicit allowlist, not a default: a probe is only safe at use when it is free
+    /// (no quota, no billing), read-only, and 401 unambiguously means "dead key". Off for
+    /// metered endpoints (Brave burns a search), for providers whose reject code is a
+    /// generic 400 (a bad request looks like a bad key), and for endpoints that answer 200
+    /// for an expired token and put the verdict in the body (Cloudflare).
+    #[serde(default)]
+    pub at_use: bool,
 }
 fn default_get() -> String { "GET".into() }
 

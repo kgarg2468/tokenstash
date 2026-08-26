@@ -17,10 +17,31 @@ pub enum Liveness {
     Unknown(String),
 }
 
+impl Liveness {
+    /// The provider said "slow down": the next probe must wait longer than after a mere outage.
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(self, Liveness::Unknown(s) if s == "HTTP 429")
+    }
+}
+
+/// Timeout for a human-initiated probe (paste, `check`, import).
+pub const TIMEOUT_HUMAN: Duration = Duration::from_secs(8);
+/// Timeout for a probe on the agent's hot path (verify-on-use in `need`).
+pub const TIMEOUT_AT_USE: Duration = Duration::from_secs(4);
+
 /// One cheap authenticated request. Never logs the value. Network failure → Unknown (accept).
-pub fn liveness(check: &Check, value: &SecretString) -> Liveness {
+///
+/// Verdicts: 401 (or a status the registry lists in `reject_status`) → Rejected. 403 is
+/// "authenticated but not permitted" — a restricted Stripe/SendGrid key answers 403 on an
+/// endpoint outside its scope and is perfectly alive — so it is Unknown, never Rejected.
+/// 429/5xx: the provider did not evaluate the key → Unknown. Redirects are never followed:
+/// `ureq` would forward custom auth headers (xi-api-key, X-Subscription-Token) to whatever
+/// origin the 3xx names, and strips Authorization so a redirected bearer probe would 401 on
+/// a live key. A 3xx is therefore Unknown too.
+pub fn liveness(check: &Check, value: &SecretString, timeout: Duration) -> Liveness {
     let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(8))
+        .timeout(timeout)
+        .redirects(0)
         .user_agent("tokenstash-liveness/0.1")
         .build();
     let v = value.expose_secret();
@@ -54,12 +75,15 @@ pub fn liveness(check: &Check, value: &SecretString) -> Liveness {
     }
     let resp = if check.method.eq_ignore_ascii_case("POST") { req.send_string("{}") } else { req.call() };
     match resp {
+        // With redirects off, ureq hands a 3xx back as a plain response.
+        Ok(r) if (300..400).contains(&r.status()) => Liveness::Unknown(format!("HTTP {}", r.status())),
         Ok(_) => Liveness::Ok,
         Err(ureq::Error::Status(code, _)) => {
-            if code == 401 || code == 403 || check.reject_status.contains(&code) {
+            if code == 401 || check.reject_status.contains(&code) {
                 Liveness::Rejected(code)
-            } else if code == 429 || code >= 500 {
-                // The provider did not evaluate the key (rate-limited, down): no verdict.
+            } else if code == 403 || (300..400).contains(&code) || code == 429 || code >= 500 {
+                // The provider did not evaluate the key (rate-limited, down, redirecting)
+                // or evaluated it and found it live but under-scoped (403): no verdict.
                 // Treating this as "accepted" would let an outage record a genuine dead-key
                 // report as a false report and suppress it for the whole cooldown.
                 Liveness::Unknown(format!("HTTP {code}"))
