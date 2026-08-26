@@ -282,7 +282,7 @@ pub fn from_env(a: FromEnvArgs) -> Result<i32> {
     if !std::io::stdout().is_terminal() { bail!("`export --from-env` is interactive; run it in a terminal"); }
     let app = App::open()?;
     let root = a.dir.canonicalize().with_context(|| format!("{} does not exist", a.dir.display()))?;
-    println!("scanning {} …", root.display());
+    println!("scanning {} …", tokenstash_core::envcrawl::display_path(&root));
     let c = tokenstash_core::envcrawl::crawl(&root);
     for p in &c.problems { eprintln!("  note: {p}"); }
     if c.candidates.is_empty() {
