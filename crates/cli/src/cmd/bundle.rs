@@ -31,7 +31,7 @@ pub fn export(a: ExportArgs) -> Result<i32> {
     let app = App::open()?;
     let out = a.out.unwrap_or_else(|| PathBuf::from("tokenstash.bundle"));
     let out = if out.is_absolute() { out } else { std::env::current_dir()?.join(out) };
-    refuse_bad_destination(&out)?;
+    refuse_bad_destination(&out, &app.cfg.env_file)?;
     let secrets = app.db.list_secrets()?;
     if secrets.is_empty() {
         println!("nothing indexed in this home; nothing to export");
@@ -71,12 +71,16 @@ pub fn export(a: ExportArgs) -> Result<i32> {
     Ok(0)
 }
 
-/// A bundle holds every value: never into a git-tracked path, a project's env-file
-/// location, or a device/pipe.
-fn refuse_bad_destination(p: &Path) -> Result<()> {
+/// A bundle holds every value: never into a device/pipe, a git-tracked path, a checkout
+/// owned by someone else (owned_git_root's hard error propagates), or a project's env-file
+/// name (a bundle is not an env file, and that name is what agents read).
+fn refuse_bad_destination(p: &Path, env_file: &str) -> Result<()> {
     if p.starts_with("/dev") || p.starts_with("/proc") { bail!("refusing to write the bundle to {}", p.display()); }
+    if p.file_name().map(|f| f.to_string_lossy() == env_file).unwrap_or(false) {
+        bail!("refusing to write the bundle as {}: that is the env-file name agents read", p.display());
+    }
     let parent = p.parent().filter(|d| !d.as_os_str().is_empty()).map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-    if let Some(root) = tokenstash_core::envfile::owned_git_root(&parent).ok().flatten() {
+    if let Some(root) = tokenstash_core::envfile::owned_git_root(&parent)? {
         if tokenstash_core::envfile::is_git_tracked(&root, p) {
             bail!("{} is tracked by git; refusing to write a bundle there", p.display());
         }
@@ -121,6 +125,12 @@ pub fn import(a: ImportArgs) -> Result<i32> {
     }
     for e in &payload.entries {
         bundle::validate_entry(e).context("refusing the whole import")?;
+        // What a paste would have rejected, an import rejects too.
+        if let Some(pat) = tokenstash_core::registry::lookup(&e.name).and_then(|p| p.pattern.as_ref()) {
+            if !tokenstash_core::validate::matches_pattern(pat, &SecretString::from(e.value.clone()))? {
+                bail!("entry {}@{} does not match the expected shape for {}; refusing the whole import", e.name, e.identity, e.name);
+            }
+        }
     }
     // 2. resolve conflicts, one question per name, before applying
     #[derive(PartialEq)] enum Plan { Add, Skip, Replace }
@@ -132,7 +142,15 @@ pub fn import(a: ImportArgs) -> Result<i32> {
             Some(v) if v.expose_secret() == e.value => Plan::Skip,
             Some(_) => {
                 if a.keep_existing { Plan::Skip } else if a.replace { Plan::Replace } else {
-                    let ans = rpassword::prompt_password(format!("{}@{} differs from what this machine has — replace it? [y/N] ", e.name, e.identity))?;
+                    let local = app.db.get_secret(&e.name, &e.identity)?;
+                    print!("{}@{} differs from what this machine has (here: stored {}{}; bundle: stored {}{}) — replace it? [y/N] ",
+                        e.name, e.identity,
+                        local.as_ref().map(|m| m.created.clone()).unwrap_or_default(), if local.as_ref().map(|m| m.stale).unwrap_or(false) { ", STALE" } else { "" },
+                        e.created, if e.stale { ", stale" } else { "" });
+                    use std::io::Write;
+                    std::io::stdout().flush()?;
+                    let mut ans = String::new();
+                    std::io::stdin().read_line(&mut ans)?;
                     if ans.trim().eq_ignore_ascii_case("y") { Plan::Replace } else { Plan::Skip }
                 }
             }
@@ -183,7 +201,14 @@ pub fn import(a: ImportArgs) -> Result<i32> {
     println!("✓ {added} added, {replaced} replaced, {skipped} unchanged; {bound} of {} bindings applied", payload.bindings.len());
     // Keys that arrived stale are already a miss; verifying them gains nothing, and a probe
     // saying "still live" must not un-stale a rotation the user asked for on the old machine.
-    let names: Vec<String> = plan.iter().filter(|(p, e)| *p != Plan::Skip && !e.stale).map(|(_, e)| e.name.clone()).collect();
+    // Also re-probe a key that was skipped as identical but is stale HERE and fresh in the
+    // bundle: the other machine may have a working copy of the same value.
+    let mut names: Vec<String> = plan.iter().filter(|(p, e)| *p != Plan::Skip && !e.stale).map(|(_, e)| e.name.clone()).collect();
+    for (p, e) in &plan {
+        if *p == Plan::Skip && !e.stale && app.db.get_secret(&e.name, &e.identity)?.map(|m| m.stale && !m.stale_reason.as_deref().unwrap_or("").starts_with(tokenstash_core::db::Db::ROTATE_REASON)).unwrap_or(false) {
+            names.push(e.name.clone());
+        }
+    }
     drop(plan);
     drop(payload);
 
