@@ -137,7 +137,7 @@ pub fn crawl(root: &Path) -> Crawl {
     let mut seen_files: std::collections::HashSet<PathBuf> = Default::default();
     let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
     while let Some((dir, depth)) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { out.problems.push(format!("{} — unreadable directory", dir.display())); continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else { out.problems.push(format!("{} — unreadable directory", display_path(&dir))); continue };
         for entry in rd.flatten() {
             let path = entry.path();
             let Ok(md) = std::fs::symlink_metadata(&path) else { continue };
