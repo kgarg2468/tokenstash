@@ -1097,6 +1097,6 @@ fn an_ordinary_card_answered_after_a_stale_mark_elsewhere_does_not_propagate() {
     let card = db.get_task(&tid).unwrap().unwrap();
     assert_eq!(card.expects, tasks::EXPECTS_REPLACE);
     tasks::answer_secret(&ctx, &card, SecretString::from("gsk_new_dddddddddddddddd".to_string()), true).unwrap();
-    assert!(std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("gsk_new_cccc") || std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("gsk_old_"), "B held the OLD value at the time of the ordinary answer; the replacement compares against the value it replaces");
+    assert!(std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("gsk_new_dddd"), "B held the ORIGINAL stale value (the ordinary answer changed the stash in between); the replacement still reaches it");
     std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
 }

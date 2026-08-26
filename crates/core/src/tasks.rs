@@ -251,18 +251,15 @@ pub fn answer_secret(ctx: &Ctx, task: &Task, value: SecretString, skip_liveness:
     // still holding it can be rewritten below. An ordinary paste that happens to differ from
     // a stored value (two projects with their own pending cards) is not a rotation.
     let is_replacement = task.expects == EXPECTS_REPLACE;
-    let previous = if is_replacement { ctx.stash.get(&stash_key(&name, &task.identity))? } else { None };
     let injected_to = store_and_inject(
         ctx, &name, &task.identity, &value, provider.map(|p| p.provider.clone()), task.url.clone(), sensitive,
         Path::new(&task.project), &task.agent, Some(&task.id),
         matches!(liveness, Some(Liveness::Ok)),
     )?;
-    let mut rotation = None;
-    if let Some(old) = previous {
-        if old.expose_secret() != value.expose_secret() {
-            rotation = Some(rewrite_replaced_value(ctx, &name, &task.identity, &old, &value, &task.project)?);
-        }
-    }
+    // A replacement card's answer reaches every project that was ever given this key and
+    // does not already hold the new value — whichever old value it holds (the stash may
+    // have changed between the stale mark and this answer).
+    let rotation = if is_replacement { Some(rewrite_replaced_value(ctx, &name, &task.identity, &value, &task.project)?) } else { None };
     Ok(AnswerResult::Stored { injected_to, sensitive, liveness, rotation })
 }
 
@@ -403,10 +400,11 @@ pub fn expire(ctx: &Ctx) -> Result<usize> {
     ctx.db.expire_overdue()
 }
 
-/// After a key is replaced, every other project whose env file still holds the OLD value
-/// gets the new one — otherwise each of them fails next week and files its own card. The
-/// comparison happens here, value to value, and is never shown. Projects that no longer
-/// exist, or whose file no longer holds the old value, are left alone.
+/// After a key is replaced, every other project that was given this key and whose env
+/// file does not already hold the NEW value gets it — otherwise each of them fails next
+/// week and files its own card. The comparison happens here, value to value, and is never
+/// shown. Projects that no longer exist, or no longer have the variable at all, are left
+/// alone.
 /// What the post-rotation rewrite did, for the human: the projects updated and the ones
 /// that still hold the old value and why (a git-tracked env file, a permission error).
 /// Those need a hand before the old key is revoked.
@@ -416,7 +414,7 @@ pub struct RotationReport {
     pub skipped: Vec<(String, String)>,
 }
 
-pub fn rewrite_replaced_value(ctx: &Ctx, name: &str, identity: &str, old: &SecretString, new: &SecretString, answering_project: &str) -> Result<RotationReport> {
+pub fn rewrite_replaced_value(ctx: &Ctx, name: &str, identity: &str, new: &SecretString, answering_project: &str) -> Result<RotationReport> {
     let mut report = RotationReport::default();
     let sensitive = ctx.db.get_secret(name, identity)?.map(|m| m.sensitive).unwrap_or(false);
     for project in ctx.db.delivered_projects(name, identity)? {
@@ -437,8 +435,8 @@ pub fn rewrite_replaced_value(ctx: &Ctx, name: &str, identity: &str, old: &Secre
         }
         let Ok(env_path) = crate::envfile::resolve(dir, &ctx.cfg.env_file) else { continue };
         let Ok(text) = std::fs::read_to_string(&env_path) else { continue };
-        let holds_old = text.lines().filter_map(crate::envfile::parse_line).any(|(k, v)| k == name && v == old.expose_secret());
-        if !holds_old {
+        let needs_update = text.lines().filter_map(crate::envfile::parse_line).any(|(k, v)| k == name && v != new.expose_secret());
+        if !needs_update {
             continue;
         }
         match crate::envfile::write(dir, &ctx.cfg.env_file, name, new) {
