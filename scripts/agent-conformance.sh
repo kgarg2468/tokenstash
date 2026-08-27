@@ -495,6 +495,7 @@ wait
     echo "# tokenstash agent conformance — $(date -u +%Y-%m-%dT%H:%MZ)"
     echo
     echo "binary: $TS ($("$TS" --version 2>/dev/null | head -1))"
+    rev=$(git -C "$(dirname "$REPO_SKILL")" rev-parse --short HEAD 2>/dev/null); [ -n "$rev" ] && echo "revision: $rev$(git -C "$(dirname "$REPO_SKILL")" diff --quiet 2>/dev/null || echo ' (with uncommitted changes)')"
     for a in "${AGENTS[@]}"; do
         case $a in cursor) bin=cursor-agent ;; *) bin=$a ;; esac
         printf -- '- %s: %s' "$a" "$("$bin" --version 2>/dev/null | head -1)"
