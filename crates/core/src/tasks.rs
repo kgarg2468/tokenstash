@@ -179,22 +179,32 @@ pub enum Decision {
 pub fn create_approval_task(ctx: &Ctx, project: &Path, agent: &str, names: &[String], kind: ApprovalKind) -> Result<Task> {
     let pid = project.to_string_lossy().to_string();
     if kind != ApprovalKind::Once {
-        if let Some(mut t) = ctx.db.open_approval_task_kind(&pid, kind.expects())? {
+        // Read-merge-write under the write lock: two processes growing the same card must
+        // not overwrite each other's names.
+        let own_tx = ctx.db.conn.is_autocommit();
+        if own_tx { ctx.db.conn.execute_batch("BEGIN IMMEDIATE")?; }
+        let merged_card = (|| -> Result<Option<Task>> {
+            let Some(mut t) = ctx.db.open_approval_task_kind(&pid, kind.expects())? else { return Ok(None) };
             let mut merged = t.names.clone();
             for n in names {
                 if !merged.contains(n) {
                     merged.push(n.clone());
                 }
             }
-            if merged != t.names {
-                if ctx.db.update_task_names(&t.id, &merged)? {
-                    t.names = merged;
-                    return Ok(t);
-                }
-                // answered between our read and this write: a new card, not a free ride
-            } else {
-                return Ok(t);
+            if merged == t.names {
+                return Ok(Some(t));
             }
+            if ctx.db.update_task_names(&t.id, &merged)? {
+                t.names = merged;
+                return Ok(Some(t));
+            }
+            Ok(None) // answered between our read and this write: a new card, not a free ride
+        })();
+        if own_tx {
+            match &merged_card { Ok(_) => ctx.db.conn.execute_batch("COMMIT")?, Err(_) => { let _ = ctx.db.conn.execute_batch("ROLLBACK"); } }
+        }
+        if let Some(t) = merged_card? {
+            return Ok(t);
         }
     }
     let shown: Vec<String> = names.iter().map(|n| n.strip_suffix("@default").unwrap_or(n).to_string()).collect();
