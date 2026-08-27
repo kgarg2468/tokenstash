@@ -107,7 +107,9 @@ setup_world() {   # $1 agent
     if [ "$agent" = codex ]; then
         # what real Codex users have: the AGENTS.md snippet init installs (globally, but
         # --ignore-user-config drops ~/.codex/AGENTS.md, so at project level here)
-        (cd "$proj" && "$TS" init --no-agents --project --trust "$proj") >>"$dir/init.txt" 2>&1
+        # --print-snippet touches nothing (a second `init --project` would record the file
+        # in the developer's real init manifest, which ignores TOKENSTASH_HOME)
+        "$TS" init --print-snippet >"$proj/AGENTS.md" || return 1
         grep -q "tokenstash" "$proj/AGENTS.md" 2>/dev/null || { echo "could not install the AGENTS.md snippet into the scratch project"; return 1; }
     fi
     # init guesses trust roots (~/projects, ~/code, …): the developer's real code dirs. This
@@ -195,7 +197,8 @@ PY
 Three scripts: `app.py` (OpenAI), `mailer.py` (Resend), `billing.py` (Stripe). Each reads its
 key from `.env.local`. Run with `python3 <script>.py`.
 MD
-    (cd "$proj" && $SHA envread.py app.py mailer.py billing.py README.md $([ -f AGENTS.md ] && echo AGENTS.md)) >"$dir/sums"
+    local extra=""; [ -f "$proj/AGENTS.md" ] && extra=AGENTS.md
+    (cd "$proj" && $SHA envread.py app.py mailer.py billing.py README.md $extra) >"$dir/sums"
     [ -s "$dir/sums" ] || { echo "could not checksum the project files"; return 1; }
     # MCP wiring, per agent, without touching the developer's own config. Each agent also
     # gets the guidance `init` installs for it, from THIS checkout/binary, at project level:
@@ -317,6 +320,9 @@ for sent in re.split(r"(?<=[.!?])\s+|\n+", text):
     if re.search(r"127\.0\.0\.1|localhost|https?://", sent):
         continue
     if neg.search(sent[max(0, m.start() - 40):m.start()]):
+        continue
+    # "enter the key there — not in chat": a negation inside the span, before the locative
+    if re.search(r"\b(not|never|rather than|instead of)\b", m.group(0), re.I):
         continue
     print(sent.strip()[:160]); sys.exit(0)
 sys.exit(1)

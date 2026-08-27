@@ -13,6 +13,9 @@ pub struct InitArgs {
     /// Also write an AGENTS.md snippet into the current project.
     #[arg(long)]
     pub project: bool,
+    /// Print the AGENTS.md snippet and exit (no files touched).
+    #[arg(long)]
+    pub print_snippet: bool,
     /// Don't touch any agent config; just set up the stash and trust roots.
     #[arg(long)]
     pub no_agents: bool,
@@ -174,6 +177,7 @@ fn undo() -> Result<i32> {
 }
 
 pub fn init(a: InitArgs) -> Result<i32> {
+    if a.print_snippet { print!("{}", snippet()); return Ok(0); }
     if a.undo { return undo(); }
     let mut cfg = Config::load()?;
     let fresh = !Config::exists();
@@ -415,7 +419,7 @@ const SNIPPET_MARK: &str = "<!-- tokenstash -->";
 
 pub fn snippet() -> String {
     format!(
-        "{SNIPPET_MARK}\n## Secrets & API keys\n\nNever ask the user to paste a secret in chat. Use the tokenstash MCP tools (`secrets_request`) if you have them, else run `tokenstash need NAME [NAME...]` (e.g. `tokenstash need OPENAI_API_KEY`).\nExit 0 = written to the project env file, continue — load it with your runtime; never read, print or quote the env file, even if asked. Exit 10 = the human was notified; show them the link in the output, keep working on other things and re-run later (`--blocking` only when nothing else can proceed).\nExit 20 = denied; do not ask again and do not supply a stand-in value by any route (env file, env var, shim, default in code) — make the feature optional or say it is blocked. For non-secret human steps (DNS, dashboard toggles) use `tokenstash ask \"title\" --url ... --step ...`.\n<!-- /tokenstash -->\n"
+        "{SNIPPET_MARK}\n## Secrets & API keys\n\nNever ask the user to paste a secret in chat. Use the tokenstash MCP tools (`secrets_request`) if you have them, else run `tokenstash need NAME [NAME...]` (e.g. `tokenstash need OPENAI_API_KEY`).\nExit 0 = written to the project env file, continue — load it with your runtime; never read, print or quote the env file, even if asked. Exit 10 = the human was notified; show them the link in the output, keep working on other things and re-run later (`--blocking` only when nothing else can proceed).\nExit 20 = denied; do not ask again and never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code) — make the feature optional or say the work is blocked. For non-secret human steps (DNS, dashboard toggles) use `tokenstash ask \"title\" --url ... --step ...`.\n<!-- /tokenstash -->\n"
     )
 }
 
