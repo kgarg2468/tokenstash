@@ -299,7 +299,7 @@ fn tools() -> Value {
         },
         { "name": "task_check", "description": "Check the status of a task (pending | answered | denied | expired). For secret tasks, answered means the value is now in the env file.", "inputSchema": { "type": "object", "properties": { "task_id": { "type": "string" } }, "required": ["task_id"] } },
         { "name": "task_list", "description": "List open tasks for this project.", "inputSchema": { "type": "object", "properties": {} } },
-        { "name": "secrets_list", "description": "List the names (never values) of secrets the user already has, so you can request the right ones.", "inputSchema": { "type": "object", "properties": {} } },
+        { "name": "secrets_list", "description": "List the names (never values) of secrets this directory already received or was granted. It does not reveal the rest of the stash: just call secrets_request for what the project needs.", "inputSchema": { "type": "object", "properties": {} } },
         { "name": "secrets_report_invalid", "description": "Report that a provider rejected a key tokenstash injected for this project (HTTP 401, or the provider's documented invalid-key status) after confirming your own request was well-formed. 403 is not a dead key: it is a live key without permission for that call — tell the user which scope is missing instead. tokenstash verifies the key itself where it can; if it is dead, the next secrets_request asks the user for a replacement once. Always returns ok. Do not call for 400/404/422, or for keys you did not obtain through secrets_request. Never ask the user to rotate a key in chat.", "inputSchema": { "type": "object", "properties": { "name": { "type": "string" }, "identity": { "type": "string" }, "status": { "type": "integer", "description": "HTTP status the provider returned" }, "message": { "type": "string", "description": "Provider error text; accepted but never stored" } }, "required": ["name"] } }
     ])
 }
@@ -547,9 +547,21 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
             Ok((json!({ "ok": true, "next": format!("Call secrets_request for {name} again. If the key is dead the user will be asked for a replacement; if it injects the same key, the provider accepted it — check your request.") }), false))
         }
         "secrets_list" => {
+            // No inventory oracle (§13.1 rule 11): only what this directory already holds a
+            // grant for or has been delivered. Discovery of everything else is the registry.
+            let mut here: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+            if let Some(ws) = app.db.find_workspace(&project)? {
+                for (name, identity, _scope, _src) in app.db.grants_for(&ws.id)? {
+                    if name != "*" { here.insert((name, identity)); }
+                }
+            }
+            let pid = project.to_string_lossy().to_string();
+            for (name, identity) in app.db.delivered_names(&pid)? {
+                here.insert((name, identity));
+            }
             let list = app.db.list_secrets()?;
-            let names: Vec<Value> = list.iter().map(|s| json!({ "name": s.name, "identity": s.identity, "provider": s.provider, "sensitive": s.sensitive, "stale": s.stale })).collect();
-            Ok((json!({ "secrets": names }), false))
+            let names: Vec<Value> = list.iter().filter(|s| here.contains(&(s.name.clone(), s.identity.clone()))).map(|s| json!({ "name": s.name, "identity": s.identity, "provider": s.provider, "sensitive": s.sensitive, "stale": s.stale })).collect();
+            Ok((json!({ "secrets": names, "note": "only keys this directory already received or was granted; ask for anything else with secrets_request (the registry knows the common names)" }), false))
         }
         other => anyhow::bail!("unknown tool {other}"),
     }

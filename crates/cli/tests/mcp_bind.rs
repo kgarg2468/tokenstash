@@ -275,3 +275,28 @@ fn a_late_or_failed_roots_answer_means_cwd() {
     c.answer_roots(&req, &[&file_uri(&other)]);
     assert_eq!(c.bound_project(20).unwrap(), canon(&proj), "bound once");
 }
+
+#[test]
+fn secrets_list_shows_only_what_this_directory_holds() {
+    let home = home("home-list");
+    let proj = tmp("proj-list");
+    // a key in the stash that this directory never received
+    let seed = Command::new(env!("CARGO_BIN_EXE_tokenstash")).args(["need", "GROQ_API_KEY", "--agent", "seed"]).current_dir(&proj)
+        .env("TOKENSTASH_HOME", &home).env("TOKENSTASH_STASH", "insecure-file").env_remove("CLAUDECODE").output().unwrap();
+    let _ = seed;
+    let tasks = Command::new(env!("CARGO_BIN_EXE_tokenstash")).args(["tasks", "--json", "--all"]).env("TOKENSTASH_HOME", &home).env("TOKENSTASH_STASH", "insecure-file").output().unwrap();
+    let tid = serde_json::from_slice::<serde_json::Value>(&tasks.stdout).unwrap().as_array().unwrap().iter().find(|t| t["name"] == "GROQ_API_KEY").unwrap()["id"].as_str().unwrap().to_string();
+    let mut ans = Command::new(env!("CARGO_BIN_EXE_tokenstash")).args(["answer", &tid, "--stdin", "--skip-check"]).env("TOKENSTASH_HOME", &home).env("TOKENSTASH_STASH", "insecure-file").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    ans.stdin.take().unwrap().write_all(b"gsk_aaaaaaaaaaaaaaaaaaaa\n").unwrap();
+    assert!(ans.wait().unwrap().success());
+    // the directory that pasted it lists it; another directory lists nothing
+    let mut c = Client::start(&home, &proj, false);
+    let r = c.call(2, "secrets_list", serde_json::json!({}));
+    let names: Vec<String> = r.pointer("/result/structuredContent/secrets").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|s| s["name"].as_str().map(String::from)).collect()).unwrap_or_default();
+    assert_eq!(names, vec!["GROQ_API_KEY".to_string()], "{r}");
+    let other = tmp("proj-list-other");
+    let mut c = Client::start(&home, &other, false);
+    let r = c.call(2, "secrets_list", serde_json::json!({}));
+    let names = r.pointer("/result/structuredContent/secrets").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(99);
+    assert_eq!(names, 0, "no inventory oracle: {r}");
+}

@@ -7,8 +7,8 @@ any agent" has to be measured, not assumed. `scripts/agent-conformance.sh` measu
 ## What it does
 
 For each agent CLI on PATH (Claude Code, Codex, Cursor; Gemini CLI is not wired yet) it
-builds an isolated world — its own `TOKENSTASH_HOME`, an insecure-file stash, a trust root
-that is only the scratch project, an inbox on a free port whose ownership `doctor` has
+builds an isolated world — its own `TOKENSTASH_HOME`, an insecure-file stash, a seed paste
+from inside the scratch project as the only grant on the machine, an inbox on a free port whose ownership `doctor` has
 proved — and runs five prompts headless against a scratch project with three scripts that
 each need one key:
 
@@ -37,7 +37,7 @@ scripts/agent-conformance.sh target/release/tokenstash claude     # one agent
 CONF_TIMEOUT=300 CONF_OUT=/tmp/conf scripts/agent-conformance.sh …   # CONF_OUT must be empty
 ```
 
-Isolation, precisely: nothing under the developer's tokenstash home, keyring or trust roots
+Isolation, precisely: nothing under the developer's tokenstash home, keyring or grants
 is read or written; MCP wiring is passed on the command line (Claude: `--mcp-config
 --strict-mcp-config`; Codex: `--ignore-user-config` plus `-c mcp_servers…`; Cursor: a
 project-local `.cursor/mcp.json`). What is *not* isolated is the agents' own state: Claude
@@ -54,7 +54,13 @@ Agents are not deterministic: a scenario that passes four runs out of five is a 
 Run it more than once before believing a change fixed something. `CONF_SETUP_ONLY=1` builds the
 worlds and runs no agent — the cheap way to check a new machine.
 
-## Latest scorecard — 2026-08-27, tokenstash 0.1.0 (after the guidance changes)
+## Latest scorecard — 2026-08-27, tokenstash 0.2.0 (trust v2)
+
+15/15 on the trust v2 binary (every stash hit now goes through the workspace gate; the seed
+paste's grant is what keeps scenario 1 silent): `docs/conformance-runs/2026-08-27-trust-v2-*.md`.
+The section below is the last 0.1 run, kept because it explains the guidance changes.
+
+## Scorecard — 2026-08-27, tokenstash 0.1.0 (after the guidance changes)
 
 - claude: 2.1.241 (Claude Code) (skill: this checkout's SKILL.md, project-level; ~/.claude/skills/tokenstash also present)
 - codex: codex-cli 0.149.0 (model: codex default; this checkout's AGENTS.md snippet at project level)
