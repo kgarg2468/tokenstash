@@ -78,7 +78,7 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"secrets_request","arguments":{"secrets":[{"name":"OPENAI_API_KEY"}],"project":"'"$PROJ"'"}}}' \
   '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"secrets_list","arguments":{}}}' \
   '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"task_list","arguments":{"all":true}}}' \
-  | "$TS" mcp >"$OUT/mcp.txt" 2>&1
+  | (cd "$PROJ" && "$TS" mcp) >"$OUT/mcp.txt" 2>&1
 "$TS" doctor >"$OUT/doctor.txt" 2>&1 || true
 
 # run shim: a child that echoes its environment must not leak the injected value
@@ -339,7 +339,15 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"task_check","arguments":{"task_id":"'"$OTID"'","project":"'"$PROJ"'"}}}' \
   '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"task_list","arguments":{"project":"'"$PROJ"'","all":true}}}' \
   '{"jsonrpc":"2.0","id":4,"method":"tools/list"}' \
-  | "$TS" mcp >"$OUT/mcp-scope.txt" 2>&1 || true
+  | (cd "$PROJ" && "$TS" mcp) >"$OUT/mcp-scope.txt" 2>&1 || true
+# the server serves the directory it was started in; no schema names a project, and a
+# request for another directory is refused outright
+grep '"tools"' "$OUT/mcp-scope.txt" | grep -q '"project":{' && { echo "FAIL: a tool schema still takes a project argument"; fail=1; }
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"ci"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"secrets_list","arguments":{}}}' \
+  | (cd / && "$TS" mcp) >"$OUT/mcp-root.txt" 2>&1 || true
+grep -q "no project bound" "$OUT/mcp-root.txt" || { echo "FAIL: an MCP server started at / served a tool call"; fail=1; }
 grep -q "$OTHER" "$OUT/mcp-scope.txt" && { echo "FAIL: MCP revealed another project's path via task_check/task_list"; fail=1; }
 grep -q "OTHER_PROJECT_KEY" "$OUT/mcp-scope.txt" && { echo "FAIL: MCP revealed another project's task via task_check/task_list"; fail=1; }
 grep -q '"all"' "$OUT/mcp-scope.txt" && { echo "FAIL: task_list still advertises an all-projects switch"; fail=1; }

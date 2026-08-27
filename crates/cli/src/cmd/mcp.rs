@@ -28,10 +28,65 @@ use tokenstash_core::tasks::{self, HumanRequest, SecretRequest};
 
 const PROTOCOL: &str = "2025-06-18";
 
+/// Which directory this server serves. Decided once, at the first tool call, from the
+/// client's `roots` (when it advertised the capability and had answered by then) or the
+/// server's cwd; never from a tool argument. Measured 2026-08-27: Claude Code, Codex and
+/// Cursor all spawn the server in the project directory; only Claude Code offers `roots`.
+struct Binding {
+    /// Ok(project) or Err(why this directory is refused).
+    bound: Option<std::result::Result<PathBuf, String>>,
+    roots_supported: bool,
+    roots: Option<Vec<PathBuf>>,
+}
+
+const ROOTS_REQ_ID: &str = "tokenstash-roots-1";
+
+impl Binding {
+    fn decide(&mut self) -> &std::result::Result<PathBuf, String> {
+        if self.bound.is_none() {
+            let cwd = tokenstash_core::project::current();
+            let candidate = match self.roots.as_deref() {
+                Some([one]) => one.clone(),
+                Some(many) if !many.is_empty() => {
+                    // the root containing cwd; else the one root cwd is the parent of; else cwd
+                    many.iter().find(|r| cwd.starts_with(r)).cloned()
+                        .or_else(|| { let under: Vec<&PathBuf> = many.iter().filter(|r| r.starts_with(&cwd)).collect(); if under.len() == 1 { Some(under[0].clone()) } else { None } })
+                        .unwrap_or(cwd)
+                }
+                _ => cwd,
+            };
+            let candidate = tokenstash_core::project::canonical(&candidate);
+            self.bound = Some(match tokenstash_core::trust::refused_root(&candidate) {
+                Some(why) => Err(format!("no project bound: {} is {why}. Restart your agent in the project directory.", candidate.display())),
+                None => Ok(candidate),
+            });
+        }
+        self.bound.as_ref().unwrap()
+    }
+}
+
+/// `file:///a/b%20c` → `/a/b c`; anything that is not a local file URI is ignored.
+fn root_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    if !rest.starts_with('/') { return None; }
+    let mut out = Vec::with_capacity(rest.len());
+    let b = rest.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&rest[i + 1..i + 3], 16) { out.push(v); i += 3; continue; }
+        }
+        out.push(b[i]); i += 1;
+    }
+    Some(PathBuf::from(String::from_utf8_lossy(&out).to_string()))
+}
+
 pub fn serve() -> Result<i32> {
     let stdin = std::io::stdin();
     let mut out = std::io::stdout().lock();
     let mut agent = String::from("mcp");
+    let mut binding = Binding { bound: None, roots_supported: false, roots: None };
     for line in stdin.lock().lines() {
         let line = match line { Ok(l) => l, Err(_) => break };
         if line.trim().is_empty() { continue; }
@@ -42,7 +97,21 @@ pub fn serve() -> Result<i32> {
         let id = msg.get("id").cloned();
         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("").to_string();
         let params = msg.get("params").cloned().unwrap_or(json!({}));
-        let Some(id) = id else { continue }; // notification
+        // A response to our own request (no method): only `roots/list` is ever sent.
+        if method.is_empty() {
+            if id.as_ref().and_then(|v| v.as_str()) == Some(ROOTS_REQ_ID) && binding.bound.is_none() {
+                let roots: Vec<PathBuf> = msg.pointer("/result/roots").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|r| r.get("uri").and_then(|u| u.as_str()).and_then(root_path)).collect()).unwrap_or_default();
+                binding.roots = Some(roots);
+            }
+            continue;
+        }
+        let Some(id) = id else {
+            // notifications
+            if method == "notifications/initialized" && binding.roots_supported {
+                write_msg(&mut out, &json!({ "jsonrpc": "2.0", "id": ROOTS_REQ_ID, "method": "roots/list" }))?;
+            }
+            continue;
+        };
         let resp = match method.as_str() {
             "initialize" => {
                 // The client names itself; the name ends up in audit rows and on cards
@@ -51,6 +120,7 @@ pub fn serve() -> Result<i32> {
                 if let Some(n) = params.pointer("/clientInfo/name").and_then(|v| v.as_str()) {
                     agent = need::clean_agent(n);
                 }
+                binding.roots_supported = params.pointer("/capabilities/roots").is_some();
                 let pv = params.get("protocolVersion").and_then(|v| v.as_str()).unwrap_or(PROTOCOL);
                 result(id, json!({
                     "protocolVersion": pv,
@@ -61,9 +131,12 @@ pub fn serve() -> Result<i32> {
             }
             "ping" => result(id, json!({})),
             "tools/list" => result(id, json!({ "tools": tools() })),
-            "tools/call" => match call(&params, &agent) {
+            "tools/call" => match binding.decide().clone() {
+                Err(why) => result(id, json!({ "content": [{ "type": "text", "text": why }], "isError": true })),
+                Ok(project) => match call(&params, &agent, &project) {
                 Ok((v, is_err)) => result(id, json!({ "content": [{ "type": "text", "text": v.to_string() }], "structuredContent": v, "isError": is_err })),
-                Err(e) => result(id, json!({ "content": [{ "type": "text", "text": format!("error: {e:#}") }], "isError": true })),
+                    Err(e) => result(id, json!({ "content": [{ "type": "text", "text": format!("error: {e:#}") }], "isError": true })),
+                },
             },
             _ => error(id, -32601, &format!("method not found: {method}")),
         };
@@ -97,7 +170,6 @@ fn tools() -> Value {
                         "pattern": { "type": "string", "description": "Regex the value must match" },
                         "identity": { "type": "string", "description": "Identity label (work/personal), optional" }
                     }, "required": ["name"] } },
-                    "project": { "type": "string", "description": "Project directory (defaults to the server's working directory)" },
                     "blocking": { "type": "boolean", "description": "Wait (at most 30 s) for the user instead of returning pending. Default false. Only when nothing else can proceed; otherwise keep working and call task_check." },
                     "timeout_s": { "type": "integer", "default": 30, "description": "Seconds to wait when blocking; capped at 30 so your client does not time out. If still pending, call task_check with the task_id." }
                 },
@@ -111,11 +183,11 @@ fn tools() -> Value {
                 "title": { "type": "string" }, "why": { "type": "string" }, "url": { "type": "string" },
                 "steps": { "type": "array", "items": { "type": "string" } },
                 "expects": { "type": "string", "enum": ["confirm", "text"], "default": "confirm" },
-                "project": { "type": "string" }, "blocking": { "type": "boolean" }, "timeout_s": { "type": "integer", "default": 30, "description": "Capped at 30; if still pending, call task_check with the task_id — do not call human_request again." }
+                "blocking": { "type": "boolean" }, "timeout_s": { "type": "integer", "default": 30, "description": "Capped at 30; if still pending, call task_check with the task_id — do not call human_request again." }
             }, "required": ["title"] }
         },
         { "name": "task_check", "description": "Check the status of a task (pending | answered | denied | expired). For secret tasks, answered means the value is now in the env file.", "inputSchema": { "type": "object", "properties": { "task_id": { "type": "string" } }, "required": ["task_id"] } },
-        { "name": "task_list", "description": "List open tasks for the project.", "inputSchema": { "type": "object", "properties": { "project": { "type": "string" } } } },
+        { "name": "task_list", "description": "List open tasks for this project.", "inputSchema": { "type": "object", "properties": {} } },
         { "name": "secrets_list", "description": "List the names (never values) of secrets the user already has, so you can request the right ones.", "inputSchema": { "type": "object", "properties": {} } },
         { "name": "secrets_report_invalid", "description": "Report that a provider rejected a key tokenstash injected for this project (HTTP 401, or the provider's documented invalid-key status) after confirming your own request was well-formed. 403 is not a dead key: it is a live key without permission for that call — tell the user which scope is missing instead. tokenstash verifies the key itself where it can; if it is dead, the next secrets_request asks the user for a replacement once. Always returns ok. Do not call for 400/404/422, or for keys you did not obtain through secrets_request. Never ask the user to rotate a key in chat.", "inputSchema": { "type": "object", "properties": { "name": { "type": "string" }, "identity": { "type": "string" }, "status": { "type": "integer", "description": "HTTP status the provider returned" }, "message": { "type": "string", "description": "Provider error text; accepted but never stored" } }, "required": ["name"] } }
     ])
@@ -124,11 +196,11 @@ fn tools() -> Value {
 #[derive(Deserialize)]
 struct SecretSpec { name: String, why: Option<String>, url: Option<String>, #[serde(default)] steps: Vec<String>, pattern: Option<String>, identity: Option<String> }
 
-/// The server serves the directory it was started in. A `project` argument is accepted
-/// only when it names that same directory: a model must not pick which directory's
-/// grants it uses. (Roots binding and removing the argument from the schemas: PR B.)
-fn project_of(args: &Value) -> anyhow::Result<PathBuf> {
-    let here = tokenstash_core::project::current();
+/// The server serves the directory it was bound to. A `project` argument (no longer in
+/// any schema; an old prompt may still send one) is accepted only when it names that same
+/// directory: a model must not pick which directory's grants it uses.
+fn project_of(args: &Value, bound: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let here = bound.to_path_buf();
     match args.get("project").and_then(|v| v.as_str()) {
         Some(p) => {
             let asked = tokenstash_core::project::canonical(std::path::Path::new(p));
@@ -141,11 +213,11 @@ fn project_of(args: &Value) -> anyhow::Result<PathBuf> {
     }
 }
 
-fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
+fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, bool)> {
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
     let app = App::open()?;
-    let project = project_of(&args)?;
+    let project = project_of(&args, bound)?;
     let blocking = args.get("blocking").and_then(|v| v.as_bool()).unwrap_or(false);
     // MCP clients time out a tool call well before a human answers a card (Cursor's did at
     // about a minute in the conformance suite, and the agent then fell back to polling a
@@ -344,10 +416,10 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
         }
         "secrets_report_invalid" => {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            // The project is where this server was started, never the `project` argument: a
-            // report only counts from a project that received the key, and a caller-named
-            // path would let a hostile repo borrow another project's standing.
-            let project = tokenstash_core::project::current();
+            // The project is the bound directory, never a `project` argument: a report only
+            // counts from a project that received the key, and a caller-named path would let
+            // a hostile repo borrow another project's standing.
+            let project = bound.to_path_buf();
             let identity = args.get("identity").and_then(|v| v.as_str()).map(|s| s.to_string())
                 .or(match app.db.find_workspace(&project)? { Some(w) => app.db.binding(&w.id, &name)?, None => None })
                 .unwrap_or_else(|| "default".into());
