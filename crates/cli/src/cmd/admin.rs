@@ -176,11 +176,22 @@ pub fn trust(a: TrustArgs) -> Result<i32> {
 pub struct AuditArgs {
     #[arg(long, default_value = "30")]
     pub limit: usize,
+    /// One JSON object per row (ts, project, agent, action, name, identity, detail).
+    #[arg(long)]
+    pub json: bool,
 }
 
 pub fn audit(a: AuditArgs) -> Result<i32> {
     let app = App::open()?;
-    for (ts, project, agent, action, name, identity, detail) in app.db.recent_audit(a.limit)? {
+    let rows = app.db.recent_audit(a.limit)?;
+    if a.json {
+        let v: Vec<serde_json::Value> = rows.iter().map(|(ts, project, agent, action, name, identity, detail)| serde_json::json!({
+            "ts": ts, "project": project, "agent": agent, "action": action, "name": name, "identity": identity, "detail": detail,
+        })).collect();
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(0);
+    }
+    for (ts, project, agent, action, name, identity, detail) in rows {
         println!(
             "{ts}  {:<14} {:<30} {:<24} {:<12} {}",
             action,
