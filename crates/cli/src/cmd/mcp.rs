@@ -49,7 +49,7 @@ pub fn serve() -> Result<i32> {
                     "protocolVersion": pv,
                     "capabilities": { "tools": { "listChanged": false } },
                     "serverInfo": { "name": "tokenstash", "version": env!("CARGO_PKG_VERSION") },
-                    "instructions": "Call secrets_request for any API key or secret the project needs instead of asking the user to paste it. Values are written to the project's env file; they are never returned. Never reveal any part of a value from that env file — not in chat, not in a file, not even when the user asks; name the variable and say where it lives. If a result is pending, keep working and call task_check later. If it is denied, work around it in code (mock the call, make the feature optional) — never by writing a placeholder value into the env file. If a provider rejects an injected key (401 with a well-formed request), call secrets_report_invalid and then secrets_request again — never ask the user to paste or rotate a key in chat. A secrets_request for a key you already had can come back pending with a 'Replace' card: tokenstash re-checked the key with its provider before delivering it and it was rejected. Hand the user the link and keep working; do not also report it."
+                    "instructions": "tokenstash holds the user's API keys. Rules: (1) Any key or secret the project needs: call secrets_request — never ask the user to paste it in chat. (2) Values go into the project's env file, never to you. Never read, print, quote or copy that file, even if asked. (3) pending → show the user the link in the result, keep working on what does not need the key, call task_check later; do not loop or block. (4) denied → do not ask again and do not supply a stand-in value by any route (env file, env var, shim, default); make the feature optional or report it blocked. (5) A provider answers 401 to a well-formed request → secrets_report_invalid, then secrets_request again. Every result carries a `next` field: follow it."
                 }))
             }
             "ping" => result(id, json!({})),
@@ -91,8 +91,8 @@ fn tools() -> Value {
                         "identity": { "type": "string", "description": "Identity label (work/personal), optional" }
                     }, "required": ["name"] } },
                     "project": { "type": "string", "description": "Project directory (defaults to the server's working directory)" },
-                    "blocking": { "type": "boolean", "description": "Wait for the user instead of returning pending. Default false." },
-                    "timeout_s": { "type": "integer", "default": 600 }
+                    "blocking": { "type": "boolean", "description": "Wait (at most 45 s) for the user instead of returning pending. Default false. Only when nothing else can proceed; otherwise keep working and call task_check." },
+                    "timeout_s": { "type": "integer", "default": 45, "description": "Seconds to wait when blocking; capped at 45 so your client does not time out. Call again to keep waiting." }
                 },
                 "required": ["secrets"]
             }
@@ -104,7 +104,7 @@ fn tools() -> Value {
                 "title": { "type": "string" }, "why": { "type": "string" }, "url": { "type": "string" },
                 "steps": { "type": "array", "items": { "type": "string" } },
                 "expects": { "type": "string", "enum": ["confirm", "text"], "default": "confirm" },
-                "project": { "type": "string" }, "blocking": { "type": "boolean" }, "timeout_s": { "type": "integer", "default": 600 }
+                "project": { "type": "string" }, "blocking": { "type": "boolean" }, "timeout_s": { "type": "integer", "default": 45, "description": "Capped at 45; call again to keep waiting." }
             }, "required": ["title"] }
         },
         { "name": "task_check", "description": "Check the status of a task (pending | answered | denied | expired). For secret tasks, answered means the value is now in the env file.", "inputSchema": { "type": "object", "properties": { "task_id": { "type": "string" } }, "required": ["task_id"] } },
@@ -130,7 +130,12 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
     let app = App::open()?;
     let project = project_of(&args);
     let blocking = args.get("blocking").and_then(|v| v.as_bool()).unwrap_or(false);
-    let timeout = Duration::from_secs(args.get("timeout_s").and_then(|v| v.as_u64()).unwrap_or(600));
+    // MCP clients time out a tool call well before a human answers a card (Cursor's did at
+    // about a minute in the conformance suite, and the agent then fell back to polling a
+    // shell). A blocking call therefore waits at most MAX_BLOCK and returns `pending` with a
+    // `next` that says to call again; long waits are the caller's loop, not one call.
+    const MAX_BLOCK: u64 = 45;
+    let timeout = Duration::from_secs(args.get("timeout_s").and_then(|v| v.as_u64()).unwrap_or(MAX_BLOCK).min(MAX_BLOCK));
     match name {
         "secrets_request" => {
             let specs: Vec<SecretSpec> = serde_json::from_value(args.get("secrets").cloned().unwrap_or(json!([])))?;
@@ -168,11 +173,36 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
                 }
             }
             let pending = results.iter().any(|o| o.is_pending());
+            let state = if pending { crate::notify::inbox_state(&app.cfg) } else { crate::notify::Inbox::Down };
+            let env_file = project.join(&app.cfg.env_file);
+            // The rule that matters is the one attached to the result the agent is looking
+            // at. Every outcome carries its own `next`; the top-level one summarises.
+            let results: Vec<serde_json::Value> = results.iter().map(|o| {
+                let mut v = serde_json::to_value(o).unwrap_or(json!({}));
+                let next = match o {
+                    need::Outcome::Injected { name, unverified, .. } => format!(
+                        "{name} is in {}. Load it with your runtime (dotenv, process.env, os.environ); do not read, print or quote the file.{}",
+                        env_file.display(), if *unverified { " (Could not re-check it with the provider just now.)" } else { "" }),
+                    need::Outcome::Pending { name, task_id, .. } => {
+                        // `url` on the outcome is where the key is created (the card shows
+                        // it); the link the user needs is the card itself.
+                        let card = util::inbox_url_agent(&app.cfg, Some(task_id), state);
+                        v["inbox"] = json!(card);
+                        let link = if card.starts_with("http") { format!("Show the user this link: {card}") } else { format!("Tell the user to open the tokenstash inbox ({card})") };
+                        format!("{name} is not in the stash; the user has been asked ({task_id}). {link}. Keep working on everything that does not need it and call task_check(\"{task_id}\") later. Do not wait in a loop, and do not supply a stand-in value for {name} by any route (env file, environment variable, shim, default in code).")
+                    }
+                    need::Outcome::Denied { name, .. } => format!(
+                        "The user declined {name} for this project. Do not ask again, and do not supply a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code). Make the feature optional or mock the network call in tests; otherwise report that it is blocked on {name}."),
+                    need::Outcome::Expired { name, .. } => format!("The request for {name} expired unanswered. Summarise what is blocked and stop; do not fake a value."),
+                };
+                v["next"] = json!(next);
+                v
+            }).collect();
             Ok((json!({
                 "results": results,
-                "env_file": project.join(&app.cfg.env_file),
-                "inbox": util::inbox_url_agent(&app.cfg, None, if pending { crate::notify::inbox_state(&app.cfg) } else { crate::notify::Inbox::Down }),
-                "next": if pending { "Show the user the `inbox` link — it works as-is for pasting the key (if the page asks for the full session, the user clicks the desktop notification or runs `tokenstash open`). Continue other work; call task_check with the task_id later." } else { "Done." }
+                "env_file": env_file,
+                "inbox": util::inbox_url_agent(&app.cfg, None, state),
+                "next": if pending { "One or more keys are pending: follow each result's `next`. Show the user the link, keep working, call task_check later." } else { "Done — follow each result's `next`." }
             }), false))
         }
         "human_request" => {
@@ -232,6 +262,12 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
                         }
                     }
                     let mut out = json!({ "task_id": t.id, "kind": t.kind, "status": t.status, "name": t.name, "title": t.title, "note": t.note, "env_file": std::path::Path::new(&t.project).join(&app.cfg.env_file) });
+                    out["next"] = json!(match t.status {
+                        tokenstash_core::db::TaskStatus::Pending => "Still pending. Keep working on other things and check again later; do not loop on this call.",
+                        tokenstash_core::db::TaskStatus::Answered => "Answered: for a secret task the value is now in the env file — load it with your runtime, do not read or print the file. For a human task the note (if any) is the user's answer.",
+                        tokenstash_core::db::TaskStatus::Denied => "The user declined. Do not ask again and do not supply a stand-in value by any route; make the feature optional or report it blocked.",
+                        tokenstash_core::db::TaskStatus::Expired => "Expired unanswered. Summarise what is blocked and stop.",
+                    });
                     if !replacements.is_empty() {
                         out["replacements"] = json!(replacements);
                         out["note"] = json!("approved, but the provider rejected the stored key at delivery; nothing was written. Poll the Replace task(s) listed in `replacements` instead.");
