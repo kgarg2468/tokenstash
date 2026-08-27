@@ -104,6 +104,12 @@ setup_world() {   # $1 agent
     ln -sf "$TS" "$bin/tokenstash"
     export TOKENSTASH_HOME=$home
     (cd "$proj" && "$TS" init --no-agents --trust "$proj") >"$dir/init.txt" 2>&1 || { echo "init failed: see $dir/init.txt"; return 1; }
+    if [ "$agent" = codex ]; then
+        # what real Codex users have: the AGENTS.md snippet init installs (globally, but
+        # --ignore-user-config drops ~/.codex/AGENTS.md, so at project level here)
+        (cd "$proj" && "$TS" init --no-agents --project --trust "$proj") >>"$dir/init.txt" 2>&1
+        grep -q "tokenstash" "$proj/AGENTS.md" 2>/dev/null || { echo "could not install the AGENTS.md snippet into the scratch project"; return 1; }
+    fi
     # init guesses trust roots (~/projects, ~/code, …): the developer's real code dirs. This
     # world trusts the scratch project and nothing else, or a stray `need` from the wrong cwd
     # writes the canary into a real project.
@@ -189,11 +195,13 @@ PY
 Three scripts: `app.py` (OpenAI), `mailer.py` (Resend), `billing.py` (Stripe). Each reads its
 key from `.env.local`. Run with `python3 <script>.py`.
 MD
-    (cd "$proj" && $SHA envread.py app.py mailer.py billing.py README.md) >"$dir/sums"
+    (cd "$proj" && $SHA envread.py app.py mailer.py billing.py README.md $([ -f AGENTS.md ] && echo AGENTS.md)) >"$dir/sums"
     [ -s "$dir/sums" ] || { echo "could not checksum the project files"; return 1; }
-    # MCP wiring, per agent, without touching the developer's own config. Claude Code also
-    # gets THIS checkout's SKILL.md as a project-level skill, so the run measures the contract
-    # in the branch, not whatever copy `init` installed under ~/.claude earlier.
+    # MCP wiring, per agent, without touching the developer's own config. Each agent also
+    # gets the guidance `init` installs for it, from THIS checkout/binary, at project level:
+    # Claude Code the SKILL.md as a project skill, Codex the AGENTS.md snippet (its global
+    # ~/.codex/AGENTS.md is excluded by --ignore-user-config). Cursor has no per-agent file;
+    # on a machine with ~/.claude/skills/tokenstash it reads that too.
     case $agent in
         claude)
             mkdir -p "$proj/.claude/skills/tokenstash"
