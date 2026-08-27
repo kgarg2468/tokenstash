@@ -77,15 +77,20 @@ cleanup() {
     for f in "$OUT"/*/inbox.pid; do [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null; done
     # an inbox tokenstash itself respawned (detached, no --port on its command line) if the
     # scratch one died mid-run: kill whatever listens on the scratch port
-    for f in "$OUT"/*/port; do [ -f "$f" ] && kill_port "$(cat "$f")"; done
+    for f in "$OUT"/*/port; do [ -f "$f" ] && kill_port "$(cat "$f")" "$(dirname "$f")/home"; done
     return 0
 }
-kill_port() {   # $1 port — only a tokenstash inbox; never an unrelated service that took the port
+kill_port() {   # $1 port, $2 scratch home — only an inbox of THIS binary serving THIS home
     local pids p
     if command -v fuser >/dev/null 2>&1; then pids=$(fuser "$1/tcp" 2>/dev/null); else pids=$(lsof -ti "tcp:$1" 2>/dev/null); fi
     for p in $pids; do
-        # the respawn is `<current exe> inbox`: match this binary by path, whatever its name
-        ps -o args= -p "$p" 2>/dev/null | grep -qE "^(\S*/)?tokenstash inbox|^$TS inbox|^$TS_REAL inbox" && kill "$p" 2>/dev/null
+        # the respawn is `<current exe> inbox`: this binary by path (as given or resolved)…
+        ps -o args= -p "$p" 2>/dev/null | grep -qE "^$TS inbox|^$TS_REAL inbox" || continue
+        # …and, where the environment is readable, serving the scratch home and no other
+        if [ -r "/proc/$p/environ" ]; then
+            tr '\0' '\n' <"/proc/$p/environ" | grep -qx "TOKENSTASH_HOME=$2" || continue
+        fi
+        kill "$p" 2>/dev/null
     done
     return 0
 }
