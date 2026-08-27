@@ -342,7 +342,7 @@ printf '%s\n' \
   | (cd "$PROJ" && "$TS" mcp) >"$OUT/mcp-scope.txt" 2>&1 || true
 # the server serves the directory it was started in; no schema names a project, and a
 # request for another directory is refused outright
-grep '"tools"' "$OUT/mcp-scope.txt" | grep -q '"project":{' && { echo "FAIL: a tool schema still takes a project argument"; fail=1; }
+grep '"tools"' "$OUT/mcp-scope.txt" | grep -q '"project"' && { echo "FAIL: a tool schema still takes a project argument"; fail=1; }
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"ci"}}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"secrets_list","arguments":{}}}' \
