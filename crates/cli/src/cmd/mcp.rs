@@ -156,10 +156,11 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
             {
                 // Resolve each spec's identity the way need() will (explicit → project
                 // binding → "default") so equivalent spellings compare equal.
-                let pid = project.to_string_lossy().to_string();
+                let ws = app.db.find_workspace(&project)?;
                 let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
                 for s in &specs {
-                    let id = match &s.identity { Some(i) => i.clone(), None => app.db.binding(&pid, &s.name)?.unwrap_or_else(|| "default".into()) };
+                    let bound = match &ws { Some(w) => app.db.binding(&w.id, &s.name)?, None => None };
+                    let id = match &s.identity { Some(i) => i.clone(), None => bound.unwrap_or_else(|| "default".into()) };
                     if let Some(prev) = seen.insert(s.name.clone(), id.clone()) {
                         if prev != id { anyhow::bail!("{} requested under two identities ({prev} and {id}); a project env file can hold only one", s.name); }
                     }
@@ -337,9 +338,8 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
             // report only counts from a project that received the key, and a caller-named
             // path would let a hostile repo borrow another project's standing.
             let project = tokenstash_core::project::current();
-            let pid = project.to_string_lossy().to_string();
             let identity = args.get("identity").and_then(|v| v.as_str()).map(|s| s.to_string())
-                .or(app.db.binding(&pid, &name)?)
+                .or(match app.db.find_workspace(&project)? { Some(w) => app.db.binding(&w.id, &name)?, None => None })
                 .unwrap_or_else(|| "default".into());
             let status = args.get("status").and_then(|v| v.as_u64()).and_then(|s| u16::try_from(s).ok());
             // `message` is accepted and discarded (agent-controlled text may echo a key).

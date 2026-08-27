@@ -34,7 +34,9 @@ pub fn doctor() -> Result<i32> {
     }
 
     check("registry", true, format!("{} providers", tokenstash_core::registry::count()));
-    ok &= check("trust roots", !cfg.trust_roots.is_empty(), if cfg.trust_roots.is_empty() { "none (every project will ask once)".into() } else { cfg.trust_roots.iter().map(|p| tokenstash_core::project::short(p)).collect::<Vec<_>>().join(", ") });
+    if !cfg.trust_roots.is_empty() {
+        check("trust roots", true, format!("{} in config, retired in 0.2 — each directory pairs once instead (`tokenstash workspaces`)", cfg.trust_roots.len()));
+    }
     // "Not running" is normal — it starts on demand. Someone else holding the port is not:
     // that is the case where a human could be sent to paste a key into another process.
     let inbox = notify::inbox_state(&cfg);
@@ -56,8 +58,16 @@ pub fn doctor() -> Result<i32> {
     check("agents", true, if agents.is_empty() { "none configured (run `tokenstash init`)".into() } else { agents.join(", ") });
 
     let project = tokenstash_core::project::current();
-    let inside = tokenstash_core::trust::inside_roots(&project, &cfg);
-    check("this project", true, format!("{}  {}", tokenstash_core::project::short(&project), if inside { "trusted" } else { "outside trust roots → will ask once" }));
+    let standing = match Db::open_default() {
+        Ok(db) => db.find_workspace(&project).ok().flatten().map(|w| db.grants_for(&w.id).map(|g| g.len()).unwrap_or(0)),
+        Err(_) => None,
+    };
+    let refused = tokenstash_core::trust::refused_root(&project);
+    check("this directory", refused.is_none(), format!("{}  {}", tokenstash_core::project::short(&project), match (refused, standing) {
+        (Some(why), _) => format!("is {why} — no keys are delivered here"),
+        (None, Some(n)) => format!("paired, {n} grant(s)"),
+        (None, None) => "not paired yet → the first stored key asks once".into(),
+    }));
     check("binary", true, std::env::current_exe()?.display().to_string());
 
     Ok(if ok { 0 } else { 1 })

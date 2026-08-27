@@ -136,12 +136,6 @@ pub fn split_identity(entry: &str) -> (&str, &str) {
     }
 }
 
-/// Create or merge into the open approval task for this project.
-/// `names` are `NAME@identity` entries and may include "*" meaning "this project is
-/// outside trust roots".
-pub fn create_approval_task(ctx: &Ctx, project: &Path, agent: &str, names: &[String]) -> Result<Task> {
-    create_approval_task_opts(ctx, project, agent, names, true)
-}
 
 /// `merge=false` always files a fresh task: used for program-derived requests, where each
 /// invocation must be authorized on its own and must not piggyback on (or be granted by)
@@ -154,34 +148,70 @@ pub const EXPECTS_REPLACE: &str = "replace";
 /// Marker in `expects` for an approval that must not become a standing grant: a program's
 /// own output chose the key (`run` shim), so the human authorises THIS injection only.
 pub const APPROVAL_ONCE: &str = "once";
+pub const APPROVAL_PAIRING: &str = "pairing";
+pub const APPROVAL_SENSITIVE: &str = "sensitive";
 
-pub fn create_approval_task_opts(ctx: &Ctx, project: &Path, agent: &str, names: &[String], merge: bool) -> Result<Task> {
-    let pid = project.to_string_lossy().to_string();
-    if let Some(mut t) = ctx.db.open_approval_task(&pid)?.filter(|_| merge) {
-        let mut merged = t.names.clone();
-        for n in names {
-            if !merged.contains(n) {
-                merged.push(n.clone());
-            }
-        }
-        if merged != t.names {
-            ctx.db.update_task_names(&t.id, &merged)?;
-            t.names = merged;
-        }
-        return Ok(t);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalKind {
+    /// First delivery of stored keys into this workspace: one batched card.
+    Pairing,
+    /// Sensitive or unregistered keys: their own card, exact grants only.
+    Sensitive,
+    /// A program's output chose the key (`run`): a fresh yes every time, no grant.
+    Once,
+}
+
+impl ApprovalKind {
+    pub fn expects(self) -> &'static str {
+        match self { ApprovalKind::Pairing => APPROVAL_PAIRING, ApprovalKind::Sensitive => APPROVAL_SENSITIVE, ApprovalKind::Once => APPROVAL_ONCE }
     }
-    let outside = names.iter().any(|n| n == "*");
-    let concrete: Vec<&String> = names.iter().filter(|n| n.as_str() != "*").collect();
-    let _ = &concrete;
-    let title = if outside {
-        format!("Allow {} to use {} key(s)?", crate::project::short(project), concrete.len())
-    } else {
-        format!("Allow {} to use sensitive key(s)?", crate::project::short(project))
-    };
-    let why = if outside {
-        Some("This project is outside your trust roots.".to_string())
-    } else {
-        Some("These keys are tagged sensitive (live payments, cloud credentials, or unbounded spend).".to_string())
+}
+
+/// What the human pressed on an approval card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    Deny,
+    /// Exactly the listed keys.
+    Allow,
+    /// The listed keys, plus any registry-confirmed non-sensitive key for the same
+    /// identity in this workspace. Pairing cards only.
+    AllowBroad,
+}
+
+/// One card per kind per workspace: a pairing card and a sensitive card merge with the
+/// open one of their kind; a one-time card never merges.
+pub fn create_approval_task(ctx: &Ctx, project: &Path, agent: &str, names: &[String], kind: ApprovalKind) -> Result<Task> {
+    let pid = project.to_string_lossy().to_string();
+    if kind != ApprovalKind::Once {
+        if let Some(mut t) = ctx.db.open_approval_task_kind(&pid, kind.expects())? {
+            let mut merged = t.names.clone();
+            for n in names {
+                if !merged.contains(n) {
+                    merged.push(n.clone());
+                }
+            }
+            if merged != t.names {
+                ctx.db.update_task_names(&t.id, &merged)?;
+                t.names = merged;
+            }
+            return Ok(t);
+        }
+    }
+    let shown: Vec<String> = names.iter().map(|n| n.strip_suffix("@default").unwrap_or(n).to_string()).collect();
+    let short = crate::project::short(project);
+    let (title, why) = match kind {
+        ApprovalKind::Pairing => (
+            format!("{short} wants {}", if shown.len() == 1 { shown[0].clone() } else { format!("{} keys", shown.len()) }),
+            format!("First time this directory asks for stored keys. Allowing writes exactly these into {}: {}. Nothing else, nowhere else.", project.join(&ctx.cfg.env_file).display(), shown.join(", ")),
+        ),
+        ApprovalKind::Sensitive => (
+            format!("{short} wants sensitive key(s): {}", shown.join(", ")),
+            format!("Tagged sensitive (live payments, cloud credentials, unbounded spend) or unknown to the registry: each needs its own yes for this directory. Written to {}.", project.join(&ctx.cfg.env_file).display()),
+        ),
+        ApprovalKind::Once => (
+            format!("A program in {short} asked for {}", shown.join(", ")),
+            "The key was chosen by a running program's output, not by you or the agent. Allowing delivers it once; the next run asks again.".to_string(),
+        ),
     };
     let t = Task {
         id: new_id("a"),
@@ -191,10 +221,10 @@ pub fn create_approval_task_opts(ctx: &Ctx, project: &Path, agent: &str, names: 
         name: None,
         identity: "default".into(),
         title,
-        why,
+        why: Some(why),
         url: None,
         steps: vec![],
-        expects: if merge { "confirm".into() } else { APPROVAL_ONCE.into() },
+        expects: kind.expects().into(),
         pattern: None,
         names: names.to_vec(),
         status: TaskStatus::Pending,
@@ -204,7 +234,7 @@ pub fn create_approval_task_opts(ctx: &Ctx, project: &Path, agent: &str, names: 
         note: None,
     };
     ctx.db.insert_task(&t)?;
-    ctx.db.audit(Some(&pid), Some(agent), "task.approval", None, None, Some(&names.join(",")))?;
+    ctx.db.audit(Some(&pid), Some(agent), "task.approval", None, None, Some(&format!("{}: {}", kind.expects(), names.join(","))))?;
     Ok(t)
 }
 
@@ -367,15 +397,19 @@ pub fn store_and_inject(
         verify_off: verified == Verified::Skipped,
     })?;
     ctx.db.audit(Some(&pid), Some(agent), "store", Some(name), Some(identity), None)?;
-    // The human just handled this key for this project: that is the approval.
-    ctx.db.approve(&pid, name)?;
+    // The human just handled this key for this project: that is the grant — this key,
+    // this identity, this workspace, nothing broader.
+    if project.is_dir() {
+        let ws = ctx.db.workspace_for(project)?;
+        ctx.db.grant(&ws.id, name, identity, crate::db::GRANT_KEY, crate::db::GRANT_PASTE)?;
+    }
     if let Some(tid) = answering_task {
         ctx.db.set_task_status(tid, TaskStatus::Answered, None)?;
     }
     tx.commit().context("recording the stored secret")?;
     let injected_to = if project.is_dir() {
         let p = crate::envfile::write(project, &ctx.cfg.env_file, name, value)?;
-        ctx.db.audit(Some(&pid), Some(agent), "inject", Some(name), Some(identity), None)?;
+        ctx.db.audit_grant(Some(&pid), Some(agent), "inject", Some(name), Some(identity), None, crate::db::GRANT_PASTE)?;
         Some(p)
     } else {
         None
@@ -383,7 +417,7 @@ pub fn store_and_inject(
     Ok(injected_to)
 }
 
-pub fn answer_approval(ctx: &Ctx, task: &Task, allow: bool) -> Result<AnswerResult> {
+pub fn answer_approval(ctx: &Ctx, task: &Task, decision: Decision) -> Result<AnswerResult> {
     if task.kind != TaskKind::Approval {
         bail!("task {} is not an approval task", task.id);
     }
@@ -391,26 +425,40 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, allow: bool) -> Result<AnswerResu
         bail!("task {} is already {}", task.id, task.status.as_str());
     }
     let pid = task.project.clone();
-    if !allow {
+    if decision == Decision::Deny {
         ctx.db.set_task_status(&task.id, TaskStatus::Denied, None)?;
         ctx.db.audit(Some(&pid), Some(&task.agent), "deny", None, None, Some(&task.names.join(",")))?;
         return Ok(AnswerResult::Denied);
     }
     let project = Path::new(&pid);
-    // 1. Record the decision atomically: every approval plus the task's answered status.
+    let kind = task.expects.as_str();
+    if decision == Decision::AllowBroad && kind != APPROVAL_PAIRING {
+        bail!("only a pairing card can grant broadly");
+    }
+    // 1. Record the decision atomically: every grant plus the task's answered status.
     //    Once this commits the human's answer is final and nothing can ask them again.
     //    A one-time approval (program-derived, `run`) records the answer but no grant: the
     //    next request for the same key in this project asks again, by design.
+    let grant_source = match kind {
+        APPROVAL_ONCE => crate::db::GRANT_ONCE,
+        APPROVAL_SENSITIVE => crate::db::GRANT_SENSITIVE,
+        _ => crate::db::GRANT_PAIRING,
+    };
     {
         let tx = ctx.db.conn.unchecked_transaction()?;
-        if task.expects != APPROVAL_ONCE {
+        if kind != APPROVAL_ONCE {
+            let ws = ctx.db.find_workspace(project)?;
+            let Some(ws) = ws else { bail!("{} is no longer the directory this card was filed for; ask again from inside it", crate::project::short(project)) };
             for entry in &task.names {
-                let n = if entry == "*" { "*" } else { split_identity(entry).0 };
-                ctx.db.approve(&pid, n)?;
+                let (n, identity) = split_identity(entry);
+                ctx.db.grant(&ws.id, n, identity, crate::db::GRANT_KEY, grant_source)?;
+                if decision == Decision::AllowBroad {
+                    ctx.db.grant(&ws.id, "*", identity, crate::db::GRANT_BROAD, crate::db::GRANT_PAIRING)?;
+                }
             }
         }
         ctx.db.set_task_status(&task.id, TaskStatus::Answered, None)?;
-        ctx.db.audit(Some(&pid), Some(&task.agent), "approve", None, None, Some(&task.names.join(",")))?;
+        ctx.db.audit(Some(&pid), Some(&task.agent), "approve", None, None, Some(&format!("{}{}: {}", kind, if decision == Decision::AllowBroad { "+broad" } else { "" }, task.names.join(","))))?;
         tx.commit().context("recording approval")?;
     }
     // 2. Inject each requested identity. Failures are collected and surfaced after all
@@ -429,7 +477,7 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, allow: bool) -> Result<AnswerResu
                 // The approval is the authorization; delivery still verifies on use. A key
                 // the provider rejects becomes a Replace card for this project instead of
                 // a dead value in its env file.
-                match crate::need::deliver(ctx, project, &task.agent, n, identity, &v, Some("after-approval"), &mut budget) {
+                match crate::need::deliver(ctx, project, &task.agent, n, identity, &v, Some("after-approval"), grant_source, &mut budget) {
                     Ok(crate::need::Delivery::Injected { .. }) => injected.push(n.to_string()),
                     Ok(crate::need::Delivery::Rejected { reason }) => {
                         let why = format!("Replace {n}: {reason}. The new value is written to {}.", project.join(&ctx.cfg.env_file).display());
@@ -490,7 +538,12 @@ pub struct RotationReport {
 
 pub fn rewrite_replaced_value(ctx: &Ctx, name: &str, identity: &str, new: &SecretString, answering_project: &str) -> Result<RotationReport> {
     let mut report = RotationReport::default();
-    let sensitive = ctx.db.get_secret(name, identity)?.map(|m| m.sensitive).unwrap_or(false);
+    // A past delivery is not a standing grant. Only workspaces the human granted this key
+    // (exactly, or broadly for its identity) are rewritten: a one-time `run` approval or an
+    // on-disk match never authorised future values, and a re-created directory is not the
+    // one that was paired (`workspaces_granted` returns records; the fingerprint is
+    // re-checked below).
+    let granted = ctx.db.workspaces_granted(name, identity)?;
     for project in ctx.db.delivered_projects(name, identity)? {
         if project == answering_project {
             continue;
@@ -499,10 +552,9 @@ pub fn rewrite_replaced_value(ctx: &Ctx, name: &str, identity: &str, new: &Secre
         if !dir.is_dir() {
             continue;
         }
-        // A past delivery is not a standing grant: a project that only ever had a one-time
-        // (run-shim) approval, or has since left the trust roots, must pass the gate again.
-        if !matches!(crate::trust::gate(ctx.db, ctx.cfg, dir, name, sensitive)?, crate::trust::Gate::Open) {
-            let why = "no standing approval for this key here; it will ask on its next `need`".to_string();
+        let still_granted = granted.iter().any(|w| w.root == project) && ctx.db.find_workspace(dir)?.map(|w| granted.iter().any(|g| g.id == w.id)).unwrap_or(false);
+        if !still_granted {
+            let why = "no standing grant for this key here; it will ask on its next `need`".to_string();
             ctx.db.audit(Some(&project), None, "rotate.skip", Some(name), Some(identity), Some(&why))?;
             report.skipped.push((project.clone(), why));
             continue;

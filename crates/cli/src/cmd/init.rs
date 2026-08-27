@@ -191,31 +191,17 @@ pub fn init(a: InitArgs) -> Result<i32> {
     }
     println!("✓ stash backend: {backend}{}", if backend == "keyutils" { "  (Linux kernel keyring: survives logout, not reboot; install a Secret Service like gnome-keyring for persistence)" } else { "" });
 
-    // 2. trust roots: only what the user named, plus (on a fresh config) existing code dirs
-    // under $HOME — each printed with where it came from. Never the current directory.
-    let guessed: Vec<PathBuf> = if cfg.trust_roots.is_empty() { Config::default_trust_roots() } else { vec![] };
-    cfg.trust_roots.extend(guessed.iter().cloned());
-    let mut explicit = vec![];
-    for t in &a.trust {
-        let t = t.canonicalize().unwrap_or(t.clone());
-        if !cfg.trust_roots.contains(&t) {
-            cfg.trust_roots.push(t.clone());
-        }
-        explicit.push(t);
-    }
+    // 2. trust: nothing is inferred and nothing is added. The first time a directory asks
+    // for stored keys the human approves exactly which ones; that is the whole model.
     cfg.save()?;
     tokenstash_core::Db::open_default()?;
-    let short = |p: &PathBuf| tokenstash_core::project::short(p);
-    println!("✓ trust roots (projects here get silent injection of non-sensitive keys):");
-    for r in &cfg.trust_roots {
-        let how = if explicit.contains(r) { "you passed --trust" } else if guessed.contains(r) { "guessed: an existing code dir" } else { "from config" };
-        println!("    {}  ({how})", short(r));
+    if !a.trust.is_empty() {
+        println!("! --trust is retired: directories are not trusted by folder any more. The first stored key a directory asks for shows you one card; approve it and those keys are silent there.");
     }
-    if cfg.trust_roots.is_empty() {
-        println!("    (none — every project will ask once; add one with `tokenstash trust add <dir>`)");
-    } else {
-        println!("  remove any with `tokenstash trust rm <dir>`; elsewhere you're asked once per project");
+    if !cfg.trust_roots.is_empty() {
+        println!("! trust_roots in config.toml no longer apply (retired in 0.2); `tokenstash trust rm <dir>` tidies them");
     }
+    println!("✓ trust: each directory pairs once (`tokenstash workspaces` lists them)");
 
     // 3. agents
     let mut touched: Vec<PathBuf> = vec![];

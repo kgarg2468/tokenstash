@@ -201,7 +201,8 @@ fn handle(app: &App, mut req: Request, tokens: &inbox_auth::Tokens) -> Result<()
                         if scope != Scope::Full {
                             anyhow::bail!("approving needs the full inbox session: click the desktop notification or run `tokenstash open`, then reload this page");
                         }
-                        match tasks::answer_approval(&ctx, &task, action == "allow")? {
+                        let decision = match action.as_str() { "allow" => tasks::Decision::Allow, "allow_broad" => tasks::Decision::AllowBroad, _ => tasks::Decision::Deny };
+                        match tasks::answer_approval(&ctx, &task, decision)? {
                             AnswerResult::Approved { injected, replaced } => Ok(format!("Approved; injected {}{}", if injected.is_empty() { "nothing new".into() } else { injected.join(", ") }, if replaced.is_empty() { String::new() } else { format!(". {} rejected by the provider at delivery — a Replace card is waiting", replaced.join(", ")) })),
                             _ => Ok("Denied".into()),
                         }
@@ -366,9 +367,21 @@ fn page_task(t: &Task, err: Option<&str>, token: &str, scope: inbox_auth::Scope)
             ));
         }
         TaskKind::Approval => {
-            b.push_str(&format!("<p>Keys: <code>{}</code></p>", crate::util::approval_names(&t.names).iter().map(|n| esc(n)).collect::<Vec<_>>().join("</code>, <code>")));
+            // Rule 12: the card shows the canonical path, what kind of decision this is,
+            // the exact destination file, and every key with its identity and sensitivity.
+            let kind = match t.expects.as_str() { tasks::APPROVAL_PAIRING => "new directory — first stored keys", tasks::APPROVAL_SENSITIVE => "sensitive / unregistered keys — each its own decision", tasks::APPROVAL_ONCE => "chosen by a running program — this run only", _ => "approval" };
+            b.push_str(&format!("<p class=mut>Directory: <code>{}</code><br>Decision: {}<br>Written to: <code>{}</code></p>", esc(&t.project), esc(kind), esc(&std::path::Path::new(&t.project).join(tokenstash_core::Config::load().map(|c| c.env_file).unwrap_or_else(|_| ".env.local".into())).display().to_string())));
+            let rows: Vec<String> = t.names.iter().filter(|n| n.as_str() != "*").map(|entry| {
+                let (n, identity) = tasks::split_identity(entry);
+                let sensitive = tokenstash_core::registry::lookup(n).map(|p| p.sensitive).unwrap_or(false) || tokenstash_core::registry::lookup(n).is_none();
+                format!("<li><code>{}</code>{}{}</li>", esc(n), if identity != "default" { format!(" <span class=mut>@{}</span>", esc(identity)) } else { String::new() }, if sensitive { " <span class=err>sensitive</span>" } else { "" })
+            }).collect();
+            b.push_str(&format!("<ul>{}</ul>", rows.join("")));
             if scope == inbox_auth::Scope::Full {
-                b.push_str(&format!("<form method=post>{csrf}<div class=row><button class=p name=action value=allow>Allow for this project</button><button class=bad name=action value=deny>Deny</button></div></form>"));
+                let broad = if t.expects == tasks::APPROVAL_PAIRING {
+                    "<button name=action value=allow_broad title='also any registry-confirmed non-sensitive key for this identity, in this directory only'>Allow these + any non-sensitive key here</button>"
+                } else { "" };
+                b.push_str(&format!("<form method=post>{csrf}<div class=row><button class=p name=action value=allow>Allow these</button>{broad}<button class=bad name=action value=deny>Deny</button></div></form>"));
             } else {
                 b.push_str("<div class=err>Approving needs the full inbox session, which only you can open: click the desktop notification, or run <code>tokenstash open</code> in a terminal, then reload this page. (The link your agent gave you can paste keys, but not approve — so an agent can never approve its own request.)</div>");
             }
