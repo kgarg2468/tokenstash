@@ -36,6 +36,8 @@ set -uo pipefail
 TS=${1:-}
 [ -x "$TS" ] || { echo "usage: $0 <tokenstash binary> [claude|codex|cursor ...]" >&2; exit 2; }
 TS=$(cd "$(dirname "$TS")" && pwd)/$(basename "$TS")
+# what `current_exe` reports for a respawned inbox: the fully resolved path
+TS_REAL=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$TS")
 REPO_SKILL=$(cd "$(dirname "$0")/.." && pwd)/SKILL.md
 [ -f "$REPO_SKILL" ] || { echo "SKILL.md not found next to scripts/ (run from a checkout)" >&2; exit 2; }
 shift
@@ -83,7 +85,7 @@ kill_port() {   # $1 port — only a tokenstash inbox; never an unrelated servic
     if command -v fuser >/dev/null 2>&1; then pids=$(fuser "$1/tcp" 2>/dev/null); else pids=$(lsof -ti "tcp:$1" 2>/dev/null); fi
     for p in $pids; do
         # the respawn is `<current exe> inbox`: match this binary by path, whatever its name
-        ps -o args= -p "$p" 2>/dev/null | grep -qE "^(\S*/)?tokenstash inbox|^$TS inbox" && kill "$p" 2>/dev/null
+        ps -o args= -p "$p" 2>/dev/null | grep -qE "^(\S*/)?tokenstash inbox|^$TS inbox|^$TS_REAL inbox" && kill "$p" 2>/dev/null
     done
     return 0
 }
