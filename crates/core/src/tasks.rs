@@ -219,10 +219,13 @@ pub struct HumanRequest {
 
 pub fn create_human_task(ctx: &Ctx, project: &Path, agent: &str, req: HumanRequest) -> Result<Task> {
     let pid = project.to_string_lossy().to_string();
-    // Same title, same project, still open: that is the same request (an agent whose
-    // blocking call timed out and asked again), not a second card.
-    if let Some(t) = ctx.db.open_human_task(&pid, &req.title)? {
-        return Ok(t);
+    // Same title and answer type, same project, still open, same instructions: that is the
+    // same request (an agent whose blocking call timed out and asked again), not a second
+    // card. Different instructions under the same title are a different request.
+    if let Some(t) = ctx.db.open_human_task(&pid, &req.title, &req.expects)? {
+        if t.why == req.why && t.url == req.url && t.steps == req.steps {
+            return Ok(t);
+        }
     }
     let t = Task {
         id: new_id("h"),

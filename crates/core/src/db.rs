@@ -492,9 +492,9 @@ impl Db {
     /// requests and must never share a task.
     /// The open human task with this title in this project, if any: a blocking caller that
     /// re-issues its request must not file a second card.
-    pub fn open_human_task(&self, project: &str, title: &str) -> Result<Option<Task>> {
-        let sql = format!("SELECT {} FROM tasks WHERE kind='human' AND status='pending' AND project=?1 AND title=?2 ORDER BY created DESC", Self::TASK_COLS);
-        Ok(self.conn.query_row(&sql, params![project, title], Self::row_to_task).optional()?)
+    pub fn open_human_task(&self, project: &str, title: &str, expects: &str) -> Result<Option<Task>> {
+        let sql = format!("SELECT {} FROM tasks WHERE kind='human' AND status='pending' AND project=?1 AND title=?2 AND expects=?3 ORDER BY created DESC", Self::TASK_COLS);
+        Ok(self.conn.query_row(&sql, params![project, title, expects], Self::row_to_task).optional()?)
     }
 
     pub fn open_secret_task(&self, project: &str, name: &str, identity: &str) -> Result<Option<Task>> {
