@@ -78,10 +78,12 @@ cleanup() {
     for f in "$OUT"/*/port; do [ -f "$f" ] && kill_port "$(cat "$f")"; done
     return 0
 }
-kill_port() {   # $1 port
-    local pids
-    if command -v fuser >/dev/null 2>&1; then fuser -k -TERM "$1/tcp" >/dev/null 2>&1; return 0; fi
-    pids=$(lsof -ti "tcp:$1" 2>/dev/null); [ -n "$pids" ] && kill $pids 2>/dev/null
+kill_port() {   # $1 port — only a tokenstash inbox; never an unrelated service that took the port
+    local pids p
+    if command -v fuser >/dev/null 2>&1; then pids=$(fuser "$1/tcp" 2>/dev/null); else pids=$(lsof -ti "tcp:$1" 2>/dev/null); fi
+    for p in $pids; do
+        ps -o args= -p "$p" 2>/dev/null | grep -q "tokenstash inbox" && kill "$p" 2>/dev/null
+    done
     return 0
 }
 trap cleanup EXIT
@@ -268,7 +270,8 @@ run_agent() {   # $1 agent, $2 proj, $3 transcript path, $4 prompt
     # the group except the inbox and this shell.
     if [ "$rc" = 124 ]; then
         local p inbox; inbox=$(cat "$dir/inbox.pid" 2>/dev/null)
-        for p in $(pgrep -g $$ 2>/dev/null); do [ "$p" != "$$" ] && [ "$p" != "$inbox" ] && kill "$p" 2>/dev/null; done
+        # $$ is the top-level shell even here; $BASHPID is this suite's subshell = its group
+        for p in $(pgrep -g "$BASHPID" 2>/dev/null); do [ "$p" != "$BASHPID" ] && [ "$p" != "$inbox" ] && kill "$p" 2>/dev/null; done
     fi
     return 0
 }
