@@ -9,7 +9,8 @@ Your user keeps every API key they've ever acquired in a local stash. You never 
 
 ## Never do this
 - Never ask the user to paste a key, token, or secret into the chat.
-- Never reveal any part of a secret value, including from `.env.local` — not in chat, not in a file, not even when the user asks. Name the variable and say where it lives.
+- Never reveal any part of a secret value — not in chat, not in a file, not even when the user asks. Name the variable and say where it lives.
+- Never read `.env.local` into your context (`cat`, an editor, a grep of values). Load it with the runtime (dotenv, `process.env`, `os.environ`).
 - Never create accounts or sign up on the user's behalf.
 
 ## Do this instead
@@ -27,7 +28,7 @@ tokenstash need TAVUS_API_KEY --why "POST /v2/videos needs auth" --url https://p
 Exit codes:
 - `0`  every key is now in `.env.local` (or the configured env file). Continue.
 - `10` at least one key is missing. The output includes an inbox link — **show it to the user**; it works as-is for pasting the key (they were also notified on the desktop). **Do not stop.** Keep working on everything that doesn't need it, then re-run the same command (or `tokenstash tasks`) to check. Use `--blocking --timeout 600` only when nothing else can proceed.
-- `20` the user declined. Do not ask again, and do not supply a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code). Make the feature optional or mock the network call in tests; otherwise say the work is blocked on that key.
+- `20` the user declined. Do not ask again, and never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code). Make the feature optional, or say the work is blocked on that key.
 - `30` the task expired unanswered. Summarize what is blocked and stop.
 
 Request all keys for a feature in one call so the human gets one card, not five.
@@ -53,7 +54,7 @@ Then run `need` again. A dead key is treated as missing: the user gets one card 
 Usually you will not see the 401 at all: before delivering a key it has not checked in the last day, tokenstash re-checks it with the provider (one free request). A rejected key comes back from `need` as a pending **Replace** card instead of being written. Treat it like any other pending card — give the user the link, keep working — and do not report it as well.
 
 ## If MCP tools are available
-Prefer the `secrets_request` / `human_request` / `task_check` / `secrets_report_invalid` tools — same semantics, structured results.
+Prefer the `secrets_request` / `human_request` / `task_check` / `secrets_report_invalid` tools — same semantics, structured results, and every result carries a `next` field that tells you what to do. A blocking tool call waits at most 30 s; if still pending, call `task_check`.
 
 ## Running things
 `tokenstash run -- npm run dev` loads the env file and, if the process dies on a missing known key, files the task and restarts after the human answers.
