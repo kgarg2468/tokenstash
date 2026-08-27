@@ -48,7 +48,7 @@ enum Cmd {
     Workspaces(cmd::admin::WorkspacesArgs),
     /// Show recent audit events (never values).
     Audit(cmd::admin::AuditArgs),
-    /// Detect agents, write MCP config + skill file, choose a stash backend, set trust roots.
+    /// Detect agents, write MCP config + skill file, choose a stash backend.
     Init(cmd::init::InitArgs),
     /// Check that everything works.
     Doctor,

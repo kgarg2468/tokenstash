@@ -93,7 +93,7 @@ pub fn answer(a: AnswerArgs) -> Result<i32> {
                 let ans = rpassword::prompt_password("Allow? [y/N] (input hidden) ")?;
                 if matches!(ans.trim(), "y" | "Y" | "yes") { tasks::Decision::Allow } else { tasks::Decision::Deny }
             };
-            match tasks::answer_approval(&ctx, &task, decision)? {
+            match tasks::answer_approval(&ctx, &task, decision, Some(&task.names))? {
                 AnswerResult::Approved { injected, replaced } => {
                     println!("✓ approved; injected {}", if injected.is_empty() { "nothing new".into() } else { injected.join(", ") });
                     if !replaced.is_empty() { println!("  {} rejected by the provider at delivery — a Replace card is waiting", replaced.join(", ")); }

@@ -1,4 +1,4 @@
-//! `init`: pick a stash backend, set trust roots, wire up agents.
+//! `init`: pick a stash backend, wire up agents.
 
 use anyhow::Result;
 use clap::Args;
@@ -16,7 +16,7 @@ pub struct InitArgs {
     /// Print the AGENTS.md snippet and exit (no files touched).
     #[arg(long)]
     pub print_snippet: bool,
-    /// Don't touch any agent config; just set up the stash and trust roots.
+    /// Don't touch any agent config; just set up the stash.
     #[arg(long)]
     pub no_agents: bool,
     /// Extra trust root(s).

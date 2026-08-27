@@ -136,10 +136,6 @@ pub fn split_identity(entry: &str) -> (&str, &str) {
     }
 }
 
-
-/// `merge=false` always files a fresh task: used for program-derived requests, where each
-/// invocation must be authorized on its own and must not piggyback on (or be granted by)
-/// another invocation's pending approval.
 /// Marker in `expects` for a secret task that REPLACES a stale value (a rotation or a
 /// reported-dead key). Only answers to such cards propagate to other projects; an ordinary
 /// paste card answered later, even if the key has since gone stale elsewhere, does not.
@@ -202,7 +198,7 @@ pub fn create_approval_task(ctx: &Ctx, project: &Path, agent: &str, names: &[Str
     let (title, why) = match kind {
         ApprovalKind::Pairing => (
             format!("{short} wants {}", if shown.len() == 1 { shown[0].clone() } else { format!("{} keys", shown.len()) }),
-            format!("First time this directory asks for stored keys. Allowing writes exactly these into {}: {}. Nothing else, nowhere else.", project.join(&ctx.cfg.env_file).display(), shown.join(", ")),
+            format!("First time this directory asks for stored keys. \"Allow these\" writes exactly these into {}: {}. \"Allow these + any non-sensitive key here\" also lets this directory receive any registry-confirmed non-sensitive key for the same identity, without asking. Nothing applies to any other directory.", project.join(&ctx.cfg.env_file).display(), shown.join(", ")),
         ),
         ApprovalKind::Sensitive => (
             format!("{short} wants sensitive key(s): {}", shown.join(", ")),
@@ -349,6 +345,7 @@ pub fn answer_secret(ctx: &Ctx, task: &Task, value: SecretString, skip_liveness:
             _ if skip_liveness && provider.and_then(|p| p.check.as_ref()).is_some() => Verified::Skipped,
             _ => Verified::Unknown,
         },
+        crate::db::GRANT_PASTE,
     )?;
     // A replacement card's answer reaches every project that was ever given this key and
     // does not already hold the new value — whichever old value it holds (the stash may
@@ -377,6 +374,7 @@ pub fn store_and_inject(
     agent: &str,
     answering_task: Option<&str>,
     verified: Verified,
+    grant_source: &str,
 ) -> Result<Option<PathBuf>> {
     ctx.stash.set(&stash_key(name, identity), value)?;
     let pid = project.to_string_lossy().to_string();
@@ -400,8 +398,11 @@ pub fn store_and_inject(
     // The human just handled this key for this project: that is the grant — this key,
     // this identity, this workspace, nothing broader.
     if project.is_dir() {
+        // The directory the human is answering for: if its record no longer matches it,
+        // the human's paste is the pairing of the new directory.
         let ws = ctx.db.workspace_for(project)?;
-        ctx.db.grant(&ws.id, name, identity, crate::db::GRANT_KEY, crate::db::GRANT_PASTE)?;
+        let ws = if ws.fingerprint_ok { ws } else { ctx.db.repair_workspace(project)? };
+        ctx.db.grant(&ws.id, name, identity, crate::db::GRANT_KEY, grant_source)?;
     }
     if let Some(tid) = answering_task {
         ctx.db.set_task_status(tid, TaskStatus::Answered, None)?;
@@ -409,7 +410,7 @@ pub fn store_and_inject(
     tx.commit().context("recording the stored secret")?;
     let injected_to = if project.is_dir() {
         let p = crate::envfile::write(project, &ctx.cfg.env_file, name, value)?;
-        ctx.db.audit_grant(Some(&pid), Some(agent), "inject", Some(name), Some(identity), None, crate::db::GRANT_PASTE)?;
+        ctx.db.audit_grant(Some(&pid), Some(agent), "inject", Some(name), Some(identity), None, grant_source)?;
         Some(p)
     } else {
         None
@@ -417,12 +418,22 @@ pub fn store_and_inject(
     Ok(injected_to)
 }
 
-pub fn answer_approval(ctx: &Ctx, task: &Task, decision: Decision) -> Result<AnswerResult> {
+/// `seen` is the list of names the human was shown; if the card grew since (an agent
+/// asked for more while the page was open) the answer is refused and the human re-reads.
+pub fn answer_approval(ctx: &Ctx, task: &Task, decision: Decision, seen: Option<&[String]>) -> Result<AnswerResult> {
     if task.kind != TaskKind::Approval {
         bail!("task {} is not an approval task", task.id);
     }
     if task.status != TaskStatus::Pending {
         bail!("task {} is already {}", task.id, task.status.as_str());
+    }
+    let task = &ctx.db.get_task(&task.id)?.unwrap_or_else(|| task.clone());
+    if let Some(seen) = seen {
+        let mut a: Vec<&String> = task.names.iter().collect(); a.sort();
+        let mut b: Vec<&String> = seen.iter().collect(); b.sort();
+        if a != b {
+            bail!("this card changed since you read it (it now lists {}); reload it and decide again", task.names.iter().map(|n| n.strip_suffix("@default").unwrap_or(n)).collect::<Vec<_>>().join(", "));
+        }
     }
     let pid = task.project.clone();
     if decision == Decision::Deny {
@@ -447,8 +458,13 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, decision: Decision) -> Result<Ans
     {
         let tx = ctx.db.conn.unchecked_transaction()?;
         if kind != APPROVAL_ONCE {
-            let ws = ctx.db.find_workspace(project)?;
-            let Some(ws) = ws else { bail!("{} is no longer the directory this card was filed for; ask again from inside it", crate::project::short(project)) };
+            // The human is pairing THIS directory. If the record on file is for a directory
+            // that no longer exists at this path, replace it (revoking the old grants).
+            let ws = match ctx.db.find_workspace(project)? {
+                Some(ws) => ws,
+                None if project.is_dir() => ctx.db.repair_workspace(project)?,
+                None => bail!("{} no longer exists", crate::project::short(project)),
+            };
             for entry in &task.names {
                 let (n, identity) = split_identity(entry);
                 ctx.db.grant(&ws.id, n, identity, crate::db::GRANT_KEY, grant_source)?;
@@ -485,6 +501,7 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, decision: Decision) -> Result<Ans
                         create_replacement_task(ctx, project, &task.agent, n, identity, &req)?;
                         replaced.push(n.to_string());
                     }
+                    Ok(crate::need::Delivery::NotDelivered) => failures.push(format!("{n}: value changed during delivery; ask again")),
                     Err(e) => failures.push(format!("{n}: {e:#}")),
                 }
             }
@@ -543,7 +560,9 @@ pub fn rewrite_replaced_value(ctx: &Ctx, name: &str, identity: &str, new: &Secre
     // on-disk match never authorised future values, and a re-created directory is not the
     // one that was paired (`workspaces_granted` returns records; the fingerprint is
     // re-checked below).
-    let granted = ctx.db.workspaces_granted(name, identity)?;
+    let meta = ctx.db.get_secret(name, identity)?;
+    let sensitive = meta.as_ref().map(|m| m.sensitive).unwrap_or(false) || registry::lookup(name).map(|p| p.sensitive).unwrap_or(false);
+    let granted = ctx.db.workspaces_granted(name, identity, crate::trust::broad_applies(sensitive, registry::lookup(name).is_some()))?;
     for project in ctx.db.delivered_projects(name, identity)? {
         if project == answering_project {
             continue;
@@ -567,7 +586,7 @@ pub fn rewrite_replaced_value(ctx: &Ctx, name: &str, identity: &str, new: &Secre
         }
         match crate::envfile::write(dir, &ctx.cfg.env_file, name, new) {
             Ok(_) => {
-                ctx.db.audit(Some(&project), None, "inject", Some(name), Some(identity), Some("after-rotation"))?;
+                ctx.db.audit_grant(Some(&project), None, "inject", Some(name), Some(identity), Some("after-rotation"), crate::db::GRANT_ROTATION)?;
                 report.rewritten.push(project.clone());
             }
             Err(e) => {
