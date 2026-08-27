@@ -248,8 +248,11 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
             crate::notify::desktop(&app.cfg, &t.title, &format!("{} · {agent}", tokenstash_core::project::short(&project)), &util::inbox_notice(&app.cfg, Some(&t.id), state));
             let mut task = t;
             if blocking {
-                while task.status == tokenstash_core::db::TaskStatus::Pending && call_started.elapsed() < timeout {
-                    std::thread::sleep(Duration::from_millis(500));
+                // Stop polling with a margin for the inbox check that follows, and never
+                // sleep past the deadline: the cap is on the whole call.
+                let margin = Duration::from_secs(3);
+                while task.status == tokenstash_core::db::TaskStatus::Pending && call_started.elapsed() + margin < timeout {
+                    std::thread::sleep(Duration::from_millis(500).min(remaining(call_started, timeout).saturating_sub(margin)));
                     app.db.expire_overdue()?;
                     task = app.db.get_task(&task.id)?.unwrap_or(task);
                 }
