@@ -21,9 +21,10 @@
 - `pattern` — regex for the key format, so a bad paste fails immediately. Optional but valuable.
 - `check` — one cheap authenticated GET that returns 200 with a valid key and 401/403 without. Optional.
   `auth` is `bearer` | `header:<Name>` | `prefix:<Scheme>` | `basic-user` | `query:<param>`.
-- `sensitive: true` — live payment keys, cloud credentials, anything with unbounded spend. These
-  always ask once per project even inside trust roots. Use `sensitive_pattern` when only some
-  values are dangerous (e.g. Stripe live vs test).
+- `sensitive: true` — live payment keys, cloud credentials, anything with unbounded spend. These,
+  and any name the registry does not know, get their own card per directory; the broad pairing
+  button never covers them. Use `sensitive_pattern` when only some values are dangerous (e.g.
+  Stripe live vs test).
 - `generate: "base64:32"` — for local secrets with no vendor (`AUTH_SECRET`), so no human is involved.
 
 Run `cargo test` — `registry_is_sane` validates every entry.

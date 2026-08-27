@@ -27,8 +27,7 @@ tokenstash need TAVUS_API_KEY --why "POST /v2/videos needs auth" --url https://p
 
 Exit codes:
 - `0`  every key is now in `.env.local` (or the configured env file). Continue.
-- `10` can also mean a **pairing** card: the key is in the stash, but this directory has never received it. The user approves once (the card lists exactly which keys and which file); show the link, keep working, re-run later. Same for a sensitive key's own card.
-- `10` at least one key is missing. The output includes an inbox link — **show it to the user**; it works as-is for pasting the key (they were also notified on the desktop). **Do not stop.** Keep working on everything that doesn't need it, then re-run the same command (or `tokenstash tasks`) to check. Use `--blocking --timeout 600` only when nothing else can proceed.
+- `10` at least one key is pending: either missing (the user pastes it once) or stored but not yet approved for this directory (a pairing, sensitive, or `run` card the user answers once). The output includes an inbox link — **show it to the user**; it works as-is (they were also notified on the desktop). **Do not stop.** Keep working on everything that doesn't need it, then re-run the same command (or `tokenstash tasks`) to check. Use `--blocking --timeout 600` only when nothing else can proceed.
 - `20` the user declined. Do not ask again, and never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code). Make the feature optional, or say the work is blocked on that key.
 - `30` the task expired unanswered. Summarize what is blocked and stop.
 
