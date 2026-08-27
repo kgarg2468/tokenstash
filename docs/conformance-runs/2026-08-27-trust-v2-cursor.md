@@ -1,7 +1,7 @@
-# tokenstash agent conformance — 2026-08-27T20:45Z
+# tokenstash agent conformance — 2026-08-27T20:56Z
 
-binary: /home/kg/projects/token-cache/target/release/tokenstash (tokenstash 0.2.0)
-revision: 30c0420 (with uncommitted changes)
+binary: /tmp/tgt/tokenstash-c (tokenstash 0.2.0)
+revision: 822241c
 - cursor: 2026.08.25-3e8eec8
 
 ```
