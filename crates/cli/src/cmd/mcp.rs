@@ -40,6 +40,13 @@ struct Binding {
     /// We sent `roots/list` and have not consumed the answer yet.
     roots_requested: bool,
     roots: Option<Vec<PathBuf>>,
+    /// What the client sent, before filtering (measurement aid).
+    roots_raw: Vec<String>,
+}
+
+/// Is this message the client's answer to our `roots/list`?
+fn is_roots_answer(m: &Value) -> bool {
+    m.get("method").is_none() && m.get("id").and_then(|v| v.as_str()) == Some(ROOTS_REQ_ID) && (m.get("result").is_some() || m.get("error").is_some())
 }
 
 const ROOTS_REQ_ID: &str = "tokenstash-roots-1";
@@ -52,7 +59,10 @@ impl Binding {
     /// anything else is ambiguous and fails closed (§13.5).
     fn decide(&mut self) -> std::result::Result<PathBuf, String> {
         if self.bound.is_none() {
-            let cwd = tokenstash_core::project::current();
+            self.roots_requested = false;
+            // Roots are compared against the directory we were started in, not its git
+            // root: two roots inside one repo must still resolve by where we actually are.
+            let cwd = std::env::current_dir().ok().and_then(|d| d.canonicalize().ok()).unwrap_or_else(tokenstash_core::project::current);
             let candidate: std::result::Result<PathBuf, String> = match self.roots.as_deref() {
                 Some([one]) => Ok(one.clone()),
                 Some(many) if !many.is_empty() => {
@@ -67,6 +77,7 @@ impl Binding {
                         }
                     }
                 }
+                // no roots offered, or none usable: the directory we were started in
                 _ => Ok(cwd.clone()),
             };
             self.bound = Some(candidate.and_then(|c| {
@@ -77,8 +88,9 @@ impl Binding {
                 }
             }));
             if let Ok(log) = std::env::var("TOKENSTASH_MCP_LOG") {
-                // measurement aid (§13.7): where clients spawn us and what they say
-                let line = format!("{} cwd={} roots_supported={} roots={:?} bound={:?}\n", tokenstash_core::now(), cwd.display(), self.roots_supported, self.roots, self.bound);
+                // measurement aid (§13.7): where clients spawn us and what they say (paths only)
+                let bound = match self.bound.as_ref().unwrap() { Ok(p) => format!("ok:{}", p.display()), Err(e) => format!("err:{e}") };
+                let line = format!("{} cwd={} roots_supported={} roots_raw={:?} roots={:?} bound={bound}\n", tokenstash_core::now(), cwd.display(), self.roots_supported, self.roots_raw, self.roots);
                 let _ = std::fs::OpenOptions::new().create(true).append(true).open(log).and_then(|mut f| f.write_all(line.as_bytes()));
             }
         }
@@ -93,10 +105,14 @@ impl Binding {
         if msg.get("error").is_some() {
             return; // the client could not say: cwd it is
         }
-        let mut roots: Vec<PathBuf> = msg.pointer("/result/roots").and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|r| r.get("uri").and_then(|u| u.as_str()).and_then(root_path)).collect()).unwrap_or_default();
-        // canonical, deduplicated; a root that does not exist is not a root
-        roots = roots.into_iter().filter_map(|r| r.canonicalize().ok()).collect();
+        let uris: Vec<String> = msg.pointer("/result/roots").and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|r| r.get("uri").and_then(|u| u.as_str()).map(String::from)).collect()).unwrap_or_default();
+        self.roots_raw = uris.clone();
+        let mut roots: Vec<PathBuf> = uris.iter().filter_map(|u| root_path(u)).collect();
+        // Existing directories only, resolved the way a project is (symlinks followed, the
+        // owned git root when inside one); a dangling or unreadable root is no root — with
+        // none usable the server falls back to cwd, which is the same trust tier.
+        roots = roots.into_iter().filter(|r| r.is_dir()).map(|r| tokenstash_core::project::canonical(&r)).collect();
         roots.sort();
         roots.dedup();
         self.roots = Some(roots);
@@ -110,10 +126,11 @@ fn root_path(uri: &str) -> Option<PathBuf> {
     if !rest.starts_with('/') { return None; }
     let mut out = Vec::with_capacity(rest.len());
     let b = rest.as_bytes();
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&rest[i + 1..i + 3], 16) { out.push(v); i += 3; continue; }
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) { out.push(h * 16 + l); i += 3; continue; }
         }
         out.push(b[i]);
         i += 1;
@@ -140,7 +157,7 @@ pub fn serve() -> Result<i32> {
     });
     let mut out = std::io::stdout().lock();
     let mut agent = String::from("mcp");
-    let mut binding = Binding { bound: None, roots_supported: false, roots_requested: false, roots: None };
+    let mut binding = Binding { bound: None, roots_supported: false, roots_requested: false, roots: None, roots_raw: vec![] };
     let mut queued: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     loop {
         let line = match queued.pop_front() {
@@ -152,19 +169,26 @@ pub fn serve() -> Result<i32> {
             Ok(v) => v,
             Err(e) => { write_msg(&mut out, &error(Value::Null, -32700, &format!("parse error: {e}")))?; continue; }
         };
-        let id = msg.get("id").cloned();
+        if !msg.is_object() {
+            write_msg(&mut out, &error(Value::Null, -32600, "invalid request: expected a JSON-RPC object (batches are not supported)"))?;
+            continue;
+        }
+        let id = msg.get("id").cloned().filter(|v| !v.is_null());
         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("").to_string();
         let params = msg.get("params").cloned().unwrap_or(json!({}));
         // A response (result/error, no method): only our own `roots/list` is ever answered.
         if method.is_empty() && (msg.get("result").is_some() || msg.get("error").is_some()) {
-            if id.as_ref().and_then(|v| v.as_str()) == Some(ROOTS_REQ_ID) {
+            if is_roots_answer(&msg) {
                 binding.take_roots(&msg);
             }
             continue;
         }
+        if !method.is_empty() && (msg.get("result").is_some() || msg.get("error").is_some()) {
+            continue; // neither a request nor a response: ignored
+        }
         let Some(id) = id else {
             // notifications
-            if method == "notifications/initialized" && binding.roots_supported && binding.bound.is_none() {
+            if method == "notifications/initialized" && binding.roots_supported && binding.bound.is_none() && !binding.roots_requested && binding.roots.is_none() {
                 write_msg(&mut out, &json!({ "jsonrpc": "2.0", "id": ROOTS_REQ_ID, "method": "roots/list" }))?;
                 binding.roots_requested = true;
             }
@@ -204,7 +228,7 @@ pub fn serve() -> Result<i32> {
                         match rx.recv_timeout(left) {
                             Ok(Incoming::Line(l)) => {
                                 let is_roots = serde_json::from_str::<Value>(&l).ok()
-                                    .filter(|m| m.get("method").is_none() && m.get("id").and_then(|v| v.as_str()) == Some(ROOTS_REQ_ID))
+                                    .filter(is_roots_answer)
                                     .map(|m| { binding.take_roots(&m); true }).unwrap_or(false);
                                 if !is_roots { queued.push_back(l); }
                             }
