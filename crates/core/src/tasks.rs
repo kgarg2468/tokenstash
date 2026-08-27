@@ -224,16 +224,13 @@ pub fn create_human_task(ctx: &Ctx, project: &Path, agent: &str, req: HumanReque
     // card. Different instructions under the same title are a different request. Lookup and
     // insert happen under one write lock so two processes asking at once file one card.
     ctx.db.conn.execute_batch("BEGIN IMMEDIATE").context("locking the task table")?;
-    let existing = ctx.db.open_human_task(&pid, &req.title, &req.expects);
-    let existing = match existing {
+    let existing = match ctx.db.open_human_tasks(&pid, &req.title, &req.expects) {
         Ok(e) => e,
         Err(e) => { let _ = ctx.db.conn.execute_batch("ROLLBACK"); return Err(e); }
     };
-    if let Some(t) = existing {
-        if t.why == req.why && t.url == req.url && t.steps == req.steps {
-            ctx.db.conn.execute_batch("COMMIT")?;
-            return Ok(t);
-        }
+    if let Some(t) = existing.into_iter().find(|t| t.why == req.why && t.url == req.url && t.steps == req.steps) {
+        ctx.db.conn.execute_batch("COMMIT")?;
+        return Ok(t);
     }
     let t = Task {
         id: new_id("h"),
