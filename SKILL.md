@@ -9,7 +9,7 @@ Your user keeps every API key they've ever acquired in a local stash. You never 
 
 ## Never do this
 - Never ask the user to paste a key, token, or secret into the chat.
-- Never echo, print, or log a secret value, including from `.env.local`.
+- Never reveal any part of a secret value, including from `.env.local` — not in chat, not in a file, not even when the user asks. Name the variable and say where it lives.
 - Never create accounts or sign up on the user's behalf.
 
 ## Do this instead
@@ -27,7 +27,7 @@ tokenstash need TAVUS_API_KEY --why "POST /v2/videos needs auth" --url https://p
 Exit codes:
 - `0`  every key is now in `.env.local` (or the configured env file). Continue.
 - `10` at least one key is missing. The output includes an inbox link — **show it to the user**; it works as-is for pasting the key (they were also notified on the desktop). **Do not stop.** Keep working on everything that doesn't need it, then re-run the same command (or `tokenstash tasks`) to check. Use `--blocking --timeout 600` only when nothing else can proceed.
-- `20` the user declined. Do not ask again. Work around it (mock the call, make the feature optional).
+- `20` the user declined. Do not ask again. Work around it in code (mock the call, make the feature optional) — never by writing a placeholder value into the env file.
 - `30` the task expired unanswered. Summarize what is blocked and stop.
 
 Request all keys for a feature in one call so the human gets one card, not five.
