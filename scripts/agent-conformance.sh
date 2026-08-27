@@ -82,7 +82,8 @@ kill_port() {   # $1 port — only a tokenstash inbox; never an unrelated servic
     local pids p
     if command -v fuser >/dev/null 2>&1; then pids=$(fuser "$1/tcp" 2>/dev/null); else pids=$(lsof -ti "tcp:$1" 2>/dev/null); fi
     for p in $pids; do
-        ps -o args= -p "$p" 2>/dev/null | grep -q "tokenstash inbox" && kill "$p" 2>/dev/null
+        # the respawn is `<current exe> inbox`: match this binary by path, whatever its name
+        ps -o args= -p "$p" 2>/dev/null | grep -qE "^(\S*/)?tokenstash inbox|^$TS inbox" && kill "$p" 2>/dev/null
     done
     return 0
 }
