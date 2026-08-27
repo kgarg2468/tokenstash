@@ -27,7 +27,7 @@ tokenstash need TAVUS_API_KEY --why "POST /v2/videos needs auth" --url https://p
 Exit codes:
 - `0`  every key is now in `.env.local` (or the configured env file). Continue.
 - `10` at least one key is missing. The output includes an inbox link — **show it to the user**; it works as-is for pasting the key (they were also notified on the desktop). **Do not stop.** Keep working on everything that doesn't need it, then re-run the same command (or `tokenstash tasks`) to check. Use `--blocking --timeout 600` only when nothing else can proceed.
-- `20` the user declined. Do not ask again. Work around it in code (mock the call, make the feature optional) — never by writing a placeholder value into the env file.
+- `20` the user declined. Do not ask again, and do not supply a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code). Make the feature optional or mock the network call in tests; otherwise say the work is blocked on that key.
 - `30` the task expired unanswered. Summarize what is blocked and stop.
 
 Request all keys for a feature in one call so the human gets one card, not five.
