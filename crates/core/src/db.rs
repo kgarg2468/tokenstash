@@ -490,6 +490,13 @@ impl Db {
     /// Open secret task for this project+name+identity, if any (avoid duplicate tasks).
     /// Identity is part of the key: `OPENAI_API_KEY@work` and `@personal` are different
     /// requests and must never share a task.
+    /// The open human task with this title in this project, if any: a blocking caller that
+    /// re-issues its request must not file a second card.
+    pub fn open_human_task(&self, project: &str, title: &str) -> Result<Option<Task>> {
+        let sql = format!("SELECT {} FROM tasks WHERE kind='human' AND status='pending' AND project=?1 AND title=?2 ORDER BY created DESC", Self::TASK_COLS);
+        Ok(self.conn.query_row(&sql, params![project, title], Self::row_to_task).optional()?)
+    }
+
     pub fn open_secret_task(&self, project: &str, name: &str, identity: &str) -> Result<Option<Task>> {
         let sql = format!(
             "SELECT {} FROM tasks WHERE kind='secret' AND status='pending' AND project=?1 AND name=?2 AND identity=?3 ORDER BY created DESC",
