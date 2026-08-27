@@ -44,7 +44,11 @@ trap cleanup EXIT
 # whatever real inbox the developer may have running.
 PORT=$(( 20000 + RANDOM % 20000 ))
 sed -i.bak -e "s/^inbox_port = .*/inbox_port = $PORT/" -e "s/^notifications = .*/notifications = false/" "$TOKENSTASH_HOME/config.toml"
-printf 'stash_backend = "insecure-file"\n' >> "$TOKENSTASH_HOME/config.toml"
+if grep -q '^stash_backend' "$TOKENSTASH_HOME/config.toml"; then
+    sed -i.bak 's/^stash_backend = .*/stash_backend = "insecure-file"/' "$TOKENSTASH_HOME/config.toml"
+else
+    printf 'stash_backend = "insecure-file"\n' >> "$TOKENSTASH_HOME/config.toml"
+fi
 # The canary is a fake OpenAI key: verify-on-use would send it to api.openai.com and mark
 # it stale. Off for this run; the probe itself is covered by the loopback unit tests.
 sed -i.bak -e 's/^verify_every = .*/verify_every = "never"/' "$TOKENSTASH_HOME/config.toml"
