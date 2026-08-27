@@ -139,9 +139,10 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
     let blocking = args.get("blocking").and_then(|v| v.as_bool()).unwrap_or(false);
     // MCP clients time out a tool call well before a human answers a card (Cursor's did at
     // about a minute in the conformance suite, and the agent then fell back to polling a
-    // shell). A blocking call therefore waits at most MAX_BLOCK and returns `pending` with a
-    // `next` that says to call again; long waits are the caller's loop, not one call.
-    // The cap is on the whole call — probes, inbox start and the wait — not just the wait.
+    // shell). A blocking call therefore spends at most MAX_BLOCK waiting — measured from the
+    // start of the call, so probes and the inbox start count against it — plus bounded
+    // delivery overhead (a post-answer probe, the inbox proof), and returns `pending` with a
+    // `next` that says to call task_check; long waits are the caller's loop, not one call.
     const MAX_BLOCK: u64 = 30;
     let call_started = std::time::Instant::now();
     let timeout = Duration::from_secs(args.get("timeout_s").and_then(|v| v.as_u64()).unwrap_or(MAX_BLOCK).min(MAX_BLOCK));
@@ -309,7 +310,7 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
                     } else if !in_flight.is_empty() {
                         out["pending_delivery"] = json!(in_flight);
                         out["note"] = json!("approved; delivery is still running for the names in `pending_delivery`. Check again before using them.");
-                        out["next"] = json!("Approved, delivery still running: check again before using the names in `pending_delivery`.");
+                        out["next"] = json!("Approved; the names in `pending_delivery` are not in the env file yet (delivery still running, or it failed). Call secrets_request for them again — after an approval that is a plain hit and injects from the stash without asking — then load them with your runtime.");
                     } else {
                         out["next"] = json!(match t.status {
                             tokenstash_core::db::TaskStatus::Pending => "Still pending. Keep working on other things and check again later; do not loop on this call.",
