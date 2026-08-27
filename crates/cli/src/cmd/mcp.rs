@@ -310,7 +310,7 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
                     } else if !in_flight.is_empty() {
                         out["pending_delivery"] = json!(in_flight);
                         out["note"] = json!("approved; delivery is still running for the names in `pending_delivery`. Check again before using them.");
-                        out["next"] = json!("Approved; the entries in `pending_delivery` are not in the env file yet (delivery still running, or it failed). Call secrets_request for each again with the same name and identity — after an approval that is a plain hit and injects from the stash without asking — then load them with your runtime.");
+                        out["next"] = json!("Approved; the entries in `pending_delivery` are not in the env file yet (delivery still running, or it failed). Call secrets_request for each again with the same name and identity — after a standing approval that is a plain hit and injects from the stash without asking; if the approval was one-time (a `run` card) it asks once more — then load them with your runtime.");
                     } else {
                         out["next"] = json!(match t.status {
                             tokenstash_core::db::TaskStatus::Pending => "Still pending. Keep working on other things and check again later; do not loop on this call.",
