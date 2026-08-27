@@ -221,9 +221,17 @@ pub fn create_human_task(ctx: &Ctx, project: &Path, agent: &str, req: HumanReque
     let pid = project.to_string_lossy().to_string();
     // Same title and answer type, same project, still open, same instructions: that is the
     // same request (an agent whose blocking call timed out and asked again), not a second
-    // card. Different instructions under the same title are a different request.
-    if let Some(t) = ctx.db.open_human_task(&pid, &req.title, &req.expects)? {
+    // card. Different instructions under the same title are a different request. Lookup and
+    // insert happen under one write lock so two processes asking at once file one card.
+    ctx.db.conn.execute_batch("BEGIN IMMEDIATE").context("locking the task table")?;
+    let existing = ctx.db.open_human_task(&pid, &req.title, &req.expects);
+    let existing = match existing {
+        Ok(e) => e,
+        Err(e) => { let _ = ctx.db.conn.execute_batch("ROLLBACK"); return Err(e); }
+    };
+    if let Some(t) = existing {
         if t.why == req.why && t.url == req.url && t.steps == req.steps {
+            ctx.db.conn.execute_batch("COMMIT")?;
             return Ok(t);
         }
     }
@@ -247,8 +255,11 @@ pub fn create_human_task(ctx: &Ctx, project: &Path, agent: &str, req: HumanReque
         answered_at: None,
         note: None,
     };
-    ctx.db.insert_task(&t)?;
-    ctx.db.audit(Some(&pid), Some(agent), "task.human", None, None, Some(&t.title))?;
+    if let Err(e) = ctx.db.insert_task(&t).and_then(|_| ctx.db.audit(Some(&pid), Some(agent), "task.human", None, None, Some(&t.title))) {
+        let _ = ctx.db.conn.execute_batch("ROLLBACK");
+        return Err(e);
+    }
+    ctx.db.conn.execute_batch("COMMIT").context("recording the human task")?;
     Ok(t)
 }
 
