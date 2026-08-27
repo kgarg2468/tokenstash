@@ -179,7 +179,9 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
                 notify_pending(&app, &project, agent, &results);
                 if blocking {
                     // wait on the tasks already filed (each carries its own identity)
-                    need::wait(&app.ctx(), &project, &mut results, remaining(call_started, timeout))?;
+                    // Leave room for the delivery that follows an answer (a verify-on-use
+                    // probe may run, up to ProbeBudget::MAX): the cap is on the whole call.
+                    need::wait(&app.ctx(), &project, &mut results, remaining(call_started, timeout).saturating_sub(need::ProbeBudget::MAX))?;
                 }
             }
             let pending = results.iter().any(|o| o.is_pending());
@@ -308,7 +310,7 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
                     } else {
                         out["next"] = json!(match t.status {
                             tokenstash_core::db::TaskStatus::Pending => "Still pending. Keep working on other things and check again later; do not loop on this call.",
-                            tokenstash_core::db::TaskStatus::Answered => "Answered: for a secret task the value is now in the env file — load it with your runtime, never read or print the file. For a human task the note (if any) is the user's answer.",
+                            tokenstash_core::db::TaskStatus::Answered => "Answered: for a secret task the value is stored — call secrets_request for it once more, which writes it to the env file without asking again, then load it with your runtime (never read or print the file). For a human task the note (if any) is the user's answer.",
                             tokenstash_core::db::TaskStatus::Denied => "The user declined. Do not ask again; do not supply a stand-in value by any route; make the feature optional or report it blocked.",
                             tokenstash_core::db::TaskStatus::Expired => "Expired unanswered. Summarise what is blocked and stop.",
                         });
