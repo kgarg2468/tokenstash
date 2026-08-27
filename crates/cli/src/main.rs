@@ -42,8 +42,10 @@ enum Cmd {
     Import(cmd::bundle::ImportArgs),
     /// Bind a secret name to an identity for this project (work vs personal).
     Bind(cmd::admin::BindArgs),
-    /// Manage trust roots (directories whose projects get silent injection).
+    /// Retired in 0.2 (directories pair once instead); `trust rm` tidies old config.
     Trust(cmd::admin::TrustArgs),
+    /// Paired directories and what each may receive; revoke or forget one. For a person at a terminal.
+    Workspaces(cmd::admin::WorkspacesArgs),
     /// Show recent audit events (never values).
     Audit(cmd::admin::AuditArgs),
     /// Detect agents, write MCP config + skill file, choose a stash backend, set trust roots.
@@ -89,6 +91,7 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Import(a) => cmd::bundle::import(a),
         Cmd::Bind(a) => cmd::admin::bind(a),
         Cmd::Trust(a) => cmd::admin::trust(a),
+        Cmd::Workspaces(a) => cmd::admin::workspaces(a),
         Cmd::Audit(a) => cmd::admin::audit(a),
         Cmd::Init(a) => cmd::init::init(a),
         Cmd::Doctor => cmd::doctor::doctor(),

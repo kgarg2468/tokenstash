@@ -2,7 +2,6 @@ use crate::notify;
 use crate::util::{self, App};
 use anyhow::Result;
 use clap::Args;
-use std::path::PathBuf;
 use std::time::Duration;
 use tokenstash_core::exit;
 use tokenstash_core::need::{self, NeedOpts, Outcome};
@@ -34,9 +33,6 @@ pub struct NeedArgs {
     /// Seconds to wait when --blocking.
     #[arg(long, default_value = "600")]
     pub timeout: u64,
-    /// Project directory (defaults to cwd / git root).
-    #[arg(long)]
-    pub project: Option<PathBuf>,
     /// Agent name for the audit log (auto-detected).
     #[arg(long)]
     pub agent: Option<String>,
@@ -50,7 +46,9 @@ pub struct NeedArgs {
 
 pub fn need(a: NeedArgs) -> Result<i32> {
     let app = App::open()?;
-    let project = util::project_from(&a.project);
+    // The directory this command runs in is the project: a caller-named path would let a
+    // script choose which directory's grants it uses. (Read-only `tasks`/`audit` keep --project.)
+    let project = util::project_from(&None);
     let agent = util::agent_from(&a.agent);
     let opts = NeedOpts {
         req: SecretRequest { why: a.why.clone(), url: a.url.clone(), steps: a.steps.clone(), pattern: a.pattern.clone() },
@@ -157,8 +155,6 @@ pub struct AskArgs {
     #[arg(long, default_value = "600")]
     pub timeout: u64,
     #[arg(long)]
-    pub project: Option<PathBuf>,
-    #[arg(long)]
     pub agent: Option<String>,
     #[arg(long)]
     pub json: bool,
@@ -166,7 +162,7 @@ pub struct AskArgs {
 
 pub fn ask(a: AskArgs) -> Result<i32> {
     let app = App::open()?;
-    let project = util::project_from(&a.project);
+    let project = util::project_from(&None);
     let agent = util::agent_from(&a.agent);
     let t = tasks::create_human_task(
         &app.ctx(),

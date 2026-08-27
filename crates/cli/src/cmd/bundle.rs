@@ -207,7 +207,13 @@ pub fn import(a: ImportArgs) -> Result<i32> {
         let dir = Path::new(&b.project);
         if !dir.is_absolute() || !dir.is_dir() { continue; }
         if a.apply_bindings {
-            app.db.set_binding(&b.project, &b.name, &b.identity)?;
+            // Bindings hang off workspaces now; a directory that was never paired here
+            // gets its binding when it is (the value is listed, not applied).
+            let Some(ws) = app.db.find_workspace(dir)? else {
+                println!("  binding NOT applied (directory not paired on this machine yet): {} → {}@{}", tokenstash_core::project::short(dir), b.name, b.identity);
+                continue;
+            };
+            app.db.set_binding(&ws.id, &b.name, &b.identity)?;
             bound += 1;
             println!("  binding applied: {} → {}@{}", tokenstash_core::project::short(dir), b.name, b.identity);
         } else {
