@@ -142,11 +142,11 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
                     // .env.local along). One check per (directory, key) per TTL: a planted
                     // guess must not be an oracle for the stash.
                     let since = (chrono::Utc::now() - chrono::Duration::hours(ctx.cfg.task_ttl_hours as i64)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-                    if !ctx.db.recent_on_disk_miss(&pid, name, &since)? && crate::envfile::has(project, &ctx.cfg.env_file, name) {
+                    if !ctx.db.recent_on_disk_miss(name, &identity, &since)? && crate::envfile::has(project, &ctx.cfg.env_file, name) {
                         if trust::on_disk_equivalent(project, &ctx.cfg.env_file, name, &value) {
-                            Gate::Open { source: trust::on_disk_source().into() }
+                            Gate::Open { source: crate::db::GRANT_ON_DISK.into() }
                         } else {
-                            ctx.db.audit(Some(&pid), Some(agent), "on_disk.miss", Some(name), Some(&identity), Some("env file holds a different value; not compared again until the TTL passes"))?;
+                            ctx.db.audit(Some(&pid), Some(agent), "on_disk.miss", Some(name), Some(&identity), Some("env file not comparable or holds a different value; no comparison for this key until the TTL passes"))?;
                             Gate::NeedsApproval { reason: GateReason::Pairing }
                         }
                     } else {
@@ -161,6 +161,12 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
                         outcomes.push(Outcome::Injected { name: name.clone(), identity, written_to: path.display().to_string(), generated: false, unverified });
                     }
                     Delivery::Rejected { reason } => outcomes.push(replacement(ctx, project, agent, name, &identity, opts, &reason)?),
+                    // The value changed under an on-disk delivery: the directory never held the
+                    // new one, so it pairs like any other first delivery.
+                    Delivery::NotDelivered => {
+                        pairing.push(format!("{name}@{identity}"));
+                        outcomes.push(Outcome::Pending { name: name.clone(), identity: identity.clone(), task_id: String::new(), title: String::new(), url: None });
+                    }
                 },
                 Gate::NeedsApproval { reason } => {
                     // Carry the identity into the approval so the approver injects the key
@@ -180,7 +186,7 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
         // Miss. Generate locally if the registry says so.
         if let Some(spec) = provider.and_then(|p| p.generate.as_deref()) {
             if let Some(v) = generate(spec) {
-                let p = tasks::store_and_inject(ctx, name, &identity, &v, provider.map(|p| p.provider.clone()), None, false, project, agent, None, tasks::Verified::Unknown)?;
+                let p = tasks::store_and_inject(ctx, name, &identity, &v, provider.map(|p| p.provider.clone()), None, false, project, agent, None, tasks::Verified::Unknown, crate::db::GRANT_GENERATED)?;
                 outcomes.push(Outcome::Injected { name: name.clone(), identity, written_to: p.map(|p| p.display().to_string()).unwrap_or_default(), generated: true, unverified: false });
                 continue;
             }
@@ -210,6 +216,11 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
         if !opts.force {
             let since = (chrono::Utc::now() - chrono::Duration::hours(ctx.cfg.task_ttl_hours as i64)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             for d in ctx.db.recent_denied_approvals(&pid, &since)? {
+                // A denied "this run only" card says nothing about pairing; a denied pairing
+                // or sensitive card does block a later one-time request for the same key.
+                if d.expects == tasks::APPROVAL_ONCE && kind != tasks::ApprovalKind::Once {
+                    continue;
+                }
                 for g in entries {
                     if denied_entries.iter().any(|(e, _)| e == g) {
                         continue;
@@ -273,7 +284,11 @@ pub fn wait(ctx: &Ctx, project: &Path, outcomes: &mut [Outcome], timeout: Durati
                         let written: PathBuf = project.join(&ctx.cfg.env_file);
                         let v = ctx.stash.get(&stash_key(name, identity))?
                             .ok_or_else(|| anyhow::anyhow!("task {} is answered but {name}@{identity} is not in the stash", t.id))?;
-                        match deliver(ctx, project, &t.agent, name, identity, &v, Some("after-answer"), GRANT_PASTE, &mut budget)
+                        let source = match t.kind {
+                            crate::db::TaskKind::Secret => GRANT_PASTE,
+                            _ => match t.expects.as_str() { tasks::APPROVAL_ONCE => crate::db::GRANT_ONCE, tasks::APPROVAL_SENSITIVE => crate::db::GRANT_SENSITIVE, _ => crate::db::GRANT_PAIRING },
+                        };
+                        match deliver(ctx, project, &t.agent, name, identity, &v, Some("after-answer"), source, &mut budget)
                             .map_err(|e| anyhow::anyhow!("{name} is stored but could not be delivered to {}: {e:#}", written.display()))?
                         {
                             Delivery::Injected { unverified, .. } => {
@@ -288,6 +303,7 @@ pub fn wait(ctx: &Ctx, project: &Path, outcomes: &mut [Outcome], timeout: Durati
                                 *o = Outcome::Pending { name: name.clone(), identity: identity.clone(), task_id: nt.id, title: nt.title, url: nt.url };
                                 any_pending = true;
                             }
+                            Delivery::NotDelivered => any_pending = true,
                         }
                     }
                     TaskStatus::Denied => *o = Outcome::Denied { name: name.clone(), task_id: task_id.clone() },
@@ -350,6 +366,9 @@ pub enum Delivery {
     /// The provider rejected the stored value just now. It is marked stale; the caller files
     /// the replacement card. Nothing was written.
     Rejected { reason: String },
+    /// An on-disk delivery found the stash value changed under it: the directory never held
+    /// the new value, so nothing was written; the caller treats it as a first delivery.
+    NotDelivered,
 }
 
 enum AtUse {
@@ -384,6 +403,11 @@ pub fn deliver(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &st
                 if m.stale {
                     return Ok(Delivery::Rejected { reason: m.stale_reason.unwrap_or_else(|| "the stored key was marked stale".into()) });
                 }
+            }
+            // On-disk equivalence proved the directory held the OLD value; it says nothing
+            // about the new one.
+            if grant == crate::db::GRANT_ON_DISK {
+                return Ok(Delivery::NotDelivered);
             }
             current = v;
             true
@@ -486,7 +510,7 @@ fn replacement(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &st
     // Generated secrets are never pasted: regenerate.
     if let Some(spec) = provider.and_then(|p| p.generate.as_deref()) {
         if let Some(v) = generate(spec) {
-            let p = tasks::store_and_inject(ctx, name, identity, &v, provider.map(|p| p.provider.clone()), None, false, project, agent, None, tasks::Verified::Unknown)?;
+            let p = tasks::store_and_inject(ctx, name, identity, &v, provider.map(|p| p.provider.clone()), None, false, project, agent, None, tasks::Verified::Unknown, crate::db::GRANT_GENERATED)?;
             return Ok(Outcome::Injected { name: name.into(), identity: identity.into(), written_to: p.map(|p| p.display().to_string()).unwrap_or_default(), generated: true, unverified: false });
         }
     }

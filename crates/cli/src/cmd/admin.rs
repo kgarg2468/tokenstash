@@ -115,9 +115,12 @@ pub struct BindArgs {
 }
 
 pub fn bind(a: BindArgs) -> Result<i32> {
+    require_human("bind")?;
     let app = App::open()?;
     let project = util::project_from(&a.project);
-    let ws = app.db.workspace_for(&project)?;
+    let Some(ws) = app.db.find_workspace(&project)? else {
+        bail!("{} is not a paired directory yet; run `tokenstash need {}` there first (the card pairs it), then bind", tokenstash_core::project::short(&project), a.name);
+    };
     app.db.set_binding(&ws.id, &a.name, &a.identity)?;
     println!("✓ {} → {}@{} for {}", a.name, a.name, a.identity, tokenstash_core::project::short(&project));
     Ok(0)
@@ -199,8 +202,8 @@ pub fn workspaces(a: WorkspacesArgs) -> Result<i32> {
                 return Ok(0);
             }
             for w in &all {
-                let live = app.db.find_workspace(std::path::Path::new(&w.root))?.is_some();
-                println!("{}{}", tokenstash_core::project::short(std::path::Path::new(&w.root)), if live { "" } else { "  (directory gone or re-created: grants no longer apply)" });
+                let note = if !w.fingerprint_ok { "  (directory gone or re-created: grants no longer apply until it pairs again)" } else if w.fingerprint_weak { "  (inode-only identity: this filesystem reports no birth time)" } else { "" };
+                println!("{}{}", tokenstash_core::project::short(std::path::Path::new(&w.root)), note);
                 for (name, identity, scope, source) in app.db.grants_for(&w.id)? {
                     let what = if scope == tokenstash_core::db::GRANT_BROAD { format!("any non-sensitive registry key @{identity}") } else if identity == "default" { name } else { format!("{name}@{identity}") };
                     println!("    {what:<48} via {source}");
@@ -274,7 +277,8 @@ fn require_human(what: &str) -> Result<()> {
 /// targets the wrong key in a project bound to `work`.
 fn resolve_identity(app: &App, project: &std::path::Path, name: &str, explicit: &Option<String>) -> Result<String> {
     if let Some(i) = explicit { return Ok(i.clone()); }
-    Ok(app.db.binding(&project.to_string_lossy(), name)?.unwrap_or_else(|| "default".into()))
+    let bound = match app.db.find_workspace(project)? { Some(w) => app.db.binding(&w.id, name)?, None => None };
+    Ok(bound.unwrap_or_else(|| "default".into()))
 }
 
 #[derive(Args)]

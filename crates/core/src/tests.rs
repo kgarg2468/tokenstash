@@ -223,9 +223,16 @@ fn workspace_identity_is_the_directory_not_the_path_string() {
     std::thread::sleep(std::time::Duration::from_millis(20));
     std::fs::create_dir_all(&proj).unwrap();
     let again = db.workspace_for(&proj).unwrap();
-    assert_ne!(again.id, ws.id, "re-created directory → new workspace");
-    assert!(db.grants_for(&again.id).unwrap().is_empty());
+    assert_eq!(again.id, ws.id, "the record stays until a human pairs the new directory");
+    assert!(!again.fingerprint_ok, "…but it is flagged, and no grant applies");
+    assert!(matches!(trust::gate(&db, &again, "OPENAI_API_KEY", "default", false, true).unwrap(), trust::Gate::NeedsApproval { .. }));
+    assert!(db.find_workspace(&proj).unwrap().is_none());
+    // the human pairs the new directory: old grants go, a new record replaces the old
+    let fresh = db.repair_workspace(&proj).unwrap();
+    assert_ne!(fresh.id, ws.id);
+    assert!(fresh.fingerprint_ok);
     assert!(db.grants_for(&ws.id).unwrap().is_empty(), "old grants revoked");
+    assert!(db.grants_for(&fresh.id).unwrap().is_empty());
     // refused roots
     assert!(trust::refused_root(std::path::Path::new("/")).is_some());
     assert!(trust::refused_root(&dirs::home_dir().unwrap()).is_some());
@@ -256,7 +263,7 @@ fn require_approval_gates_even_hits() {
     assert!(tid.starts_with("a_"));
     // approval injects; but a later program-derived request must ask again — persisted
     // approval never authorizes a fresh untrusted request
-    tasks::answer_approval(&ctx, &db.get_task(&tid).unwrap().unwrap(), tasks::Decision::Allow).unwrap();
+    tasks::answer_approval(&ctx, &db.get_task(&tid).unwrap().unwrap(), tasks::Decision::Allow, None).unwrap();
     assert!(envfile::has(&proj, ".env.local", "GROQ_API_KEY"));
     let out = need::need(&ctx, &proj, "run", &["GROQ_API_KEY".to_string()], &need::NeedOpts { require_approval: true, ..Default::default() }).unwrap();
     assert!(matches!(out[0], need::Outcome::Pending { .. }), "require_approval must ask every time");
@@ -519,7 +526,7 @@ fn approvals_follow_the_resolved_project_not_the_symlink() {
     // approve via the symlink while it points at a
     let out = need::need(&ctx, &link, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
     let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
-    tasks::answer_approval(&ctx, &db.get_task(&tid).unwrap().unwrap(), tasks::Decision::Allow).unwrap();
+    tasks::answer_approval(&ctx, &db.get_task(&tid).unwrap().unwrap(), tasks::Decision::Allow, None).unwrap();
     assert!(envfile::has(&a, ".env.local", "OPENAI_API_KEY"));
     // retarget the symlink at b: the approval must not carry over
     std::fs::remove_file(&link).unwrap();
@@ -547,7 +554,7 @@ fn approval_injects_the_requested_identity() {
     let tid = match &out[0] { need::Outcome::Pending { task_id, identity, .. } => { assert_eq!(identity, "work"); task_id.clone() } o => panic!("{o:?}") };
     let t = db.get_task(&tid).unwrap().unwrap();
     assert!(t.names.contains(&"OPENAI_API_KEY@work".to_string()), "approval must record the identity: {:?}", t.names);
-    tasks::answer_approval(&ctx, &t, tasks::Decision::Allow).unwrap();
+    tasks::answer_approval(&ctx, &t, tasks::Decision::Allow, None).unwrap();
     let env = std::fs::read_to_string(proj.join(".env.local")).unwrap();
     assert!(env.contains("OPENAI_API_KEY=sk-workworkwork1"), "must inject the work identity, got: {env}");
     assert!(!env.contains("sk-defaultdefault"));
@@ -608,7 +615,7 @@ fn approval_is_final_even_if_injection_fails() {
     let out = need::need(&ctx, &proj, "t", &["A_KEY".to_string(), "B_KEY".to_string()], &need::NeedOpts::default()).unwrap();
     let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
     std::os::unix::fs::symlink(proj.join("nowhere"), proj.join(".env.local")).unwrap();
-    let r = tasks::answer_approval(&ctx, &db.get_task(&tid).unwrap().unwrap(), tasks::Decision::Allow);
+    let r = tasks::answer_approval(&ctx, &db.get_task(&tid).unwrap().unwrap(), tasks::Decision::Allow, None);
     assert!(r.is_err(), "injection failure must be surfaced");
     assert_eq!(db.get_task(&tid).unwrap().unwrap().status, db::TaskStatus::Answered);
     let ws = db.find_workspace(&proj).unwrap().unwrap();
@@ -639,7 +646,7 @@ fn program_derived_approvals_do_not_merge() {
         o => panic!("{o:?}"),
     };
     assert_ne!(ta, tb, "two program-derived requests must not share an approval task");
-    tasks::answer_approval(&ctx, &db.get_task(&ta).unwrap().unwrap(), tasks::Decision::Allow).unwrap();
+    tasks::answer_approval(&ctx, &db.get_task(&ta).unwrap().unwrap(), tasks::Decision::Allow, None).unwrap();
     assert!(envfile::has(&proj, ".env.local", "A_KEY"));
     assert!(!envfile::has(&proj, ".env.local", "B_KEY"), "B must wait for its own approval");
     assert_eq!(db.get_task(&tb).unwrap().unwrap().status, db::TaskStatus::Pending);
@@ -673,7 +680,7 @@ fn wait_does_not_file_duplicate_program_approvals() {
         std::thread::sleep(std::time::Duration::from_millis(300));
         let st = stash::open(&cfg2).unwrap();
         let c = tasks::Ctx { cfg: &cfg2, db: &db2, stash: st.as_ref(), probe: tasks::Probe::Off };
-        tasks::answer_approval(&c, &db2.get_task(&tid2).unwrap().unwrap(), tasks::Decision::Allow).unwrap();
+        tasks::answer_approval(&c, &db2.get_task(&tid2).unwrap().unwrap(), tasks::Decision::Allow, None).unwrap();
         let _ = proj2;
     });
     need::wait(&ctx, &proj, &mut out, std::time::Duration::from_secs(5)).unwrap();
@@ -845,13 +852,13 @@ fn a_run_shim_approval_is_not_a_standing_grant() {
     // a program-derived approval is one-time
     let t = tasks::create_approval_task(&ctx, &proj, "test", &["STRIPE_SECRET_KEY@default".to_string()], tasks::ApprovalKind::Once).unwrap();
     assert_eq!(t.expects, tasks::APPROVAL_ONCE);
-    tasks::answer_approval(&ctx, &t, tasks::Decision::Allow).unwrap();
+    tasks::answer_approval(&ctx, &t, tasks::Decision::Allow, None).unwrap();
     assert_eq!(db.get_task(&t.id).unwrap().unwrap().status, db::TaskStatus::Answered, "the answer is recorded");
     assert!(db.grant_source(&ws.id, "STRIPE_SECRET_KEY", "default").unwrap().is_none(), "but no grant was written");
     assert!(matches!(trust::gate(&db, &ws, "STRIPE_SECRET_KEY", "default", true, true).unwrap(), trust::Gate::NeedsApproval { .. }), "the next bare request asks again");
     // an ordinary (human-facing) sensitive approval does persist
     let t2 = tasks::create_approval_task(&ctx, &proj, "test", &["STRIPE_SECRET_KEY@default".to_string()], tasks::ApprovalKind::Sensitive).unwrap();
-    tasks::answer_approval(&ctx, &t2, tasks::Decision::Allow).unwrap();
+    tasks::answer_approval(&ctx, &t2, tasks::Decision::Allow, None).unwrap();
     assert_eq!(db.grant_source(&ws.id, "STRIPE_SECRET_KEY", "default").unwrap().as_deref(), Some(db::GRANT_SENSITIVE));
     std::env::remove_var("TOKENSTASH_HOME");
     std::env::remove_var("TOKENSTASH_STASH");
@@ -875,7 +882,7 @@ fn a_denied_approval_is_remembered() {
     let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("expected pending, got {o:?}") };
     let t = db.get_task(&tid).unwrap().unwrap();
     assert_eq!(t.kind, db::TaskKind::Approval);
-    tasks::answer_approval(&ctx, &t, tasks::Decision::Deny).unwrap();
+    tasks::answer_approval(&ctx, &t, tasks::Decision::Deny, None).unwrap();
     // asking again within the TTL is refused without a new card
     let out2 = need::need(&ctx, &proj, "test", &names, &need::NeedOpts::default()).unwrap();
     assert!(matches!(&out2[0], need::Outcome::Denied { .. }), "got {:?}", out2[0]);
@@ -884,7 +891,7 @@ fn a_denied_approval_is_remembered() {
     stash.set(&stash::stash_key("GROQ_API_KEY", "default"), &SecretString::from("gsk_test_bbbbbbbbbbbbbbbb".to_string())).unwrap();
     let out_g = need::need(&ctx, &proj, "test", &["GROQ_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
     let gid = match &out_g[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
-    tasks::answer_approval(&ctx, &db.get_task(&gid).unwrap().unwrap(), tasks::Decision::Deny).unwrap();
+    tasks::answer_approval(&ctx, &db.get_task(&gid).unwrap().unwrap(), tasks::Decision::Deny, None).unwrap();
     let both = need::need(&ctx, &proj, "test", &["OPENAI_API_KEY".to_string(), "GROQ_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
     assert!(both.iter().all(|o| matches!(o, need::Outcome::Denied { .. })), "both denials must be remembered: {both:?}");
     assert_eq!(db.list_tasks(Some(&proj.to_string_lossy()), true).unwrap().len(), 0);
@@ -1080,7 +1087,7 @@ fn rotation_never_rewrites_a_project_without_a_standing_grant_and_ordinary_paste
     tasks::answer_secret(&ctx, &t, SecretString::from("gsk_old_aaaaaaaaaaaaaaaa".to_string()), true).unwrap();
     let ws_b = db.workspace_for(&proj_b).unwrap();
     let once = tasks::create_approval_task(&ctx, &proj_b, "run", &["GROQ_API_KEY@default".to_string()], tasks::ApprovalKind::Once).unwrap();
-    tasks::answer_approval(&ctx, &once, tasks::Decision::Allow).unwrap();
+    tasks::answer_approval(&ctx, &once, tasks::Decision::Allow, None).unwrap();
     assert!(std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("gsk_old_"));
     assert!(db.grant_source(&ws_b.id, "GROQ_API_KEY", "default").unwrap().is_none(), "one-time approval left no grant");
     // rotate from A: B must NOT be rewritten, and the human is told
@@ -1365,7 +1372,7 @@ fn approval_delivery_is_verified_too() {
     let out = need::need(&ctx, &proj, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
     let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
     assert!(tid.starts_with("a_"), "unpaired directory: pairing card first");
-    match tasks::answer_approval(&ctx, &db.get_task(&tid).unwrap().unwrap(), tasks::Decision::Allow).unwrap() {
+    match tasks::answer_approval(&ctx, &db.get_task(&tid).unwrap().unwrap(), tasks::Decision::Allow, None).unwrap() {
         tasks::AnswerResult::Approved { injected, replaced } => { assert!(injected.is_empty()); assert_eq!(replaced, vec!["OPENAI_API_KEY".to_string()]); }
         o => panic!("{o:?}"),
     }
@@ -1636,7 +1643,7 @@ fn first_contact_files_one_pairing_card_and_allow_broad_covers_registry_keys_onl
     assert_eq!(db.list_tasks(Some(&proj.to_string_lossy()), true).unwrap().len(), 2);
     assert_eq!(db.get_task(&pairing.id).unwrap().unwrap().names.len(), 3);
     // Allow broad: the listed keys + any registry non-sensitive key for `default` here
-    tasks::answer_approval(&ctx, &db.get_task(&pairing.id).unwrap().unwrap(), tasks::Decision::AllowBroad).unwrap();
+    tasks::answer_approval(&ctx, &db.get_task(&pairing.id).unwrap().unwrap(), tasks::Decision::AllowBroad, None).unwrap();
     let ws = db.find_workspace(&proj).unwrap().unwrap();
     assert!(db.has_broad_grant(&ws.id, "default").unwrap());
     assert_eq!(db.grant_source(&ws.id, "OPENAI_API_KEY", "default").unwrap().as_deref(), Some(db::GRANT_PAIRING));
@@ -1648,8 +1655,8 @@ fn first_contact_files_one_pairing_card_and_allow_broad_covers_registry_keys_onl
     assert!(matches!(out[0], need::Outcome::Injected { .. }), "{out:?}");
     assert!(matches!(out[1], need::Outcome::Pending { .. }) && matches!(out[2], need::Outcome::Pending { .. }));
     // the sensitive card cannot be answered broadly
-    assert!(tasks::answer_approval(&ctx, &db.get_task(&sens.id).unwrap().unwrap(), tasks::Decision::AllowBroad).is_err());
-    tasks::answer_approval(&ctx, &db.get_task(&sens.id).unwrap().unwrap(), tasks::Decision::Allow).unwrap();
+    assert!(tasks::answer_approval(&ctx, &db.get_task(&sens.id).unwrap().unwrap(), tasks::Decision::AllowBroad, None).is_err());
+    tasks::answer_approval(&ctx, &db.get_task(&sens.id).unwrap().unwrap(), tasks::Decision::Allow, None).unwrap();
     assert_eq!(db.grant_source(&ws.id, "STRIPE_SECRET_KEY", "default").unwrap().as_deref(), Some(db::GRANT_SENSITIVE));
     assert!(envfile::has(&proj, ".env.local", "STRIPE_SECRET_KEY"));
     // audit rows say which grant delivered
@@ -1672,7 +1679,7 @@ fn a_denied_pairing_card_is_remembered() {
     stash.set(&stash::stash_key("OPENAI_API_KEY", "default"), &SecretString::from("sk-aaaaaaaaaaaaaaaaaaaa".to_string())).unwrap();
     let out = need::need(&ctx, &proj, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
     let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
-    tasks::answer_approval(&ctx, &db.get_task(&tid).unwrap().unwrap(), tasks::Decision::Deny).unwrap();
+    tasks::answer_approval(&ctx, &db.get_task(&tid).unwrap().unwrap(), tasks::Decision::Deny, None).unwrap();
     let out = need::need(&ctx, &proj, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
     assert!(matches!(out[0], need::Outcome::Denied { .. }), "{out:?}");
     assert_eq!(db.list_tasks(Some(&proj.to_string_lossy()), true).unwrap().len(), 0, "no fresh card");
@@ -1722,7 +1729,7 @@ fn on_disk_equivalence_opens_one_delivery_and_is_not_a_grant() {
     let rows = db.recent_audit(20).unwrap();
     assert!(rows.iter().any(|r| r.3 == "inject" && r.7.as_deref() == Some(db::GRANT_ON_DISK)));
     // rotation never follows it
-    assert!(db.workspaces_granted("OPENAI_API_KEY", "default").unwrap().is_empty());
+    assert!(db.workspaces_granted("OPENAI_API_KEY", "default", true).unwrap().is_empty());
     // a different value on disk: a card, and no second comparison inside the TTL
     let other = tmp("v2-ondisk-other").canonicalize().unwrap();
     std::fs::write(other.join(".env.local"), "OPENAI_API_KEY=sk-guess-000000000000000\n").unwrap();
@@ -1783,4 +1790,165 @@ fn refused_roots_never_pair() {
     let err = need::need(&ctx, std::path::Path::new("/tmp"), "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap_err().to_string();
     assert!(err.contains("shared temporary directory"), "{err}");
     assert!(db.list_workspaces().unwrap().is_empty());
+}
+
+
+#[test]
+fn the_on_disk_check_is_rate_limited_per_key_not_per_directory() {
+    let _g = env_lock();
+    let (home, _proj) = v2_world("oracle");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let v = "sk-aaaaaaaaaaaaaaaaaaaa";
+    stash.set(&stash::stash_key("OPENAI_API_KEY", "default"), &SecretString::from(v.to_string())).unwrap();
+    // guess #1 in one directory, then the right value in a brand-new directory: no comparison
+    let g1 = tmp("v2-oracle-g1").canonicalize().unwrap();
+    std::fs::write(g1.join(".env.local"), "OPENAI_API_KEY=sk-guess-111111111111111\n").unwrap();
+    assert!(matches!(need::need(&ctx, &g1, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap()[0], need::Outcome::Pending { .. }));
+    let g2 = tmp("v2-oracle-g2").canonicalize().unwrap();
+    std::fs::write(g2.join(".env.local"), format!("OPENAI_API_KEY={v}\n")).unwrap();
+    assert!(matches!(need::need(&ctx, &g2, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap()[0], need::Outcome::Pending { .. }),
+        "a miss anywhere closes the check for this key everywhere until the TTL passes");
+}
+
+#[test]
+fn rotation_with_a_broad_grant_never_writes_a_sensitive_key() {
+    let _g = env_lock();
+    let (home, proj_a) = v2_world("rot-broad");
+    let proj_b = tmp("v2-rot-broad-b").canonicalize().unwrap();
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    // A holds STRIPE via a paste; B has a broad grant and once received STRIPE one-time
+    let t = tasks::create_secret_task(&ctx, &proj_a, "t", "STRIPE_SECRET_KEY", "default", &Default::default()).unwrap();
+    tasks::answer_secret(&ctx, &t, SecretString::from("sk_live_oldoldoldold".to_string()), true).unwrap();
+    let ws_b = db.workspace_for(&proj_b).unwrap();
+    db.grant(&ws_b.id, "*", "default", db::GRANT_BROAD, db::GRANT_PAIRING).unwrap();
+    let once = tasks::create_approval_task(&ctx, &proj_b, "run", &["STRIPE_SECRET_KEY@default".to_string()], tasks::ApprovalKind::Once).unwrap();
+    tasks::answer_approval(&ctx, &once, tasks::Decision::Allow, None).unwrap();
+    assert!(std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("sk_live_old"));
+    let card = tasks::rotate(&ctx, &proj_a, "human", "STRIPE_SECRET_KEY", "default").unwrap();
+    let r = tasks::answer_secret(&ctx, &card, SecretString::from("sk_live_newnewnewnew".to_string()), true).unwrap();
+    let tasks::AnswerResult::Stored { rotation: Some(rep), .. } = r else { panic!() };
+    assert!(rep.rewritten.is_empty(), "{rep:?}");
+    assert!(std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("sk_live_old"), "broad never covers a sensitive key");
+    // …but a broad grant does carry a registry non-sensitive key
+    let t = tasks::create_secret_task(&ctx, &proj_a, "t", "GROQ_API_KEY", "default", &Default::default()).unwrap();
+    tasks::answer_secret(&ctx, &t, SecretString::from("gsk_oldoldoldoldoldold".to_string()), true).unwrap();
+    need::need(&ctx, &proj_b, "t", &["GROQ_API_KEY".to_string()], &Default::default()).unwrap();
+    let card = tasks::rotate(&ctx, &proj_a, "human", "GROQ_API_KEY", "default").unwrap();
+    let r = tasks::answer_secret(&ctx, &card, SecretString::from("gsk_newnewnewnewnewnew".to_string()), true).unwrap();
+    let tasks::AnswerResult::Stored { rotation: Some(rep), .. } = r else { panic!() };
+    assert_eq!(rep.rewritten, vec![proj_b.to_string_lossy().to_string()], "{rep:?}");
+}
+
+#[test]
+fn a_denied_run_card_does_not_block_pairing_but_a_denied_pairing_blocks_run() {
+    let _g = env_lock();
+    let (home, proj) = v2_world("denykinds");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    stash.set(&stash::stash_key("OPENAI_API_KEY", "default"), &SecretString::from("sk-aaaaaaaaaaaaaaaaaaaa".to_string())).unwrap();
+    let once = need::need(&ctx, &proj, "run", &["OPENAI_API_KEY".to_string()], &need::NeedOpts { require_approval: true, ..Default::default() }).unwrap();
+    let tid = match &once[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
+    tasks::answer_approval(&ctx, &db.get_task(&tid).unwrap().unwrap(), tasks::Decision::Deny, None).unwrap();
+    let out = need::need(&ctx, &proj, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    assert!(matches!(out[0], need::Outcome::Pending { .. }), "a denied run card is not a denied pairing: {out:?}");
+    let pid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), _ => unreachable!() };
+    tasks::answer_approval(&ctx, &db.get_task(&pid).unwrap().unwrap(), tasks::Decision::Deny, None).unwrap();
+    let once = need::need(&ctx, &proj, "run", &["OPENAI_API_KEY".to_string()], &need::NeedOpts { require_approval: true, ..Default::default() }).unwrap();
+    assert!(matches!(once[0], need::Outcome::Denied { .. }), "a denied pairing blocks a run request too: {once:?}");
+}
+
+#[test]
+fn a_card_that_grew_since_it_was_read_is_refused() {
+    let _g = env_lock();
+    let (home, proj) = v2_world("toctou");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    for n in ["OPENAI_API_KEY", "GROQ_API_KEY"] {
+        stash.set(&stash::stash_key(n, "default"), &SecretString::from("aaaaaaaaaaaaaaaaaaaaaa".to_string())).unwrap();
+    }
+    let out = need::need(&ctx, &proj, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
+    let shown = db.get_task(&tid).unwrap().unwrap();
+    // the agent asks for more while the human has the page open
+    need::need(&ctx, &proj, "t", &["GROQ_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    let err = tasks::answer_approval(&ctx, &shown, tasks::Decision::Allow, Some(&shown.names)).unwrap_err().to_string();
+    assert!(err.contains("changed since you read it"), "{err}");
+    let ws = db.find_workspace(&proj).unwrap().unwrap();
+    assert!(db.grants_for(&ws.id).unwrap().is_empty());
+    // re-read, then it goes through
+    let now = db.get_task(&tid).unwrap().unwrap();
+    tasks::answer_approval(&ctx, &now, tasks::Decision::Allow, Some(&now.names)).unwrap();
+    assert_eq!(db.grants_for(&ws.id).unwrap().len(), 2);
+}
+
+#[test]
+fn refused_roots_include_home_and_tool_dirs_and_a_dotfiles_repo_is_not_a_project() {
+    let _g = env_lock();
+    let (home_ts, _proj) = v2_world("refused2");
+    let cfg = Config::default();
+    let db = Db::open(&home_ts.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let home = dirs::home_dir().unwrap();
+    for (p, why) in [(home.clone(), "home directory"), (home.join(".ssh"), "credential directory")] {
+        if !p.is_dir() { continue; }
+        let err = need::need(&ctx, &p, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap_err().to_string();
+        assert!(err.contains(why), "{err}");
+    }
+    // a `.git` at a refused root does not make its children resolve to it
+    let fake_home = tmp("v2-fakehome").canonicalize().unwrap();
+    std::fs::create_dir_all(fake_home.join(".git")).unwrap();
+    std::fs::create_dir_all(fake_home.join("scratch/foo")).unwrap();
+    assert_eq!(envfile::owned_git_root(&fake_home.join("scratch/foo")).unwrap(), Some(fake_home.clone()), "an ordinary dir with .git is a root");
+    assert!(trust::refused_root(&home).is_some());
+}
+
+#[test]
+fn wait_after_a_pairing_card_delivers_with_the_pairing_source() {
+    let _g = env_lock();
+    let (home, proj) = v2_world("waitpair");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    stash.set(&stash::stash_key("OPENAI_API_KEY", "default"), &SecretString::from("sk-aaaaaaaaaaaaaaaaaaaa".to_string())).unwrap();
+    let mut out = need::need(&ctx, &proj, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
+    tasks::answer_approval(&ctx, &db.get_task(&tid).unwrap().unwrap(), tasks::Decision::Allow, None).unwrap();
+    need::wait(&ctx, &proj, &mut out, std::time::Duration::from_millis(10)).unwrap();
+    assert!(matches!(out[0], need::Outcome::Injected { .. }), "{out:?}");
+    let rows = db.recent_audit(10).unwrap();
+    assert!(rows.iter().any(|r| r.3 == "inject" && r.7.as_deref() == Some(db::GRANT_PAIRING)), "{rows:?}");
+    assert!(!rows.iter().any(|r| r.3 == "inject" && r.7.as_deref() == Some(db::GRANT_PASTE)));
+}
+
+#[test]
+fn migration_handles_symlinked_duplicates_and_non_directories() {
+    let dir = tmp("v2-migrate2");
+    let path = dir.join("old.db");
+    let proj = dir.join("proj"); std::fs::create_dir_all(&proj).unwrap();
+    let link = dir.join("link"); std::os::unix::fs::symlink(&proj, &link).unwrap();
+    let file = dir.join("afile"); std::fs::write(&file, "x").unwrap();
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch("CREATE TABLE approvals (project TEXT NOT NULL, name TEXT NOT NULL, created TEXT NOT NULL, PRIMARY KEY (project, name));
+                         CREATE TABLE bindings (project TEXT NOT NULL, name TEXT NOT NULL, identity TEXT NOT NULL, PRIMARY KEY (project, name));").unwrap();
+        c.execute("INSERT INTO approvals VALUES (?1, 'OPENAI_API_KEY', 't')", [proj.to_string_lossy().to_string()]).unwrap();
+        c.execute("INSERT INTO approvals VALUES (?1, 'GROQ_API_KEY', 't')", [link.to_string_lossy().to_string()]).unwrap();
+        c.execute("INSERT INTO approvals VALUES (?1, 'X_KEY', 't')", [file.to_string_lossy().to_string()]).unwrap();
+    }
+    let db = Db::open(&path).unwrap();
+    assert_eq!(db.list_workspaces().unwrap().len(), 1, "the symlink and its target are one workspace; a file is none");
+    let ws = db.find_workspace(&proj).unwrap().unwrap();
+    assert_eq!(db.grants_for(&ws.id).unwrap().len(), 2);
 }

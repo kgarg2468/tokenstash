@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// (ts, project, agent, action, name, identity, detail) — never a value.
+/// (ts, project, agent, action, name, identity, detail, grant_source)
 pub type AuditRow = (String, Option<String>, Option<String>, String, Option<String>, Option<String>, Option<String>, Option<String>);
 
 pub struct Db {
@@ -90,7 +91,17 @@ pub struct Workspace {
     /// The filesystem gave no birth time: identity rests on the inode alone.
     #[serde(default)]
     pub fingerprint_weak: bool,
+    /// The directory at this root is no longer the one on record (re-created, moved
+    /// between volumes, shown through a different mount). Its grants do not apply until a
+    /// human pairs it again; nothing is deleted by an agent-callable path.
+    #[serde(default)]
+    pub fingerprint_ok: bool,
 }
+
+/// Generated locally (e.g. AUTH_SECRET): stored and delivered, never pasted.
+pub const GRANT_GENERATED: &str = "generated";
+/// Written by a rotation into a workspace holding an exact/broad grant.
+pub const GRANT_ROTATION: &str = "rotation";
 
 pub struct Fingerprint { pub ino: u64, pub btime: Option<String>, pub dev: u64 }
 
@@ -709,18 +720,16 @@ impl Db {
         let existing: Option<Workspace> = self.conn.query_row(
             "SELECT id, root, ino, btime, dev, created FROM workspaces WHERE root=?1",
             params![key],
-            |r| Ok(Workspace { id: r.get(0)?, root: r.get(1)?, ino: r.get::<_, i64>(2)? as u64, btime: r.get(3)?, dev: r.get::<_, i64>(4)? as u64, created: r.get(5)?, fingerprint_weak: false }),
+            Self::ws_row,
         ).optional()?;
         if let Some(mut ws) = existing {
-            if ws.ino == fp.ino && ws.btime == fp.btime {
-                ws.fingerprint_weak = fp.btime.is_none();
-                return Ok(Some(ws));
-            }
-            // Same path, different directory: everything the human granted was for the old one.
-            self.conn.execute("DELETE FROM grants WHERE workspace_id=?1", params![ws.id])?;
-            self.conn.execute("DELETE FROM workspace_bindings WHERE workspace_id=?1", params![ws.id])?;
-            self.conn.execute("DELETE FROM workspaces WHERE id=?1", params![ws.id])?;
-            self.audit(Some(&key), None, "workspace.replaced", None, None, Some("directory re-created; grants revoked"))?;
+            ws.fingerprint_weak = ws.btime.is_none();
+            // Same path, different directory (re-created, another mount, moved volumes):
+            // the grants were for the old one and do not apply — but an agent-callable
+            // path deletes nothing. `repair_workspace` (a human answering the new pairing
+            // card) is what revokes and re-records.
+            ws.fingerprint_ok = ws.ino == fp.ino && ws.btime == fp.btime;
+            return Ok(Some(ws));
         }
         let id = new_workspace_id();
         let created = crate::now();
@@ -728,7 +737,7 @@ impl Db {
             "INSERT INTO workspaces (id, root, ino, btime, dev, created) VALUES (?1,?2,?3,?4,?5,?6)",
             params![id, key, fp.ino as i64, fp.btime, fp.dev as i64, created],
         )?;
-        Ok(Some(Workspace { id, root: key, ino: fp.ino, btime: fp.btime.clone(), dev: fp.dev, created, fingerprint_weak: fp.btime.is_none() }))
+        Ok(Some(Workspace { id, root: key, ino: fp.ino, fingerprint_weak: fp.btime.is_none(), btime: fp.btime, dev: fp.dev, created, fingerprint_ok: true }))
     }
 
     /// The workspace for a root, created if this is its first contact. Only the delivery
@@ -756,15 +765,45 @@ impl Db {
         let ws: Option<Workspace> = self.conn.query_row(
             "SELECT id, root, ino, btime, dev, created FROM workspaces WHERE root=?1",
             params![key],
-            |r| Ok(Workspace { id: r.get(0)?, root: r.get(1)?, ino: r.get::<_, i64>(2)? as u64, btime: r.get(3)?, dev: r.get::<_, i64>(4)? as u64, created: r.get(5)?, fingerprint_weak: false }),
+            Self::ws_row,
         ).optional()?;
-        Ok(ws.filter(|w| fingerprint(&root).map(|fp| fp.ino == w.ino && fp.btime == w.btime).unwrap_or(false)))
+        Ok(ws.filter(|w| fingerprint(&root).map(|fp| fp.ino == w.ino && fp.btime == w.btime).unwrap_or(false)).map(|mut w| { w.fingerprint_ok = true; w }))
     }
 
+    fn ws_row(r: &rusqlite::Row) -> rusqlite::Result<Workspace> {
+        let btime: Option<String> = r.get(3)?;
+        Ok(Workspace { id: r.get(0)?, root: r.get(1)?, ino: r.get::<_, i64>(2)? as u64, fingerprint_weak: btime.is_none(), btime, dev: r.get::<_, i64>(4)? as u64, created: r.get(5)?, fingerprint_ok: false })
+    }
+
+    /// Every workspace on record; `fingerprint_ok` says whether the directory at that root
+    /// is still the one paired.
     pub fn list_workspaces(&self) -> Result<Vec<Workspace>> {
         let mut st = self.conn.prepare("SELECT id, root, ino, btime, dev, created FROM workspaces ORDER BY root")?;
-        let rows = st.query_map([], |r| Ok(Workspace { id: r.get(0)?, root: r.get(1)?, ino: r.get::<_, i64>(2)? as u64, btime: r.get(3)?, dev: r.get::<_, i64>(4)? as u64, created: r.get(5)?, fingerprint_weak: false }))?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        let rows = st.query_map([], Self::ws_row)?;
+        let mut all = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        for w in &mut all {
+            w.fingerprint_ok = fingerprint(Path::new(&w.root)).map(|fp| fp.ino == w.ino && fp.btime == w.btime).unwrap_or(false);
+        }
+        Ok(all)
+    }
+
+    /// A human is pairing a directory whose record no longer matches it: revoke what was
+    /// granted to the old directory and record the new one under a new id.
+    pub fn repair_workspace(&self, root: &Path) -> Result<Workspace> {
+        let root = root.canonicalize()?;
+        let Some(fp) = fingerprint(&root) else { anyhow::bail!("{} is not a directory", root.display()) };
+        let key = root.to_string_lossy().to_string();
+        let old: Option<String> = self.conn.query_row("SELECT id FROM workspaces WHERE root=?1", params![key], |r| r.get(0)).optional()?;
+        if let Some(old) = old {
+            self.conn.execute("DELETE FROM grants WHERE workspace_id=?1", params![old])?;
+            self.conn.execute("DELETE FROM workspace_bindings WHERE workspace_id=?1", params![old])?;
+            self.conn.execute("DELETE FROM workspaces WHERE id=?1", params![old])?;
+            self.audit(Some(&key), None, "workspace.replaced", None, None, Some("directory re-created; the human paired the new one, old grants revoked"))?;
+        }
+        let id = new_workspace_id();
+        let created = crate::now();
+        self.conn.execute("INSERT INTO workspaces (id, root, ino, btime, dev, created) VALUES (?1,?2,?3,?4,?5,?6)", params![id, key, fp.ino as i64, fp.btime, fp.dev as i64, created])?;
+        Ok(Workspace { id, root: key, ino: fp.ino, fingerprint_weak: fp.btime.is_none(), btime: fp.btime, dev: fp.dev, created, fingerprint_ok: true })
     }
 
     pub fn grant(&self, workspace_id: &str, name: &str, identity: &str, scope: &str, source: &str) -> Result<()> {
@@ -801,14 +840,16 @@ impl Db {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// Every workspace holding an exact or broad grant for (name, identity): the set a
-    /// rotation may rewrite. On-disk equivalence is not a grant and never appears here.
-    pub fn workspaces_granted(&self, name: &str, identity: &str) -> Result<Vec<Workspace>> {
+    /// Every workspace holding a grant that would open the gate for (name, identity): an
+    /// exact grant, or — only for registry-confirmed non-sensitive keys — a broad one. The
+    /// set a rotation may rewrite. On-disk equivalence and one-time approvals are not
+    /// grants and never appear here.
+    pub fn workspaces_granted(&self, name: &str, identity: &str, broad_applies: bool) -> Result<Vec<Workspace>> {
         let mut st = self.conn.prepare(
             "SELECT DISTINCT w.id, w.root, w.ino, w.btime, w.dev, w.created FROM workspaces w JOIN grants g ON g.workspace_id = w.id
-             WHERE g.identity=?2 AND (g.name=?1 OR (g.name='*' AND g.scope=?3)) ORDER BY w.root",
+             WHERE g.identity=?2 AND (g.name=?1 OR (?4 AND g.name='*' AND g.scope=?3)) ORDER BY w.root",
         )?;
-        let rows = st.query_map(params![name, identity, GRANT_BROAD], |r| Ok(Workspace { id: r.get(0)?, root: r.get(1)?, ino: r.get::<_, i64>(2)? as u64, btime: r.get(3)?, dev: r.get::<_, i64>(4)? as u64, created: r.get(5)?, fingerprint_weak: false }))?;
+        let rows = st.query_map(params![name, identity, GRANT_BROAD, broad_applies], Self::ws_row)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
@@ -898,12 +939,14 @@ impl Db {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// Was an on-disk equivalence check for (project, name) refused since `since`? One
-    /// attempt per window: a planted `NAME=guess` must not become a value-equality oracle.
-    pub fn recent_on_disk_miss(&self, project: &str, name: &str, since: &str) -> Result<bool> {
+    /// Was an on-disk equivalence check for this key refused anywhere since `since`? One
+    /// attempt per key per window, across every directory: directories are free to make,
+    /// so a per-directory limit would let a planted `NAME=guess` per directory turn the
+    /// check into a value-equality oracle.
+    pub fn recent_on_disk_miss(&self, name: &str, identity: &str, since: &str) -> Result<bool> {
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM audit WHERE project=?1 AND name=?2 AND action='on_disk.miss' AND ts >= ?3",
-            params![project, name, since],
+            "SELECT COUNT(*) FROM audit WHERE name=?1 AND identity=?2 AND action='on_disk.miss' AND ts >= ?3",
+            params![name, identity, since],
             |r| r.get(0),
         )?;
         Ok(n > 0)

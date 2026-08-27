@@ -202,7 +202,12 @@ fn handle(app: &App, mut req: Request, tokens: &inbox_auth::Tokens) -> Result<()
                             anyhow::bail!("approving needs the full inbox session: click the desktop notification or run `tokenstash open`, then reload this page");
                         }
                         let decision = match action.as_str() { "allow" => tasks::Decision::Allow, "allow_broad" => tasks::Decision::AllowBroad, _ => tasks::Decision::Deny };
-                        match tasks::answer_approval(&ctx, &task, decision)? {
+                        // What the page listed when it was rendered: a card that grew since
+                        // (an agent asked for more) is refused and re-read.
+                        // The browser form always carries `seen`; a POST without it (a
+                        // person scripting `curl`) is judged on the card as it is now.
+                        let seen: Option<Vec<String>> = form.get("seen").map(|s| s.split(',').filter(|x| !x.is_empty()).map(String::from).collect());
+                        match tasks::answer_approval(&ctx, &task, decision, seen.as_deref())? {
                             AnswerResult::Approved { injected, replaced } => Ok(format!("Approved; injected {}{}", if injected.is_empty() { "nothing new".into() } else { injected.join(", ") }, if replaced.is_empty() { String::new() } else { format!(". {} rejected by the provider at delivery — a Replace card is waiting", replaced.join(", ")) })),
                             _ => Ok("Denied".into()),
                         }
@@ -381,7 +386,8 @@ fn page_task(t: &Task, err: Option<&str>, token: &str, scope: inbox_auth::Scope)
                 let broad = if t.expects == tasks::APPROVAL_PAIRING {
                     "<button name=action value=allow_broad title='also any registry-confirmed non-sensitive key for this identity, in this directory only'>Allow these + any non-sensitive key here</button>"
                 } else { "" };
-                b.push_str(&format!("<form method=post>{csrf}<div class=row><button class=p name=action value=allow>Allow these</button>{broad}<button class=bad name=action value=deny>Deny</button></div></form>"));
+                let seen = esc(&t.names.join(","));
+                b.push_str(&format!("<form method=post>{csrf}<input type=hidden name=seen value='{seen}'><div class=row><button class=p name=action value=allow>Allow these</button>{broad}<button class=bad name=action value=deny>Deny</button></div></form>"));
             } else {
                 b.push_str("<div class=err>Approving needs the full inbox session, which only you can open: click the desktop notification, or run <code>tokenstash open</code> in a terminal, then reload this page. (The link your agent gave you can paste keys, but not approve — so an agent can never approve its own request.)</div>");
             }

@@ -11,7 +11,7 @@
 //! same value (a copy that brought its `.env.local` along), which is a delivery check, not
 //! a grant: it opens this delivery of this key and nothing else.
 
-use crate::db::{Db, Workspace, GRANT_BROAD, GRANT_ON_DISK};
+use crate::db::{Db, Workspace, GRANT_BROAD};
 use anyhow::Result;
 use secrecy::{ExposeSecret, SecretString};
 use std::path::{Path, PathBuf};
@@ -36,16 +36,25 @@ pub enum GateReason {
 /// is whether the registry knows the name at all. A `run`-derived request never reaches
 /// this: it gets a one-time approval upstream, every invocation.
 pub fn gate(db: &Db, ws: &Workspace, name: &str, identity: &str, sensitive: bool, registered: bool) -> Result<Gate> {
-    if let Some(source) = db.grant_source(&ws.id, name, identity)? {
-        return Ok(Gate::Open { source });
+    // A record whose directory was re-created holds grants for a directory that no longer
+    // exists: nothing applies until a human pairs the new one.
+    if ws.fingerprint_ok {
+        if let Some(source) = db.grant_source(&ws.id, name, identity)? {
+            return Ok(Gate::Open { source });
+        }
     }
     if sensitive || !registered {
         return Ok(Gate::NeedsApproval { reason: GateReason::Sensitive });
     }
-    if db.has_broad_grant(&ws.id, identity)? {
+    if ws.fingerprint_ok && db.has_broad_grant(&ws.id, identity)? {
         return Ok(Gate::Open { source: GRANT_BROAD.into() });
     }
     Ok(Gate::NeedsApproval { reason: GateReason::Pairing })
+}
+
+/// Does a broad grant cover this key? Only registry-confirmed, non-sensitive names.
+pub fn broad_applies(sensitive: bool, registered: bool) -> bool {
+    !sensitive && registered
 }
 
 /// Already-on-disk equivalence: the workspace's env file holds `NAME=` with exactly the
@@ -64,8 +73,7 @@ pub fn on_disk_equivalent(project: &Path, env_file: &str, name: &str, value: &Se
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        // SAFETY: geteuid has no preconditions.
-        if md.uid() != unsafe { libc::geteuid() } {
+        if md.uid() != crate::envfile::euid() {
             return false;
         }
     }
@@ -105,22 +113,26 @@ pub fn refused_root(root: &Path) -> Option<String> {
     if canon == Path::new("/") {
         return Some("the filesystem root".into());
     }
+    // Order matters only for the message: the most specific reason first. Unix-only
+    // (Windows profile/AppData roots are not covered; tokenstash does not run there yet).
     let mut refused: Vec<(PathBuf, &str, bool)> = vec![]; // (dir, why, exact_only)
+    for shared in ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"] {
+        refused.push((PathBuf::from(shared), "a shared temporary directory", true));
+    }
     if let Some(home) = dirs::home_dir() {
         refused.push((home.clone(), "your home directory", true));
         for d in [".ssh", ".aws", ".kube", ".local", ".vscode", ".windsurf", ".claude", ".codex", ".cursor", ".gemini"] {
             refused.push((home.join(d), "a tool or credential directory", false));
         }
     }
-    for shared in ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"] {
-        refused.push((PathBuf::from(shared), "a shared temporary directory", true));
-    }
-    // The tokenstash home and every ancestor of it: a project that contains the stash
-    // index is not a project.
-    let mut d = Some(crate::config::config_dir());
-    while let Some(p) = d {
-        refused.push((p.clone(), "a directory containing the tokenstash home", true));
-        d = p.parent().map(|x| x.to_path_buf()).filter(|x| x != Path::new("/"));
+    // The tokenstash home (this one and the default one) and every ancestor: a project
+    // that contains the stash index is not a project.
+    for start in [crate::config::config_dir(), crate::config::default_config_dir()] {
+        let mut d = Some(start);
+        while let Some(p) = d {
+            refused.push((p.clone(), "a directory containing the tokenstash home", true));
+            d = p.parent().map(|x| x.to_path_buf()).filter(|x| x != Path::new("/"));
+        }
     }
     for (dir, why, exact_only) in refused {
         let dir = dir.canonicalize().unwrap_or(dir);
@@ -132,7 +144,3 @@ pub fn refused_root(root: &Path) -> Option<String> {
     None
 }
 
-/// The source string recorded for an on-disk delivery.
-pub fn on_disk_source() -> &'static str {
-    GRANT_ON_DISK
-}
