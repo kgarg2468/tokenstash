@@ -124,10 +124,20 @@ fn tools() -> Value {
 #[derive(Deserialize)]
 struct SecretSpec { name: String, why: Option<String>, url: Option<String>, #[serde(default)] steps: Vec<String>, pattern: Option<String>, identity: Option<String> }
 
-fn project_of(args: &Value) -> PathBuf {
+/// The server serves the directory it was started in. A `project` argument is accepted
+/// only when it names that same directory: a model must not pick which directory's
+/// grants it uses. (Roots binding and removing the argument from the schemas: PR B.)
+fn project_of(args: &Value) -> anyhow::Result<PathBuf> {
+    let here = tokenstash_core::project::current();
     match args.get("project").and_then(|v| v.as_str()) {
-        Some(p) => tokenstash_core::project::canonical(std::path::Path::new(p)),
-        None => tokenstash_core::project::current(),
+        Some(p) => {
+            let asked = tokenstash_core::project::canonical(std::path::Path::new(p));
+            if asked != here {
+                anyhow::bail!("this server is bound to {}; it does not act for {}. Start an agent in that directory instead.", here.display(), asked.display());
+            }
+            Ok(here)
+        }
+        None => Ok(here),
     }
 }
 
@@ -135,7 +145,7 @@ fn call(params: &Value, agent: &str) -> Result<(Value, bool)> {
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
     let app = App::open()?;
-    let project = project_of(&args);
+    let project = project_of(&args)?;
     let blocking = args.get("blocking").and_then(|v| v.as_bool()).unwrap_or(false);
     // MCP clients time out a tool call well before a human answers a card (Cursor's did at
     // about a minute in the conformance suite, and the agent then fell back to polling a

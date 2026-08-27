@@ -2105,7 +2105,6 @@ dependencies = [
  "chrono",
  "dirs",
  "keyring",
- "libc",
  "rand",
  "regex",
  "rusqlite",

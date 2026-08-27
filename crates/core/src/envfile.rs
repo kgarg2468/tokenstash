@@ -288,6 +288,9 @@ pub fn owned_git_root(start: &Path) -> Result<Option<PathBuf>> {
                 p.display()
             ),
             DirClass::Foreign => return Ok(None),
+            // A repo at $HOME (dotfiles) or in a tool directory is not a project root:
+            // stop the walk there rather than adopt it.
+            DirClass::Own if has_git && crate::trust::refused_root(&p).is_some() => return Ok(None),
             DirClass::Own if has_git => return Ok(Some(p)),
             DirClass::Own => {}
         }
@@ -319,6 +322,12 @@ fn dir_class(p: &Path) -> DirClass {
 fn dir_class(_p: &Path) -> DirClass { DirClass::Own }
 
 #[cfg(unix)]
+/// The effective uid of this process.
+pub fn euid() -> u32 {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc_geteuid() }
+}
+
 unsafe fn libc_geteuid() -> u32 {
     extern "C" { fn geteuid() -> u32; }
     geteuid()
