@@ -116,6 +116,12 @@ pub fn fingerprint(root: &Path) -> Option<Fingerprint> {
     Some(Fingerprint { ino: md.ino(), btime, dev: md.dev() })
 }
 
+/// Same directory? Inode and birth time; where the filesystem reports no birth time the
+/// device joins the inode (a weaker identity, flagged in `workspaces list`).
+fn fingerprint_matches(w: &Workspace, fp: &Fingerprint) -> bool {
+    w.ino == fp.ino && w.btime == fp.btime && (w.btime.is_some() || w.dev == fp.dev)
+}
+
 fn new_workspace_id() -> String {
     use rand::RngCore;
     let mut b = [0u8; 16];
@@ -691,12 +697,15 @@ impl Db {
         Ok(())
     }
 
-    pub fn update_task_names(&self, id: &str, names: &[String]) -> Result<()> {
-        self.conn.execute(
-            "UPDATE tasks SET names=?2 WHERE id=?1",
+    /// Grow an open card. Returns false when the card is no longer pending (the human
+    /// answered it between the caller's read and this write): the caller files a new one
+    /// rather than ride an answer that never covered these names.
+    pub fn update_task_names(&self, id: &str, names: &[String]) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE tasks SET names=?2 WHERE id=?1 AND status='pending'",
             params![id, serde_json::to_string(names)?],
         )?;
-        Ok(())
+        Ok(n == 1)
     }
 
     /// Mark pending tasks past their deadline as expired. Returns count.
@@ -728,7 +737,7 @@ impl Db {
             // the grants were for the old one and do not apply — but an agent-callable
             // path deletes nothing. `repair_workspace` (a human answering the new pairing
             // card) is what revokes and re-records.
-            ws.fingerprint_ok = ws.ino == fp.ino && ws.btime == fp.btime;
+            ws.fingerprint_ok = fingerprint_matches(&ws, &fp);
             return Ok(Some(ws));
         }
         let id = new_workspace_id();
@@ -767,7 +776,7 @@ impl Db {
             params![key],
             Self::ws_row,
         ).optional()?;
-        Ok(ws.filter(|w| fingerprint(&root).map(|fp| fp.ino == w.ino && fp.btime == w.btime).unwrap_or(false)).map(|mut w| { w.fingerprint_ok = true; w }))
+        Ok(ws.filter(|w| fingerprint(&root).map(|fp| fingerprint_matches(w, &fp)).unwrap_or(false)).map(|mut w| { w.fingerprint_ok = true; w }))
     }
 
     fn ws_row(r: &rusqlite::Row) -> rusqlite::Result<Workspace> {
@@ -782,7 +791,7 @@ impl Db {
         let rows = st.query_map([], Self::ws_row)?;
         let mut all = rows.collect::<std::result::Result<Vec<_>, _>>()?;
         for w in &mut all {
-            w.fingerprint_ok = fingerprint(Path::new(&w.root)).map(|fp| fp.ino == w.ino && fp.btime == w.btime).unwrap_or(false);
+            w.fingerprint_ok = fingerprint(Path::new(&w.root)).map(|fp| fingerprint_matches(w, &fp)).unwrap_or(false);
         }
         Ok(all)
     }
@@ -943,12 +952,20 @@ impl Db {
     /// attempt per key per window, across every directory: directories are free to make,
     /// so a per-directory limit would let a planted `NAME=guess` per directory turn the
     /// check into a value-equality oracle.
-    pub fn recent_on_disk_miss(&self, name: &str, identity: &str, since: &str) -> Result<bool> {
-        let n: i64 = self.conn.query_row(
+    pub fn recent_on_disk_miss(&self, project: &str, name: &str, identity: &str, since: &str) -> Result<bool> {
+        // One miss closes the check here; a few misses anywhere close it everywhere — so
+        // neither a per-directory nor a global guess loop works, and one planted wrong value
+        // in a hostile repo does not switch the feature off for every legitimate copy.
+        let here: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM audit WHERE project=?1 AND name=?2 AND identity=?3 AND action='on_disk.miss' AND ts >= ?4",
+            params![project, name, identity, since],
+            |r| r.get(0),
+        )?;
+        let anywhere: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM audit WHERE name=?1 AND identity=?2 AND action='on_disk.miss' AND ts >= ?3",
             params![name, identity, since],
             |r| r.get(0),
         )?;
-        Ok(n > 0)
+        Ok(here > 0 || anywhere >= 3)
     }
 }
