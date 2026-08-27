@@ -326,13 +326,23 @@ impl Db {
             if v >= 2 {
                 return Ok(());
             }
-            let mut st = self.conn.prepare("SELECT project, name FROM approvals")?;
-            let rows: Vec<(String, String)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
+            let mut st = self.conn.prepare("SELECT project, name, created FROM approvals")?;
+            let rows: Vec<(String, String, String)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<_, _>>()?;
             drop(st);
-            for (project, name) in rows {
+            for (project, name, approved_at) in rows {
                 let root = Path::new(&project);
                 if !root.is_dir() {
                     continue; // a root that no longer exists gets no grant
+                }
+                // A directory created AFTER the approval is not the one the human approved
+                // (re-cloned at the same path before this upgrade): no grant for it.
+                if let Some(fp) = fingerprint(root) {
+                    if let (Some(bt), Ok(at)) = (fp.btime.as_deref(), chrono::DateTime::parse_from_rfc3339(&approved_at)) {
+                        let secs: f64 = bt.parse().unwrap_or(0.0);
+                        if secs > at.timestamp() as f64 {
+                            continue;
+                        }
+                    }
                 }
                 let Some(ws) = self.workspace_for_locked(root)? else { continue };
                 let identity = self.legacy_binding(&project, &name)?.unwrap_or_else(|| "default".into());
