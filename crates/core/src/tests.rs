@@ -1809,8 +1809,18 @@ fn the_on_disk_check_is_rate_limited_per_key_not_per_directory() {
     assert!(matches!(need::need(&ctx, &g1, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap()[0], need::Outcome::Pending { .. }));
     let g2 = tmp("v2-oracle-g2").canonicalize().unwrap();
     std::fs::write(g2.join(".env.local"), format!("OPENAI_API_KEY={v}\n")).unwrap();
-    assert!(matches!(need::need(&ctx, &g2, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap()[0], need::Outcome::Pending { .. }),
-        "a miss anywhere closes the check for this key everywhere until the TTL passes");
+    assert!(matches!(need::need(&ctx, &g2, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap()[0], need::Outcome::Injected { .. }),
+        "one wrong value elsewhere must not switch the check off for a legitimate copy");
+    // …but a few misses anywhere do close it everywhere
+    for i in 2..4 {
+        let g = tmp(&format!("v2-oracle-g{i}x")).canonicalize().unwrap();
+        std::fs::write(g.join(".env.local"), format!("OPENAI_API_KEY=sk-guess-{i}{i}{i}{i}{i}{i}{i}{i}{i}{i}{i}{i}{i}\n")).unwrap();
+        need::need(&ctx, &g, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    }
+    let g5 = tmp("v2-oracle-g5").canonicalize().unwrap();
+    std::fs::write(g5.join(".env.local"), format!("OPENAI_API_KEY={v}\n")).unwrap();
+    assert!(matches!(need::need(&ctx, &g5, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap()[0], need::Outcome::Pending { .. }),
+        "three misses anywhere close the check for this key everywhere until the TTL passes");
 }
 
 #[test]
@@ -1951,4 +1961,73 @@ fn migration_handles_symlinked_duplicates_and_non_directories() {
     assert_eq!(db.list_workspaces().unwrap().len(), 1, "the symlink and its target are one workspace; a file is none");
     let ws = db.find_workspace(&proj).unwrap().unwrap();
     assert_eq!(db.grants_for(&ws.id).unwrap().len(), 2);
+}
+
+
+#[test]
+fn names_are_env_var_names_and_nothing_else() {
+    let _g = env_lock();
+    let (home, proj) = v2_world("names");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    for bad in ["X' style='x", "A=B", "1KEY", "KEY NAME", "K@work", "", "É"] {
+        assert!(need::need(&ctx, &proj, "t", &[bad.to_string()], &need::NeedOpts::default()).is_err(), "{bad:?} must be refused");
+    }
+    assert!(need::valid_name("OPENAI_API_KEY") && need::valid_name("_x9"));
+}
+
+#[test]
+fn a_card_answered_during_a_merge_does_not_authorise_the_merged_name() {
+    let _g = env_lock();
+    let (home, proj) = v2_world("mergerace");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    for n in ["OPENAI_API_KEY", "GROQ_API_KEY"] {
+        stash.set(&stash::stash_key(n, "default"), &SecretString::from("aaaaaaaaaaaaaaaaaaaaaa".to_string())).unwrap();
+    }
+    let out = need::need(&ctx, &proj, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
+    // the human answers; the merge that races it must not land on the answered card
+    tasks::answer_approval(&ctx, &db.get_task(&tid).unwrap().unwrap(), tasks::Decision::Allow, None).unwrap();
+    assert!(!db.update_task_names(&tid, &["OPENAI_API_KEY@default".into(), "GROQ_API_KEY@default".into()]).unwrap(), "an answered card cannot grow");
+    // a wait() holding the answered card's id for a name it never covered asks again
+    let mut out = vec![need::Outcome::Pending { name: "GROQ_API_KEY".into(), identity: "default".into(), task_id: tid.clone(), title: String::new(), url: None }];
+    need::wait(&ctx, &proj, &mut out, std::time::Duration::from_millis(10)).unwrap();
+    match &out[0] {
+        need::Outcome::Pending { task_id, .. } => assert_ne!(*task_id, tid, "a fresh card"),
+        o => panic!("must not deliver an ungranted key: {o:?}"),
+    }
+    assert!(!envfile::has(&proj, ".env.local", "GROQ_API_KEY"));
+}
+
+#[test]
+fn a_paste_into_a_re_created_directory_does_not_wipe_the_old_record() {
+    let _g = env_lock();
+    let (home, proj) = v2_world("driftpaste");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let ws = db.workspace_for(&proj).unwrap();
+    db.grant(&ws.id, "GROQ_API_KEY", "default", db::GRANT_KEY, db::GRANT_PAIRING).unwrap();
+    std::fs::remove_dir_all(&proj).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::create_dir_all(&proj).unwrap();
+    let t = tasks::create_secret_task(&ctx, &proj, "t", "OPENAI_API_KEY", "default", &Default::default()).unwrap();
+    tasks::answer_secret(&ctx, &t, SecretString::from("sk-aaaaaaaaaaaaaaaaaaaa".to_string()), true).unwrap();
+    assert_eq!(db.grants_for(&ws.id).unwrap().len(), 1, "old record untouched by a bare paste");
+    assert!(db.recent_audit(10).unwrap().iter().any(|r| r.3 == "grant.skipped"));
+    // (the paste wrote the value, so while it sits in the env file the on-disk check opens
+    // deliveries without a grant; once it is gone the directory must pair)
+    std::fs::remove_file(proj.join(".env.local")).unwrap();
+    let out = need::need(&ctx, &proj, "t", &["OPENAI_API_KEY".to_string()], &need::NeedOpts::default()).unwrap();
+    let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
+    tasks::answer_approval(&ctx, &db.get_task(&tid).unwrap().unwrap(), tasks::Decision::Allow, None).unwrap();
+    let fresh = db.find_workspace(&proj).unwrap().unwrap();
+    assert_ne!(fresh.id, ws.id);
+    assert!(db.grants_for(&ws.id).unwrap().is_empty(), "replaced by the human's pairing");
 }
