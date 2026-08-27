@@ -29,39 +29,77 @@ use tokenstash_core::tasks::{self, HumanRequest, SecretRequest};
 const PROTOCOL: &str = "2025-06-18";
 
 /// Which directory this server serves. Decided once, at the first tool call, from the
-/// client's `roots` (when it advertised the capability and had answered by then) or the
-/// server's cwd; never from a tool argument. Measured 2026-08-27: Claude Code, Codex and
-/// Cursor all spawn the server in the project directory; only Claude Code offers `roots`.
+/// client's `roots` (when it advertised the capability and answered our `roots/list` —
+/// waited for up to ROOTS_WAIT) or the server's cwd; never from a tool argument. Measured
+/// 2026-08-27 (tokenstash.md §13.7): Claude Code, Codex and Cursor all spawn the server in
+/// the project directory; only Claude Code offers `roots`.
 struct Binding {
     /// Ok(project) or Err(why this directory is refused).
     bound: Option<std::result::Result<PathBuf, String>>,
     roots_supported: bool,
+    /// We sent `roots/list` and have not consumed the answer yet.
+    roots_requested: bool,
     roots: Option<Vec<PathBuf>>,
 }
 
 const ROOTS_REQ_ID: &str = "tokenstash-roots-1";
+const ROOTS_WAIT: Duration = Duration::from_secs(2);
 
 impl Binding {
-    fn decide(&mut self) -> &std::result::Result<PathBuf, String> {
+    /// Roots are launcher-descriptive — the directory the client opened — and sit in the
+    /// same trust tier as cwd. One root binds; several bind the most specific one
+    /// containing cwd (exact match first), else the single root cwd is the parent of;
+    /// anything else is ambiguous and fails closed (§13.5).
+    fn decide(&mut self) -> std::result::Result<PathBuf, String> {
         if self.bound.is_none() {
             let cwd = tokenstash_core::project::current();
-            let candidate = match self.roots.as_deref() {
-                Some([one]) => one.clone(),
+            let candidate: std::result::Result<PathBuf, String> = match self.roots.as_deref() {
+                Some([one]) => Ok(one.clone()),
                 Some(many) if !many.is_empty() => {
-                    // the root containing cwd; else the one root cwd is the parent of; else cwd
-                    many.iter().find(|r| cwd.starts_with(r)).cloned()
-                        .or_else(|| { let under: Vec<&PathBuf> = many.iter().filter(|r| r.starts_with(&cwd)).collect(); if under.len() == 1 { Some(under[0].clone()) } else { None } })
-                        .unwrap_or(cwd)
+                    let containing = many.iter().filter(|r| cwd.starts_with(r)).max_by_key(|r| r.components().count()).cloned();
+                    match containing {
+                        Some(r) => Ok(r),
+                        None => {
+                            let under: Vec<&PathBuf> = many.iter().filter(|r| r.starts_with(&cwd)).collect();
+                            if under.len() == 1 { Ok(under[0].clone()) } else {
+                                Err(format!("no project bound: the client lists {} roots and none is this directory ({}). Restart your agent in the project directory.", many.len(), cwd.display()))
+                            }
+                        }
+                    }
                 }
-                _ => cwd,
+                _ => Ok(cwd.clone()),
             };
-            let candidate = tokenstash_core::project::canonical(&candidate);
-            self.bound = Some(match tokenstash_core::trust::refused_root(&candidate) {
-                Some(why) => Err(format!("no project bound: {} is {why}. Restart your agent in the project directory.", candidate.display())),
-                None => Ok(candidate),
-            });
+            self.bound = Some(candidate.and_then(|c| {
+                let c = tokenstash_core::project::canonical(&c);
+                match tokenstash_core::trust::refused_root(&c) {
+                    Some(why) => Err(format!("no project bound: {} is {why}. Restart your agent in the project directory.", c.display())),
+                    None => Ok(c),
+                }
+            }));
+            if let Ok(log) = std::env::var("TOKENSTASH_MCP_LOG") {
+                // measurement aid (§13.7): where clients spawn us and what they say
+                let line = format!("{} cwd={} roots_supported={} roots={:?} bound={:?}\n", tokenstash_core::now(), cwd.display(), self.roots_supported, self.roots, self.bound);
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open(log).and_then(|mut f| f.write_all(line.as_bytes()));
+            }
         }
-        self.bound.as_ref().unwrap()
+        self.bound.clone().unwrap()
+    }
+
+    fn take_roots(&mut self, msg: &Value) {
+        if !self.roots_requested || self.bound.is_some() {
+            return; // unsolicited: ignored
+        }
+        self.roots_requested = false;
+        if msg.get("error").is_some() {
+            return; // the client could not say: cwd it is
+        }
+        let mut roots: Vec<PathBuf> = msg.pointer("/result/roots").and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|r| r.get("uri").and_then(|u| u.as_str()).and_then(root_path)).collect()).unwrap_or_default();
+        // canonical, deduplicated; a root that does not exist is not a root
+        roots = roots.into_iter().filter_map(|r| r.canonicalize().ok()).collect();
+        roots.sort();
+        roots.dedup();
+        self.roots = Some(roots);
     }
 }
 
@@ -77,18 +115,38 @@ fn root_path(uri: &str) -> Option<PathBuf> {
         if b[i] == b'%' && i + 2 < b.len() {
             if let Ok(v) = u8::from_str_radix(&rest[i + 1..i + 3], 16) { out.push(v); i += 3; continue; }
         }
-        out.push(b[i]); i += 1;
+        out.push(b[i]);
+        i += 1;
     }
-    Some(PathBuf::from(String::from_utf8_lossy(&out).to_string()))
+    if out.contains(&0) { return None; }
+    let s = String::from_utf8(out).ok()?;
+    let s = s.trim_end_matches('/');
+    if s.is_empty() { return Some(PathBuf::from("/")); }
+    Some(PathBuf::from(s))
 }
 
+enum Incoming { Line(String), Eof }
+
 pub fn serve() -> Result<i32> {
-    let stdin = std::io::stdin();
+    // stdin on its own thread so the first tool call can wait (bounded) for the client's
+    // roots/list answer without ever blocking on a client that never sends one.
+    let (tx, rx) = std::sync::mpsc::channel::<Incoming>();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            match line { Ok(l) => { if tx.send(Incoming::Line(l)).is_err() { return; } } Err(_) => break }
+        }
+        let _ = tx.send(Incoming::Eof);
+    });
     let mut out = std::io::stdout().lock();
     let mut agent = String::from("mcp");
-    let mut binding = Binding { bound: None, roots_supported: false, roots: None };
-    for line in stdin.lock().lines() {
-        let line = match line { Ok(l) => l, Err(_) => break };
+    let mut binding = Binding { bound: None, roots_supported: false, roots_requested: false, roots: None };
+    let mut queued: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    loop {
+        let line = match queued.pop_front() {
+            Some(l) => l,
+            None => match rx.recv() { Ok(Incoming::Line(l)) => l, _ => break },
+        };
         if line.trim().is_empty() { continue; }
         let msg: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
@@ -97,21 +155,25 @@ pub fn serve() -> Result<i32> {
         let id = msg.get("id").cloned();
         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("").to_string();
         let params = msg.get("params").cloned().unwrap_or(json!({}));
-        // A response to our own request (no method): only `roots/list` is ever sent.
-        if method.is_empty() {
-            if id.as_ref().and_then(|v| v.as_str()) == Some(ROOTS_REQ_ID) && binding.bound.is_none() {
-                let roots: Vec<PathBuf> = msg.pointer("/result/roots").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|r| r.get("uri").and_then(|u| u.as_str()).and_then(root_path)).collect()).unwrap_or_default();
-                binding.roots = Some(roots);
+        // A response (result/error, no method): only our own `roots/list` is ever answered.
+        if method.is_empty() && (msg.get("result").is_some() || msg.get("error").is_some()) {
+            if id.as_ref().and_then(|v| v.as_str()) == Some(ROOTS_REQ_ID) {
+                binding.take_roots(&msg);
             }
             continue;
         }
         let Some(id) = id else {
             // notifications
-            if method == "notifications/initialized" && binding.roots_supported {
+            if method == "notifications/initialized" && binding.roots_supported && binding.bound.is_none() {
                 write_msg(&mut out, &json!({ "jsonrpc": "2.0", "id": ROOTS_REQ_ID, "method": "roots/list" }))?;
+                binding.roots_requested = true;
             }
             continue;
         };
+        if method.is_empty() {
+            write_msg(&mut out, &error(id, -32600, "invalid request: no method"))?;
+            continue;
+        }
         let resp = match method.as_str() {
             "initialize" => {
                 // The client names itself; the name ends up in audit rows and on cards
@@ -120,7 +182,7 @@ pub fn serve() -> Result<i32> {
                 if let Some(n) = params.pointer("/clientInfo/name").and_then(|v| v.as_str()) {
                     agent = need::clean_agent(n);
                 }
-                binding.roots_supported = params.pointer("/capabilities/roots").is_some();
+                binding.roots_supported = params.pointer("/capabilities/roots").map(|v| v.is_object()).unwrap_or(false);
                 let pv = params.get("protocolVersion").and_then(|v| v.as_str()).unwrap_or(PROTOCOL);
                 result(id, json!({
                     "protocolVersion": pv,
@@ -131,13 +193,33 @@ pub fn serve() -> Result<i32> {
             }
             "ping" => result(id, json!({})),
             "tools/list" => result(id, json!({ "tools": tools() })),
-            "tools/call" => match binding.decide().clone() {
-                Err(why) => result(id, json!({ "content": [{ "type": "text", "text": why }], "isError": true })),
-                Ok(project) => match call(&params, &agent, &project) {
-                Ok((v, is_err)) => result(id, json!({ "content": [{ "type": "text", "text": v.to_string() }], "structuredContent": v, "isError": is_err })),
-                    Err(e) => result(id, json!({ "content": [{ "type": "text", "text": format!("error: {e:#}") }], "isError": true })),
-                },
-            },
+            "tools/call" => {
+                // First call: give the client's roots answer up to ROOTS_WAIT to arrive.
+                // Anything else that arrives meanwhile is handled after this call, in order.
+                if binding.bound.is_none() && binding.roots_requested {
+                    let deadline = std::time::Instant::now() + ROOTS_WAIT;
+                    while binding.roots_requested {
+                        let left = deadline.saturating_duration_since(std::time::Instant::now());
+                        if left.is_zero() { break; }
+                        match rx.recv_timeout(left) {
+                            Ok(Incoming::Line(l)) => {
+                                let is_roots = serde_json::from_str::<Value>(&l).ok()
+                                    .filter(|m| m.get("method").is_none() && m.get("id").and_then(|v| v.as_str()) == Some(ROOTS_REQ_ID))
+                                    .map(|m| { binding.take_roots(&m); true }).unwrap_or(false);
+                                if !is_roots { queued.push_back(l); }
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                match binding.decide() {
+                    Err(why) => result(id, json!({ "content": [{ "type": "text", "text": why }], "isError": true })),
+                    Ok(project) => match call(&params, &agent, &project) {
+                        Ok((v, is_err)) => result(id, json!({ "content": [{ "type": "text", "text": v.to_string() }], "structuredContent": v, "isError": is_err })),
+                        Err(e) => result(id, json!({ "content": [{ "type": "text", "text": format!("error: {e:#}") }], "isError": true })),
+                    },
+                }
+            }
             _ => error(id, -32601, &format!("method not found: {method}")),
         };
         write_msg(&mut out, &resp)?;
@@ -203,6 +285,9 @@ fn project_of(args: &Value, bound: &std::path::Path) -> anyhow::Result<PathBuf> 
     let here = bound.to_path_buf();
     match args.get("project").and_then(|v| v.as_str()) {
         Some(p) => {
+            if !std::path::Path::new(p).is_absolute() {
+                anyhow::bail!("project must be an absolute path (this server is bound to {})", here.display());
+            }
             let asked = tokenstash_core::project::canonical(std::path::Path::new(p));
             if asked != here {
                 anyhow::bail!("this server is bound to {}; it does not act for {}. Start an agent in that directory instead.", here.display(), asked.display());
