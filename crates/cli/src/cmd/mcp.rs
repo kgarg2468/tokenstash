@@ -549,15 +549,18 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
         "secrets_list" => {
             // No inventory oracle (§13.1 rule 11): only what this directory already holds a
             // grant for or has been delivered. Discovery of everything else is the registry.
+            // Both signals are tied to the CURRENT directory: its grants, and deliveries
+            // since it was paired. A re-created directory at the same path has no record
+            // (fingerprint mismatch) and inherits nothing — not even the old one's names.
             let mut here: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
             if let Some(ws) = app.db.find_workspace(&project)? {
                 for (name, identity, _scope, _src) in app.db.grants_for(&ws.id)? {
                     if name != "*" { here.insert((name, identity)); }
                 }
-            }
-            let pid = project.to_string_lossy().to_string();
-            for (name, identity) in app.db.delivered_names(&pid)? {
-                here.insert((name, identity));
+                let pid = project.to_string_lossy().to_string();
+                for (name, identity) in app.db.delivered_names(&pid, &ws.created)? {
+                    here.insert((name, identity));
+                }
             }
             let list = app.db.list_secrets()?;
             let names: Vec<Value> = list.iter().filter(|s| here.contains(&(s.name.clone(), s.identity.clone()))).map(|s| json!({ "name": s.name, "identity": s.identity, "provider": s.provider, "sensitive": s.sensitive, "stale": s.stale })).collect();
