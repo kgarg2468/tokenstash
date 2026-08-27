@@ -1,6 +1,31 @@
-# tokenstash
+<h1 align="center">tokenstash</h1>
 
-**Your agent asks you for a key once. Never again — in any project, in any agent.**
+<p align="center">
+  <strong>Your agent asks you for a key once. Never again — in any project, in any agent.</strong>
+</p>
+
+<p align="center">
+  tokenstash is a local credential broker for coding agents. The agent runs one command instead of stalling on <code>Please paste your API key</code>; keys you already own are injected into the project's env file, keys you don't get you a link and a desktop notification. Secret values never enter the agent's context, its output, or any log.
+</p>
+
+<p align="center">
+  <a href="https://github.com/kgarg2468/tokenstash/releases/latest"><strong>Download</strong></a> ·
+  <a href="registry/providers.json"><strong>Provider registry</strong></a> ·
+  <a href="docs/registry-verification.md"><strong>Verification record</strong></a>
+</p>
+
+<p align="center">
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-2021-2D2A26?style=for-the-badge&logo=rust&logoColor=white">
+  <img alt="MIT" src="https://img.shields.io/badge/License-MIT-BF6A2B?style=for-the-badge">
+  <img alt="MCP" src="https://img.shields.io/badge/MCP-stdio_server-2D2A26?style=for-the-badge">
+  <img alt="Keychain" src="https://img.shields.io/badge/Storage-OS_keychain-BF6A2B?style=for-the-badge">
+  <img alt="SQLite" src="https://img.shields.io/badge/Index-SQLite-2D2A26?style=for-the-badge&logo=sqlite&logoColor=white">
+  <img alt="Providers" src="https://img.shields.io/badge/Registry-79_providers-BF6A2B?style=for-the-badge">
+  <img alt="Tests" src="https://img.shields.io/badge/Tests-75_passing-2D2A26?style=for-the-badge">
+  <img alt="Telemetry" src="https://img.shields.io/badge/Telemetry-none-BF6A2B?style=for-the-badge">
+</p>
+
+## Product
 
 Coding agents stall on the same line every new project:
 
@@ -8,7 +33,7 @@ Coding agents stall on the same line every new project:
 Please provide: OPENAI_API_KEY= RESEND_API_KEY= STRIPE_SECRET_KEY=
 ```
 
-tokenstash gives the agent one command instead. If you already have the key, it's written into the project's env file instantly. If you don't, the agent shows you a link (and you get a desktop notification); click it, follow the link to the vendor's page, paste once, and the agent resumes. **Secret values never enter the agent's context, its output, or any log.**
+tokenstash gives the agent one command instead. If the key is already in your stash it is written into the project's env file instantly. If it isn't, the agent shows you a link (and your desktop gets a notification); you click it, follow it to the vendor's own page, paste once, and the agent resumes. The second project that needs that key never involves you at all.
 
 ```
 agent › tokenstash need OPENAI_API_KEY RESEND_API_KEY TAVUS_API_KEY
@@ -17,61 +42,110 @@ agent › tokenstash need OPENAI_API_KEY RESEND_API_KEY TAVUS_API_KEY
       ⏳ TAVUS_API_KEY pending — task t_7fa2 → http://127.0.0.1:7433/t/t_7fa2
 ```
 
-Works with Claude Code, Codex, Cursor, Gemini CLI, and anything that can run a shell command. Free forever, MIT, local-only, no accounts, no telemetry.
+Works with Claude Code, Codex, Cursor, Gemini CLI, and anything that can run a shell command. MIT, local-only, no accounts, no telemetry, never in the request path.
+
+## First Run
+
+| Step | What you do | tokenstash output |
+| --- | --- | --- |
+| Init | `tokenstash init` | Keychain backend chosen, trust roots set, MCP server registered with every agent found, skill file installed |
+| Ask | The agent needs a key it has never seen | Task filed, desktop notification, localhost inbox link printed for the chat |
+| Paste | You open the vendor page and paste once | Pattern checked, liveness probed, stored in the OS keychain |
+| Inject | Nothing — the agent re-runs the same command | Written to `.env.local`, `0600`, `.gitignore` enforced, exit `0` |
+| Reuse | A different project, a different agent, next week | Silent injection inside your trust roots; no human in the loop |
+
+```mermaid
+flowchart LR
+  Need["tokenstash need NAME"] --> Hit{"in your stash?"}
+  Hit -->|yes| Verify["re-checked with the provider"]
+  Verify --> Env["written to .env.local — exit 0"]
+  Hit -->|no| Task["task filed"]
+  Task --> Notify["desktop notification + inbox link"]
+  Notify --> Paste["you sign up and paste, once"]
+  Paste --> Keychain["OS keychain"]
+  Keychain --> Env
+```
+
+## Architecture
+
+| Layer | Stack | Role |
+| --- | --- | --- |
+| CLI | Rust 2021, clap 4 | 21 subcommands; `need` is the whole product surface an agent touches |
+| Stash | `keyring` 3, OS-native | macOS Keychain, Windows Credential Manager, Linux Secret Service, kernel-keyring fallback; `insecure-file` is CI-only and warns |
+| Index | SQLite (`rusqlite`, bundled) | Names, identities, projects, grants, tasks, audit log — metadata only, never a value |
+| Inbox | `tiny_http` bound to `127.0.0.1` | Two-scope session tokens, `HttpOnly; SameSite=Strict` cookie, CSRF double-submit, empty 404 for anything unauthenticated |
+| MCP | stdio JSON-RPC server | `secrets_request`, `secrets_list`, `secrets_report_invalid`, `human_request`, `task_check`, `task_list` |
+| Registry | `registry/providers.json` | 79 providers: signup URL, ordered steps, key pattern, optional liveness check |
+| Validation | `validate.rs` over `ureq` | Prefix check at paste time, cheap liveness call, `reject_status` for providers that do not spell auth failure `401` |
+| Portability | argon2 + chacha20poly1305 | `export` / `import`: one passphrase-encrypted bundle moves a stash between machines |
+| Release | GitHub Actions on `v*` tags | Four platform binaries, sha256 sidecars, Homebrew formula |
+
+```mermaid
+flowchart TD
+  Agent["Agent — CLI or MCP"] --> Need["need NAME"]
+  Need --> Trust["Trust roots + per-project grants"]
+  Trust --> Stash["OS keychain"]
+  Stash --> Check["Verify-on-use: re-check with the provider"]
+  Check --> Envfile["Env file, 0600, gitignored"]
+  Need --> Tasks["Task queue"]
+  Tasks --> Inbox["Localhost inbox, session-gated"]
+  Inbox --> Human["You — vendor page, paste once"]
+  Human --> Stash
+  Need --> Audit["Append-only audit log"]
+  Redact["Value-free by construction: CLI output, MCP results, SQLite, audit, errors"] -.-> Envfile
+  Redact -.-> Audit
+  Redact -.-> Inbox
+```
+
+## What It Proves
+
+| Question | tokenstash answer |
+| --- | --- |
+| Can an agent get a credential without pasting it into a chat? | Yes. `need` is the only path, and it returns an exit code, not a value. Values go clipboard → keychain → env file and are never rendered anywhere the model can read them. |
+| Does "never leaks" mean anything mechanically? | Yes. [`scripts/leak-test.sh`](scripts/leak-test.sh) drives the real binary with a canary secret and asserts the canary appears in none of stdout, stderr, the SQLite index, the config, the audit log, or MCP output — a black-box test, not an inspection of the code that was supposed to redact. |
+| Is loopback treated as authentication? | No, and that is the point. Every inbox request needs a 32-byte session token that arrives as `?t=` on the link you click and becomes an `HttpOnly; SameSite=Strict` cookie. Anything without one gets an empty 404. |
+| Can a model approve its own request? | No. The link an agent prints carries the **paste-scope** token: enough to answer a missing-key card, not enough to approve. The **full-scope** token reaches you only through channels you trigger — the notification, `tokenstash open`, your terminal. |
+| Can a revoked key be caught before the agent burns a turn on a 401? | Usually. A key unchecked for a day is re-verified with its provider before delivery — one free, read-only request to the host your code already calls. A dead key becomes a "Replace" card; a provider outage just delivers the key unchecked. |
+| Is the provider registry actually true? | It was checked, row by row, by HTTP request rather than recollection — 18 dead URLs fixed, 5 checks corrected, 1 removed for being decoration, and the rows that could not be settled say so. The record is [`docs/registry-verification.md`](docs/registry-verification.md); reproduce it with [`scripts/verify-registry.py`](scripts/verify-registry.py). |
 
 ## Install
 
+Prebuilt binaries for macOS and Linux, with sha256 sidecars, are attached to [the latest release](https://github.com/kgarg2468/tokenstash/releases/latest). From source:
+
 ```bash
-npx tokenstash init        # or: cargo install tokenstash
+cargo install --git https://github.com/kgarg2468/tokenstash tokenstash
+tokenstash init
 ```
 
 `init` picks a keychain backend, sets your trust roots (`~/code`, `~/projects`, …), registers the MCP server with the agents it finds, and installs a skill file so agents reach for it unprompted.
 
-## How it works
-
-```
-tokenstash need NAME…   ──►  in your stash?  ──yes──►  written to .env.local, exit 0
-                                   │ no
-                                   ▼
-                      task filed → notification → localhost inbox
-                      you open the vendor page, sign up yourself, paste
-                                   │
-                                   ▼
-                      stored in the OS keychain → injected → agent resumes
-                      next project: instant, no human
-```
-
-- **You create every account.** tokenstash gets you to the right page with the right steps; it never signs up for you, never proxies an API, never reads other tools' credential stores.
-- **Storage is your OS keychain** (macOS Keychain, Windows Credential Manager, Linux Secret Service; kernel keyring fallback). tokenstash keeps only names and metadata.
-- **Trust roots keep the fast path fast.** Projects under your trust roots get silent injection. Elsewhere you're asked once per project. Keys tagged sensitive (live Stripe, AWS, service-role) ask once per project regardless.
-- **Validated at paste time.** Known providers get a prefix check and a cheap liveness call so a typo fails now, not twenty minutes later.
-- **Re-checked before use.** A key that has not been checked in the last day is re-checked with its provider before an agent gets it — one free, read-only request (list models, whoami) to the same host your code calls anyway; nothing is billed and nothing is sent anywhere else. A revoked key becomes a "Replace" card *before* the agent sees a 401; a provider outage or rate limit just delivers the key unchecked. Tune with `verify_every = "24h" | "1h" | "always" | "never"` in `config.toml` (`always` is still at most once a minute per key); keys stored with `--skip-check` are not re-checked until `tokenstash check` accepts them. Probes that would cost quota (Brave Search) or whose provider cannot distinguish a bad key from a bad request are never run unattended.
+- **You create every account.** tokenstash gets you to the right page with the right steps; it never signs up for you, never proxies an API, never reads another tool's credential store.
+- **Trust roots keep the fast path fast.** Projects under a trust root get silent injection. Elsewhere you are asked once per project. Keys tagged sensitive (live Stripe, AWS, service-role) ask once per project regardless.
 - **Local secrets are generated, not requested.** `AUTH_SECRET`, `JWT_SECRET`, `SESSION_SECRET` never involve a human.
+- **Verification is tunable.** `verify_every = "24h" | "1h" | "always" | "never"` in `config.toml`; `always` is still at most once a minute per key. Probes that would cost quota, or whose provider cannot distinguish a bad key from a bad request, are never run unattended.
 
 ## Commands
 
 | | |
 |---|---|
 | `tokenstash need NAME… [--why] [--url] [--step …] [--blocking]` | exit `0` injected · `10` pending · `20` denied · `30` expired |
-| `tokenstash ask "title" [--url] [--step …] [--expects confirm\|text]` | non-secret human task (DNS, dashboard, OAuth consent) |
+| `tokenstash ask "title" [--url] [--step …] [--expects confirm\|text]` | non-secret human task (DNS, dashboard toggle, OAuth consent) |
 | `tokenstash answer [id] [--stdin] [--allow] [--deny]` | answer from the terminal instead of the inbox |
-| `tokenstash tasks [--all] [--history]` · `tokenstash open` | what's waiting on you |
-| `tokenstash list` · `forget NAME` · `bind NAME --identity work` | manage the stash (never shows values) |
+| `tokenstash tasks [--all] [--history]` · `tokenstash open` | what is waiting on you |
+| `tokenstash list` · `forget NAME` · `rotate NAME` · `bind NAME --identity work` | manage the stash (never shows values) |
+| `tokenstash check` · `report-bad NAME --status 401` | prove keys are live; tell tokenstash when a provider rejects one |
+| `tokenstash export` · `import` | passphrase-encrypted bundle, to move a stash between machines |
 | `tokenstash trust add\|rm\|list [dir]` | trust roots |
 | `tokenstash run -- npm run dev` | zero-config shim: dies on a missing key → asks → restarts |
-| `tokenstash mcp` · `tokenstash inbox` · `doctor` · `audit` · `registry` | |
+| `tokenstash mcp` · `inbox` · `doctor` · `audit` · `registry` | |
 
-## What it is not
+## What It Is Not
 
-Not a vault (use 1Password/Infisical; backends coming). Not a proxy — never in the request path. Not discovery — never reads `gh`/`aws`/Claude Code/Codex auth state. Not a sandbox: the agent can still read `.env.local`, exactly as it can today; tokenstash removes the casual leak (pasting into chat, keys echoed back), and `run --` keeps values off disk entirely.
+Not a vault — use 1Password or Infisical; backends for them are a later step. Not a proxy: tokenstash is never in the request path, and no traffic of yours flows through it. Not discovery: it never reads `gh`, `aws`, Claude Code or Codex auth state. Not a sandbox: the agent can still read `.env.local`, exactly as it can today. What it removes is the casual leak — the paste into chat, the key echoed back in a summary — and `run --` keeps values off disk entirely.
 
-## Security in one paragraph
+## Adding a Provider
 
-Values go clipboard → keychain → env file, 0600, `.gitignore` enforced on every write. CLI output, MCP results, the SQLite index, the audit log, and errors are all value-free, and CI proves it with a canary ([`scripts/leak-test.sh`](scripts/leak-test.sh)). The inbox binds `127.0.0.1` and, because loopback is not authentication, every request needs a session: a 32-byte token arrives as `?t=` on the link you click, becomes an `HttpOnly; SameSite=Strict` cookie, and every form posts it back as a CSRF double-submit. Anything without one gets an empty 404. There are two sessions. The link the agent shows you carries the **paste-scope** token: it can answer a missing-key card and human tasks, so you click straight from the chat — but it cannot approve, so a model can request a key yet never approve its own request. The **full-scope** token (approvals too) reaches you only through channels you trigger — the desktop notification, `tokenstash open`, a terminal — and once your browser holds it, every agent link is fully capable (`inbox_links = "full"` in config hands agents the full link outright). A stash miss always involves you; a stash hit is silent only inside your trust roots for non-sensitive keys.
-
-## Adding a provider
-
-[`registry/providers.json`](registry/providers.json) — one JSON object: name, signup URL, steps, key prefix, optional liveness check. PRs welcome; that file is the whole product's breadth.
+[`registry/providers.json`](registry/providers.json) — one JSON object per key: name, provider, signup URL, ordered steps, key pattern, optional liveness check. PRs welcome; that file is the whole product's breadth. See [CONTRIBUTING.md](CONTRIBUTING.md) and the verification standard in [`docs/registry-verification.md`](docs/registry-verification.md).
 
 ## License
 
