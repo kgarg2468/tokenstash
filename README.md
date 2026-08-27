@@ -48,16 +48,19 @@ Works with Claude Code, Codex, Cursor, Gemini CLI, and anything that can run a s
 
 | Step | What you do | tokenstash output |
 | --- | --- | --- |
-| Init | `tokenstash init` | Keychain backend chosen, trust roots set, MCP server registered with every agent found, skill file installed |
+| Init | `tokenstash init` | Keychain backend chosen, MCP server registered with every agent found, skill file installed |
 | Ask | The agent needs a key it has never seen | Task filed, desktop notification, localhost inbox link printed for the chat |
 | Paste | You open the vendor page and paste once | Pattern checked, liveness probed, stored in the OS keychain |
 | Inject | Nothing — the agent re-runs the same command | Written to `.env.local`, `0600`, `.gitignore` enforced, exit `0` |
-| Reuse | A different project, a different agent, next week | Silent injection inside your trust roots; no human in the loop |
+| Reuse | A different project, a different agent, next week | One **pairing card** the first time that directory asks for stored keys — you see exactly which keys go into which file and click Allow; silent there from then on |
 
 ```mermaid
 flowchart LR
   Need["tokenstash need NAME"] --> Hit{"in your stash?"}
-  Hit -->|yes| Verify["re-checked with the provider"]
+  Hit -->|yes| Grant{"paired into this directory?"}
+  Grant -->|yes| Verify["re-checked with the provider"]
+  Grant -->|first time| Pair["one pairing card: these keys → this file"]
+  Pair --> Verify
   Verify --> Env["written to .env.local — exit 0"]
   Hit -->|no| Task["task filed"]
   Task --> Notify["desktop notification + inbox link"]
@@ -105,6 +108,7 @@ flowchart TD
 | Does "never leaks" mean anything mechanically? | Yes. [`scripts/leak-test.sh`](scripts/leak-test.sh) drives the real binary with a canary secret and asserts the canary appears in none of stdout, stderr, the SQLite index, the config, the audit log, or MCP output — a black-box test, not an inspection of the code that was supposed to redact. |
 | Is loopback treated as authentication? | No, and that is the point. Every inbox request needs a 32-byte session token that arrives as `?t=` on the link you click and becomes an `HttpOnly; SameSite=Strict` cookie. Anything without one gets an empty 404. |
 | Can a model approve its own request? | No. The link an agent prints carries the **paste-scope** token: enough to answer a missing-key card, not enough to approve. The **full-scope** token reaches you only through channels you trigger — the notification, `tokenstash open`, your terminal. |
+| Can a hostile repo get a key delivered just by asking for it? | No. Nothing is trusted by folder. The first time a directory asks for a stored key you see one card naming the directory, the file, and every key with its sensitivity — approve exactly those, "these plus any non-sensitive registry key here", or deny. A paste grants one key to one directory; sensitive and unregistered keys need their own yes per directory; a program's own output choosing a key asks every time. A copy that carries its own `.env.local` with the same value needs no card and gains no grant. The MCP server serves the directory it was started in and refuses `/`, your home, tool and shared temp dirs. `tokenstash workspaces` lists and revokes it all; every delivery is audited with the grant that allowed it. |
 | Can a revoked key be caught before the agent burns a turn on a 401? | Usually. A key unchecked for a day is re-verified with its provider before delivery — one free, read-only request to the host your code already calls. A dead key becomes a "Replace" card; a provider outage just delivers the key unchecked. |
 | Is the provider registry actually true? | It was checked, row by row, by HTTP request rather than recollection — 18 dead URLs fixed, 5 checks corrected, 1 removed for being decoration, and the rows that could not be settled say so. The record is [`docs/registry-verification.md`](docs/registry-verification.md); reproduce it with [`scripts/verify-registry.py`](scripts/verify-registry.py). |
 
@@ -117,10 +121,10 @@ cargo install --git https://github.com/kgarg2468/tokenstash tokenstash
 tokenstash init
 ```
 
-`init` picks a keychain backend, sets your trust roots (`~/code`, `~/projects`, …), registers the MCP server with the agents it finds, and installs a skill file so agents reach for it unprompted.
+`init` picks a keychain backend, registers the MCP server with the agents it finds, and installs a skill file so agents reach for it unprompted. It trusts no folder: directories pair once.
 
 - **You create every account.** tokenstash gets you to the right page with the right steps; it never signs up for you, never proxies an API, never reads another tool's credential store.
-- **Trust roots keep the fast path fast.** Projects under a trust root get silent injection. Elsewhere you are asked once per project. Keys tagged sensitive (live Stripe, AWS, service-role) ask once per project regardless.
+- **Directories pair once.** The first time a directory asks for keys you already have, one card shows exactly which keys would go into which file; approve, and that directory is silent from then on. Keys tagged sensitive (live Stripe, AWS, service-role) and keys the registry does not know get their own card per directory. A copy of a project that carries its own `.env.local` needs no card.
 - **Local secrets are generated, not requested.** `AUTH_SECRET`, `JWT_SECRET`, `SESSION_SECRET` never involve a human.
 - **Verification is tunable.** `verify_every = "24h" | "1h" | "always" | "never"` in `config.toml`; `always` is still at most once a minute per key. Probes that would cost quota, or whose provider cannot distinguish a bad key from a bad request, are never run unattended.
 
@@ -135,7 +139,7 @@ tokenstash init
 | `tokenstash list` · `forget NAME` · `rotate NAME` · `bind NAME --identity work` | manage the stash (never shows values) |
 | `tokenstash check` · `report-bad NAME --status 401` | prove keys are live; tell tokenstash when a provider rejects one |
 | `tokenstash export` · `import` | passphrase-encrypted bundle, to move a stash between machines |
-| `tokenstash trust add\|rm\|list [dir]` | trust roots |
+| `tokenstash workspaces [list\|revoke DIR\|forget DIR]` | which directories are paired with which keys; take a directory's grants away |
 | `tokenstash run -- npm run dev` | zero-config shim: dies on a missing key → asks → restarts |
 | `tokenstash mcp` · `inbox` · `doctor` · `audit` · `registry` | |
 
