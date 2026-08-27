@@ -532,10 +532,11 @@ impl Db {
         Ok(n > 0)
     }
 
-    /// (name, identity) pairs ever delivered into this project root.
-    pub fn delivered_names(&self, project: &str) -> Result<Vec<(String, String)>> {
-        let mut st = self.conn.prepare("SELECT DISTINCT name, identity FROM audit WHERE project=?1 AND action IN ('inject','store') AND name IS NOT NULL")?;
-        let rows = st.query_map(params![project], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_else(|| "default".into()))))?;
+    /// (name, identity) pairs delivered into this project root since `since` (the current
+    /// workspace record's creation: an older directory's deliveries are not this one's).
+    pub fn delivered_names(&self, project: &str, since: &str) -> Result<Vec<(String, String)>> {
+        let mut st = self.conn.prepare("SELECT DISTINCT name, identity FROM audit WHERE project=?1 AND action IN ('inject','store') AND name IS NOT NULL AND ts >= ?2")?;
+        let rows = st.query_map(params![project, since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_else(|| "default".into()))))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
