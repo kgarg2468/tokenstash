@@ -532,10 +532,12 @@ impl Db {
         Ok(n > 0)
     }
 
-    /// (name, identity) pairs delivered into this project root since `since` (the current
-    /// workspace record's creation: an older directory's deliveries are not this one's).
+    /// (name, identity) pairs delivered into this project root strictly after `since` (the
+    /// current workspace record's creation: an older directory's deliveries are not this
+    /// one's, and timestamps are second-resolution so an equal second is excluded too —
+    /// a delivery in the record's own creation second is covered by its grant).
     pub fn delivered_names(&self, project: &str, since: &str) -> Result<Vec<(String, String)>> {
-        let mut st = self.conn.prepare("SELECT DISTINCT name, identity FROM audit WHERE project=?1 AND action IN ('inject','store') AND name IS NOT NULL AND ts >= ?2")?;
+        let mut st = self.conn.prepare("SELECT DISTINCT name, identity FROM audit WHERE project=?1 AND action IN ('inject','store') AND name IS NOT NULL AND ts > ?2")?;
         let rows = st.query_map(params![project, since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_else(|| "default".into()))))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
