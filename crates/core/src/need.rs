@@ -90,6 +90,9 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
     let mut once: Vec<String> = vec![];      // run-derived: one-time approval, every time
 
     for name in names {
+        if !valid_name(name) {
+            anyhow::bail!("{name:?} is not an environment variable name (letters, digits and underscores, not starting with a digit)");
+        }
         let identity = opts
             .identity
             .clone()
@@ -142,7 +145,7 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
                     // .env.local along). One check per (directory, key) per TTL: a planted
                     // guess must not be an oracle for the stash.
                     let since = (chrono::Utc::now() - chrono::Duration::hours(ctx.cfg.task_ttl_hours as i64)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-                    if !ctx.db.recent_on_disk_miss(name, &identity, &since)? && crate::envfile::has(project, &ctx.cfg.env_file, name) {
+                    if !ctx.db.recent_on_disk_miss(&pid, name, &identity, &since)? && crate::envfile::has(project, &ctx.cfg.env_file, name) {
                         if trust::on_disk_equivalent(project, &ctx.cfg.env_file, name, &value) {
                             Gate::Open { source: crate::db::GRANT_ON_DISK.into() }
                         } else {
@@ -288,6 +291,23 @@ pub fn wait(ctx: &Ctx, project: &Path, outcomes: &mut [Outcome], timeout: Durati
                             crate::db::TaskKind::Secret => GRANT_PASTE,
                             _ => match t.expects.as_str() { tasks::APPROVAL_ONCE => crate::db::GRANT_ONCE, tasks::APPROVAL_SENSITIVE => crate::db::GRANT_SENSITIVE, _ => crate::db::GRANT_PAIRING },
                         };
+                        // "Answered" is not authorisation by itself: a standing approval must
+                        // have left a grant for THIS name (a card that grew after the human read
+                        // it did not), and a one-time card must have named it.
+                        let entry = format!("{name}@{identity}");
+                        let authorised = match t.kind {
+                            crate::db::TaskKind::Secret => true,
+                            _ if t.expects == tasks::APPROVAL_ONCE => t.names.contains(&entry),
+                            _ => ctx.db.find_workspace(project)?.map(|w| ctx.db.grant_source(&w.id, name, identity)).transpose()?.flatten().is_some(),
+                        };
+                        if !authorised {
+                            // ask again, on a card of its own
+                            let kind = if t.expects == tasks::APPROVAL_SENSITIVE { tasks::ApprovalKind::Sensitive } else { tasks::ApprovalKind::Pairing };
+                            let nt = tasks::create_approval_task(ctx, project, &t.agent, &[entry], kind)?;
+                            *o = Outcome::Pending { name: name.clone(), identity: identity.clone(), task_id: nt.id, title: nt.title, url: nt.url };
+                            any_pending = true;
+                            continue;
+                        }
                         match deliver(ctx, project, &t.agent, name, identity, &v, Some("after-answer"), source, &mut budget)
                             .map_err(|e| anyhow::anyhow!("{name} is stored but could not be delivered to {}: {e:#}", written.display()))?
                         {
@@ -346,6 +366,16 @@ fn window(cfg: &crate::config::Config) -> chrono::Duration {
         Always | Never => PROBE_FLOOR,
         Every(d) => chrono::Duration::from_std(d).unwrap_or_else(|_| chrono::Duration::days(1)).max(PROBE_FLOOR),
     }
+}
+
+/// An env var name and nothing else: what the env file grammar and the cards can carry.
+pub fn valid_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    name.len() <= 128 && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Agent names come from the caller (`--agent`, `TOKENSTASH_AGENT`, MCP `clientInfo.name`)

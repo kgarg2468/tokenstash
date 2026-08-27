@@ -187,10 +187,14 @@ pub fn create_approval_task(ctx: &Ctx, project: &Path, agent: &str, names: &[Str
                 }
             }
             if merged != t.names {
-                ctx.db.update_task_names(&t.id, &merged)?;
-                t.names = merged;
+                if ctx.db.update_task_names(&t.id, &merged)? {
+                    t.names = merged;
+                    return Ok(t);
+                }
+                // answered between our read and this write: a new card, not a free ride
+            } else {
+                return Ok(t);
             }
-            return Ok(t);
         }
     }
     let shown: Vec<String> = names.iter().map(|n| n.strip_suffix("@default").unwrap_or(n).to_string()).collect();
@@ -401,8 +405,14 @@ pub fn store_and_inject(
         // The directory the human is answering for: if its record no longer matches it,
         // the human's paste is the pairing of the new directory.
         let ws = ctx.db.workspace_for(project)?;
-        let ws = if ws.fingerprint_ok { ws } else { ctx.db.repair_workspace(project)? };
-        ctx.db.grant(&ws.id, name, identity, crate::db::GRANT_KEY, grant_source)?;
+        if ws.fingerprint_ok {
+            ctx.db.grant(&ws.id, name, identity, crate::db::GRANT_KEY, grant_source)?;
+        } else {
+            // The record is for a directory that no longer exists here. A bare paste must
+            // not silently wipe it; the next request pairs this directory with a card, and
+            // answering that is what replaces the record.
+            ctx.db.audit(Some(&pid), Some(agent), "grant.skipped", Some(name), Some(identity), Some("directory re-created since it was paired; it will pair again on its next request"))?;
+        }
     }
     if let Some(tid) = answering_task {
         ctx.db.set_task_status(tid, TaskStatus::Answered, None)?;
