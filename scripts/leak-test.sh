@@ -252,13 +252,13 @@ grep -q "PASTE_TARGET_KEY=$PGOOD" "$PROJ/.env.local" || { echo "FAIL: the paste-
 # a paste-scope CSRF field does not authenticate a full-scope cookie, and vice versa
 code=$(curl -s -b "$JAR" -o /dev/null -w '%{http_code}' --data "value=sk-EVIL4&skip_check=1&t=$PASTE" "http://127.0.0.1:$PORT/t/$BTID")
 [ "$code" = 404 ] || { echo "FAIL: a paste CSRF field with a full cookie returned $code, expected 404"; exit 1; }
-# an approval task: a stash hit for a project outside every trust root
+# an approval card: a stash hit in a directory that was never paired (and an unregistered key)
 # (a project dir that is NOT under $OUT: $OUT is the agent-facing surface and is grepped for
 # values, and the env file written here legitimately holds one)
 UNTRUSTED="$(mktemp -d)/untrusted"; mkdir -p "$UNTRUSTED"
-"$TS" need EVIL_TARGET_KEY --project "$UNTRUSTED" --agent ci >"$OUT/need-untrusted.txt" 2>&1 || true
+(cd "$UNTRUSTED" && "$TS" need EVIL_TARGET_KEY --agent ci) >"$OUT/need-untrusted.txt" 2>&1 || true
 ATID=$("$TS" tasks --all --json | python3 -c "import json,sys;l=[t for t in json.load(sys.stdin) if t.get('kind')=='approval' and t['status']=='pending'];print(l[0]['id'] if l else '')")
-[ -n "$ATID" ] || { echo "FAIL: a stash hit outside the trust roots did not create an approval task"; sed -n 1,5p "$OUT/need-untrusted.txt"; exit 1; }
+[ -n "$ATID" ] || { echo "FAIL: a stash hit in an unpaired directory did not create an approval card"; sed -n 1,5p "$OUT/need-untrusted.txt"; exit 1; }
 curl -fsS -c "$PJAR" -b "$PJAR" -L -o "$WEB/paste-approval.html" "http://127.0.0.1:$PORT/t/$ATID"
 grep -q "value=allow" "$WEB/paste-approval.html" && { echo "FAIL: the paste-scope session was offered an Allow button"; exit 1; }
 grep -q "full inbox session" "$WEB/paste-approval.html" || { echo "FAIL: the paste-scope approval page does not explain how to get the full session"; exit 1; }
@@ -332,7 +332,7 @@ rm -rf "$HOME2"
 # ── MCP task scoping: another project's tasks are invisible ─────────────────────
 # task_check by id/prefix and task_list must not act as a cross-project path oracle.
 OTHER="$(mktemp -d)/otherproj"; mkdir -p "$OTHER"
-"$TS" need OTHER_PROJECT_KEY --project "$OTHER" --agent ci >"$OUT/need-other.txt" 2>&1 || true
+(cd "$OTHER" && "$TS" need OTHER_PROJECT_KEY --agent ci) >"$OUT/need-other.txt" 2>&1 || true
 OTID=$("$TS" tasks --all --json | python3 -c "import json,sys;print([t for t in json.load(sys.stdin) if t.get('name')=='OTHER_PROJECT_KEY'][0]['id'])")
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"ci"}}}' \

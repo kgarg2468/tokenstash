@@ -4,6 +4,7 @@ use crate::db::TaskStatus;
 use crate::stash::stash_key;
 use crate::tasks::{self, Ctx, SecretRequest};
 use crate::trust::{self, Gate, GateReason};
+use crate::db::GRANT_PASTE;
 use crate::registry;
 use crate::validate::Liveness;
 use anyhow::{Context, Result};
@@ -77,16 +78,22 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
     // Approvals, bindings, and tasks are keyed by the resolved path, so a symlink that is
     // later retargeted cannot inherit another project's approval.
     let project = &project.canonicalize().with_context(|| format!("project directory {} does not exist", project.display()))?;
+    if let Some(why) = trust::refused_root(project) {
+        anyhow::bail!("{} is {why}; tokenstash does not deliver keys there. Run the agent (or this command) in the project directory.", project.display());
+    }
     let pid = project.to_string_lossy().to_string();
+    // First contact creates the workspace record; every later decision hangs off it.
+    let ws = ctx.db.workspace_for(project)?;
     let mut outcomes: Vec<Outcome> = Vec::with_capacity(names.len());
-    let mut gated: Vec<String> = vec![];
-    let mut outside = false;
+    let mut pairing: Vec<String> = vec![];   // name@identity needing the pairing card
+    let mut sensitive_gated: Vec<String> = vec![]; // name@identity needing its own card
+    let mut once: Vec<String> = vec![];      // run-derived: one-time approval, every time
 
     for name in names {
         let identity = opts
             .identity
             .clone()
-            .or(ctx.db.binding(&pid, name)?)
+            .or(ctx.db.binding(&ws.id, name)?)
             .unwrap_or_else(|| "default".into());
         let provider = registry::lookup(name);
         let hit = ctx.stash.get(&stash_key(name, &identity))?;
@@ -98,11 +105,14 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
                 // another home is real and usable, but `list` here would deny it exists —
                 // a stash that says "empty" and then injects is the worst kind of surprise.
                 // Adopt it into this index, visibly, before anything else happens.
+                // Sensitivity as a paste derives it: the registry tag, or the value
+                // matching the provider's sensitive pattern (a live-mode Stripe key).
+                let by_pattern = provider.and_then(|p| p.sensitive_pattern.as_ref()).map(|sp| crate::validate::matches_pattern(sp, &value).unwrap_or(true)).unwrap_or(false);
                 let m = crate::db::SecretMeta {
                     name: name.clone(),
                     identity: identity.clone(),
                     provider: provider.map(|p| p.provider.clone()),
-                    sensitive: provider.map(|p| p.sensitive).unwrap_or(false),
+                    sensitive: provider.map(|p| p.sensitive).unwrap_or(false) || by_pattern,
                     source_url: provider.map(|p| p.url.clone()),
                     created: crate::now(),
                     last_used: None,
@@ -117,30 +127,49 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
                 ctx.db.audit(Some(&pid), Some(agent), "adopt", Some(name), Some(&identity), Some("found in the stash but not in this home's index"))?;
                 meta = Some(m);
             }
-            let sensitive = meta.as_ref().map(|m| m.sensitive).unwrap_or_else(|| provider.map(|p| p.sensitive).unwrap_or(false));
-            let gate = if opts.require_approval {
-                Gate::NeedsApproval { reason: GateReason::Sensitive }
-            } else {
-                trust::gate(ctx.db, ctx.cfg, project, name, sensitive)?
+            let sensitive = meta.as_ref().map(|m| m.sensitive).unwrap_or(false) || provider.map(|p| p.sensitive).unwrap_or(false);
+            let registered = provider.is_some();
+            // A program's own output chose the key (`run`): a fresh yes every invocation,
+            // before any grant or on-disk check can open the gate.
+            if opts.require_approval {
+                once.push(format!("{name}@{identity}"));
+                outcomes.push(Outcome::Pending { name: name.clone(), identity: identity.clone(), task_id: String::new(), title: String::new(), url: None });
+                continue;
+            }
+            let gate = match trust::gate(ctx.db, &ws, name, &identity, sensitive, registered)? {
+                Gate::NeedsApproval { reason: GateReason::Pairing } => {
+                    // The env file may already hold this very value (a copy that brought its
+                    // .env.local along). One check per (directory, key) per TTL: a planted
+                    // guess must not be an oracle for the stash.
+                    let since = (chrono::Utc::now() - chrono::Duration::hours(ctx.cfg.task_ttl_hours as i64)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                    if !ctx.db.recent_on_disk_miss(&pid, name, &since)? && crate::envfile::has(project, &ctx.cfg.env_file, name) {
+                        if trust::on_disk_equivalent(project, &ctx.cfg.env_file, name, &value) {
+                            Gate::Open { source: trust::on_disk_source().into() }
+                        } else {
+                            ctx.db.audit(Some(&pid), Some(agent), "on_disk.miss", Some(name), Some(&identity), Some("env file holds a different value; not compared again until the TTL passes"))?;
+                            Gate::NeedsApproval { reason: GateReason::Pairing }
+                        }
+                    } else {
+                        Gate::NeedsApproval { reason: GateReason::Pairing }
+                    }
+                }
+                g => g,
             };
             match gate {
-                // A stale key is a miss, but only once the project has passed the same gate a
-                // fresh injection would: a project that would need approval to receive this
-                // key must not get a paste card for its replacement instead. `deliver` makes
-                // that call (it re-reads the flag), so every door sees the same answer.
-                Gate::Open => match deliver(ctx, project, agent, name, &identity, &value, None, budget)? {
+                Gate::Open { source } => match deliver(ctx, project, agent, name, &identity, &value, None, &source, budget)? {
                     Delivery::Injected { path, unverified } => {
                         outcomes.push(Outcome::Injected { name: name.clone(), identity, written_to: path.display().to_string(), generated: false, unverified });
                     }
                     Delivery::Rejected { reason } => outcomes.push(replacement(ctx, project, agent, name, &identity, opts, &reason)?),
                 },
                 Gate::NeedsApproval { reason } => {
-                    if reason == GateReason::OutsideTrustRoots {
-                        outside = true;
-                    }
                     // Carry the identity into the approval so the approver injects the key
                     // that was actually requested, not the binding/default.
-                    gated.push(format!("{name}@{identity}"));
+                    let entry = format!("{name}@{identity}");
+                    match reason {
+                        GateReason::Pairing => pairing.push(entry),
+                        GateReason::Sensitive => sensitive_gated.push(entry),
+                    }
                     // placeholder; task id filled below
                     outcomes.push(Outcome::Pending { name: name.clone(), identity: identity.clone(), task_id: String::new(), title: String::new(), url: None });
                 }
@@ -169,55 +198,49 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
         outcomes.push(Outcome::Pending { name: name.clone(), identity: identity.clone(), task_id: t.id, title: t.title, url: t.url });
     }
 
-    if !gated.is_empty() {
-        let mut names_for_task = gated.clone();
-        if outside {
-            names_for_task.push("*".into());
+    // One card per kind per call. "Deny" on a card is remembered for task_ttl_hours, like
+    // a denied paste: every entry the human already refused for this workspace comes back
+    // Denied instead of a fresh card. Without this a program failing in a loop files a new
+    // card per failure until the human clicks through.
+    for (entries, kind) in [(&pairing, tasks::ApprovalKind::Pairing), (&sensitive_gated, tasks::ApprovalKind::Sensitive), (&once, tasks::ApprovalKind::Once)] {
+        if entries.is_empty() {
+            continue;
         }
-        // "Deny" on an approval card is remembered for task_ttl_hours, like a denied paste:
-        // every gated entry the human already refused for this project comes back Denied
-        // instead of a fresh card. Without this a program failing in a loop files a new card
-        // per failure until the human clicks through.
-        // Every denial still inside the TTL counts, not just the newest: each card may have
-        // covered different keys.
         let mut denied_entries: Vec<(String, String)> = vec![]; // (entry, denying task id)
         if !opts.force {
             let since = (chrono::Utc::now() - chrono::Duration::hours(ctx.cfg.task_ttl_hours as i64)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             for d in ctx.db.recent_denied_approvals(&pid, &since)? {
-                for g in &gated {
+                for g in entries {
                     if denied_entries.iter().any(|(e, _)| e == g) {
                         continue;
                     }
-                    // Only the keys that card actually named. The `*` an outside-root card
-                    // carries is the project-wide GRANT offer; refusing it is not "deny every
-                    // future key here" — a different key deserves its own card.
                     let name_only = tasks::split_identity(g).0.to_string();
-                    let covered = d.names.iter().any(|n| n == g || n == &name_only);
-                    if covered {
+                    if d.names.iter().any(|n| n == g || n == &name_only) {
                         denied_entries.push((g.clone(), d.id.clone()));
                     }
                 }
             }
             for o in outcomes.iter_mut() {
-                if let Outcome::Pending { name, identity, .. } = o {
-                    if let Some((_, tid)) = denied_entries.iter().find(|(e, _)| e == &format!("{name}@{identity}")) {
-                        *o = Outcome::Denied { name: name.clone(), task_id: tid.clone() };
+                if let Outcome::Pending { name, identity, task_id, .. } = o {
+                    if task_id.is_empty() {
+                        if let Some((_, tid)) = denied_entries.iter().find(|(e, _)| e == &format!("{name}@{identity}")) {
+                            *o = Outcome::Denied { name: name.clone(), task_id: tid.clone() };
+                        }
                     }
                 }
             }
         }
-        let denied_entries: Vec<String> = denied_entries.into_iter().map(|(e, _)| e).collect();
-        let still_gated: Vec<String> = gated.iter().filter(|g| !denied_entries.contains(g)).cloned().collect();
-        if !still_gated.is_empty() {
-            let names_for_task: Vec<String> = names_for_task.into_iter().filter(|n| n == "*" || still_gated.contains(n)).collect();
-            // Program-derived requests never merge with another invocation's pending approval.
-            let t = tasks::create_approval_task_opts(ctx, project, agent, &names_for_task, !opts.require_approval)?;
-            for o in outcomes.iter_mut() {
-                if let Outcome::Pending { name, identity, task_id, title, .. } = o {
-                    if task_id.is_empty() && still_gated.contains(&format!("{name}@{identity}")) {
-                        *task_id = t.id.clone();
-                        *title = t.title.clone();
-                    }
+        let denied: Vec<String> = denied_entries.into_iter().map(|(e, _)| e).collect();
+        let still: Vec<String> = entries.iter().filter(|g| !denied.contains(g)).cloned().collect();
+        if still.is_empty() {
+            continue;
+        }
+        let t = tasks::create_approval_task(ctx, project, agent, &still, kind)?;
+        for o in outcomes.iter_mut() {
+            if let Outcome::Pending { name, identity, task_id, title, .. } = o {
+                if task_id.is_empty() && still.contains(&format!("{name}@{identity}")) {
+                    *task_id = t.id.clone();
+                    *title = t.title.clone();
                 }
             }
         }
@@ -250,7 +273,7 @@ pub fn wait(ctx: &Ctx, project: &Path, outcomes: &mut [Outcome], timeout: Durati
                         let written: PathBuf = project.join(&ctx.cfg.env_file);
                         let v = ctx.stash.get(&stash_key(name, identity))?
                             .ok_or_else(|| anyhow::anyhow!("task {} is answered but {name}@{identity} is not in the stash", t.id))?;
-                        match deliver(ctx, project, &t.agent, name, identity, &v, Some("after-answer"), &mut budget)
+                        match deliver(ctx, project, &t.agent, name, identity, &v, Some("after-answer"), GRANT_PASTE, &mut budget)
                             .map_err(|e| anyhow::anyhow!("{name} is stored but could not be delivered to {}: {e:#}", written.display()))?
                         {
                             Delivery::Injected { unverified, .. } => {
@@ -343,7 +366,7 @@ enum AtUse {
 /// after-answer inject — so neither verify-on-use nor the stale flag can be bypassed by
 /// taking a different door.
 #[allow(clippy::too_many_arguments)]
-pub fn deliver(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &str, value: &SecretString, note: Option<&str>, budget: &mut ProbeBudget) -> Result<Delivery> {
+pub fn deliver(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &str, value: &SecretString, note: Option<&str>, grant: &str, budget: &mut ProbeBudget) -> Result<Delivery> {
     let pid = project.to_string_lossy().to_string();
     // Re-read: the flag may have been set after the caller looked (a report from another
     // project while an approval card was pending, a probe in another process).
@@ -370,7 +393,7 @@ pub fn deliver(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &st
     };
     let path = crate::envfile::write(project, &ctx.cfg.env_file, name, &current)?;
     ctx.db.touch_secret(name, identity)?;
-    ctx.db.audit(Some(&pid), Some(agent), "inject", Some(name), Some(identity), note)?;
+    ctx.db.audit_grant(Some(&pid), Some(agent), "inject", Some(name), Some(identity), note, grant)?;
     Ok(Delivery::Injected { path, unverified })
 }
 

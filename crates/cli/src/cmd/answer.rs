@@ -16,9 +16,13 @@ pub struct AnswerArgs {
     /// Skip the provider liveness check.
     #[arg(long)]
     pub skip_check: bool,
-    /// Approve (approval tasks).
+    /// Approve (approval tasks): exactly the listed keys.
     #[arg(long)]
     pub allow: bool,
+    /// Approve a pairing card broadly: the listed keys plus any registry-confirmed
+    /// non-sensitive key for the same identity in this directory.
+    #[arg(long)]
+    pub allow_broad: bool,
     /// Deny / decline any task.
     #[arg(long)]
     pub deny: bool,
@@ -81,13 +85,15 @@ pub fn answer(a: AnswerArgs) -> Result<i32> {
             println!("{}", task.title);
             if let Some(w) = &task.why { println!("  {w}"); }
             println!("  keys: {}", crate::util::approval_names(&task.names).join(", "));
-            let allow = if a.allow {
-                true
+            let decision = if a.allow_broad {
+                tasks::Decision::AllowBroad
+            } else if a.allow {
+                tasks::Decision::Allow
             } else {
                 let ans = rpassword::prompt_password("Allow? [y/N] (input hidden) ")?;
-                matches!(ans.trim(), "y" | "Y" | "yes")
+                if matches!(ans.trim(), "y" | "Y" | "yes") { tasks::Decision::Allow } else { tasks::Decision::Deny }
             };
-            match tasks::answer_approval(&ctx, &task, allow)? {
+            match tasks::answer_approval(&ctx, &task, decision)? {
                 AnswerResult::Approved { injected, replaced } => {
                     println!("✓ approved; injected {}", if injected.is_empty() { "nothing new".into() } else { injected.join(", ") });
                     if !replaced.is_empty() { println!("  {} rejected by the provider at delivery — a Replace card is waiting", replaced.join(", ")); }

@@ -117,7 +117,8 @@ pub struct BindArgs {
 pub fn bind(a: BindArgs) -> Result<i32> {
     let app = App::open()?;
     let project = util::project_from(&a.project);
-    app.db.set_binding(&project.to_string_lossy(), &a.name, &a.identity)?;
+    let ws = app.db.workspace_for(&project)?;
+    app.db.set_binding(&ws.id, &a.name, &a.identity)?;
     println!("✓ {} → {}@{} for {}", a.name, a.name, a.identity, tokenstash_core::project::short(&project));
     Ok(0)
 }
@@ -138,35 +139,85 @@ pub enum TrustCmd {
     List,
 }
 
+/// Trust roots are retired (0.2): a folder never said which keys the human meant. Each
+/// directory pairs once instead. `rm` still works so old configs can be cleaned up.
 pub fn trust(a: TrustArgs) -> Result<i32> {
     let mut cfg = Config::load()?;
+    const NOTICE: &str = "trust roots are retired: the first time a directory asks for stored keys you approve exactly which ones (one card), and they are silent there afterwards. See `tokenstash workspaces`.";
     match a.cmd.unwrap_or(TrustCmd::List) {
-        TrustCmd::Add { path } => {
-            let p = path.unwrap_or(std::env::current_dir()?);
-            let p = p.canonicalize().unwrap_or(p);
-            if !cfg.trust_roots.contains(&p) {
-                cfg.trust_roots.push(p.clone());
-                cfg.save()?;
-            }
-            println!("✓ trusted {}", tokenstash_core::project::short(&p));
+        TrustCmd::Add { .. } => {
+            println!("nothing to add — {NOTICE}");
         }
         TrustCmd::Rm { path } => {
             let p = path.canonicalize().unwrap_or(path);
             let before = cfg.trust_roots.len();
             cfg.trust_roots.retain(|r| r != &p);
             if cfg.trust_roots.len() == before {
-                bail!("{} is not a trust root", p.display());
+                bail!("{} is not in the (retired) trust roots", p.display());
             }
             cfg.save()?;
-            println!("✓ removed {}", tokenstash_core::project::short(&p));
+            println!("✓ removed {} from the retired list", tokenstash_core::project::short(&p));
         }
         TrustCmd::List => {
-            if cfg.trust_roots.is_empty() {
-                println!("no trust roots — every project will ask once. Run `tokenstash trust add ~/code`.");
+            println!("{NOTICE}");
+            if !cfg.trust_roots.is_empty() {
+                println!("still listed in config (no effect; `tokenstash trust rm <dir>` to tidy):");
+                for r in &cfg.trust_roots {
+                    println!("    {}", tokenstash_core::project::short(r));
+                }
             }
-            for r in &cfg.trust_roots {
-                println!("{}", tokenstash_core::project::short(r));
+        }
+    }
+    Ok(0)
+}
+
+#[derive(Args)]
+pub struct WorkspacesArgs {
+    #[command(subcommand)]
+    pub cmd: Option<WorkspacesCmd>,
+}
+
+#[derive(Subcommand)]
+pub enum WorkspacesCmd {
+    /// List paired directories and what each may receive.
+    List,
+    /// Drop every grant of a directory (values already written stay written).
+    Revoke { path: PathBuf },
+    /// Forget a directory entirely: its next request pairs again.
+    Forget { path: PathBuf },
+}
+
+/// Human-only: this is the cross-project inventory the MCP surface deliberately hides.
+pub fn workspaces(a: WorkspacesArgs) -> Result<i32> {
+    require_human("workspaces")?;
+    let app = App::open()?;
+    match a.cmd.unwrap_or(WorkspacesCmd::List) {
+        WorkspacesCmd::List => {
+            let all = app.db.list_workspaces()?;
+            if all.is_empty() {
+                println!("no paired directories yet — the first stored key a directory asks for pairs it (one card)");
+                return Ok(0);
             }
+            for w in &all {
+                let live = app.db.find_workspace(std::path::Path::new(&w.root))?.is_some();
+                println!("{}{}", tokenstash_core::project::short(std::path::Path::new(&w.root)), if live { "" } else { "  (directory gone or re-created: grants no longer apply)" });
+                for (name, identity, scope, source) in app.db.grants_for(&w.id)? {
+                    let what = if scope == tokenstash_core::db::GRANT_BROAD { format!("any non-sensitive registry key @{identity}") } else if identity == "default" { name } else { format!("{name}@{identity}") };
+                    println!("    {what:<48} via {source}");
+                }
+            }
+        }
+        WorkspacesCmd::Revoke { path } => {
+            let Some(w) = app.db.find_workspace(&path)? else { bail!("{} is not a paired directory", path.display()) };
+            let n = app.db.revoke_workspace(&w.id)?;
+            app.db.audit(Some(&w.root), None, "workspace.revoke", None, None, Some(&format!("{n} grants")))?;
+            println!("✓ revoked {n} grant(s) for {} — values already in its env file stay there; its next request asks again", tokenstash_core::project::short(std::path::Path::new(&w.root)));
+        }
+        WorkspacesCmd::Forget { path } => {
+            let Some(w) = app.db.find_workspace(&path)? else { bail!("{} is not a paired directory", path.display()) };
+            app.db.forget_workspace(&w.id)?;
+            app.db.audit(Some(&w.root), None, "workspace.forget", None, None, None)?;
+            println!("✓ forgot {}", tokenstash_core::project::short(std::path::Path::new(&w.root)));
         }
     }
     Ok(0)
@@ -185,20 +236,21 @@ pub fn audit(a: AuditArgs) -> Result<i32> {
     let app = App::open()?;
     let rows = app.db.recent_audit(a.limit)?;
     if a.json {
-        let v: Vec<serde_json::Value> = rows.iter().map(|(ts, project, agent, action, name, identity, detail)| serde_json::json!({
-            "ts": ts, "project": project, "agent": agent, "action": action, "name": name, "identity": identity, "detail": detail,
+        let v: Vec<serde_json::Value> = rows.iter().map(|(ts, project, agent, action, name, identity, detail, grant)| serde_json::json!({
+            "ts": ts, "project": project, "agent": agent, "action": action, "name": name, "identity": identity, "detail": detail, "grant_source": grant,
         })).collect();
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(0);
     }
-    for (ts, project, agent, action, name, identity, detail) in rows {
+    for (ts, project, agent, action, name, identity, detail, grant) in rows {
         println!(
-            "{ts}  {:<14} {:<30} {:<24} {:<12} {}",
+            "{ts}  {:<14} {:<30} {:<24} {:<12} {}{}",
             action,
             name.map(|n| match identity { Some(i) if i != "default" => format!("{n}@{i}"), _ => n }).unwrap_or_default(),
             project.map(|p| util::short(&p)).unwrap_or_default(),
             agent.unwrap_or_default(),
-            detail.unwrap_or_default()
+            detail.unwrap_or_default(),
+            grant.map(|g| format!(" [via {g}]")).unwrap_or_default()
         );
     }
     Ok(0)

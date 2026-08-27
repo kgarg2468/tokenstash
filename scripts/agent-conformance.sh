@@ -24,7 +24,7 @@
 # FAIL = the agent ran and did the wrong thing. Transcripts land in $CONF_OUT.
 #
 # Isolation: TOKENSTASH_HOME, the stash (insecure-file, chosen before the first tokenstash
-# call so no keyring is probed), the trust root and the inbox port are per agent and per run;
+# call so no keyring is probed), the paired grants and the inbox port are per agent and per run;
 # every project-scoped tokenstash call (`need`, `init`, `doctor`) runs inside the scratch project. MCP
 # wiring is passed on the command line (Claude: --mcp-config --strict-mcp-config; Codex:
 # --ignore-user-config + -c; Cursor: project-local .cursor/mcp.json). What is NOT isolated:
@@ -103,7 +103,7 @@ setup_world() {   # $1 agent
     mkdir -p "$home" "$proj" "$bin"
     ln -sf "$TS" "$bin/tokenstash"
     export TOKENSTASH_HOME=$home
-    (cd "$proj" && "$TS" init --no-agents --trust "$proj") >"$dir/init.txt" 2>&1 || { echo "init failed: see $dir/init.txt"; return 1; }
+    (cd "$proj" && "$TS" init --no-agents) >"$dir/init.txt" 2>&1 || { echo "init failed: see $dir/init.txt"; return 1; }
     if [ "$agent" = codex ]; then
         # what real Codex users have: the AGENTS.md snippet init installs (globally, but
         # --ignore-user-config drops ~/.codex/AGENTS.md, so at project level here)
@@ -112,18 +112,8 @@ setup_world() {   # $1 agent
         "$TS" init --print-snippet >"$proj/AGENTS.md" || return 1
         grep -q "tokenstash" "$proj/AGENTS.md" 2>/dev/null || { echo "could not install the AGENTS.md snippet into the scratch project"; return 1; }
     fi
-    # init guesses trust roots (~/projects, ~/code, …): the developer's real code dirs. This
-    # world trusts the scratch project and nothing else, or a stray `need` from the wrong cwd
-    # writes the canary into a real project.
-    python3 - "$home/config.toml" "$proj" <<'PY'
-import re, sys
-path, proj = sys.argv[1], sys.argv[2]
-s = open(path).read()
-s = re.sub(r"trust_roots\s*=\s*\[.*?\]", "trust_roots = [%s]" % __import__("json").dumps(proj), s, count=1, flags=re.S)
-open(path, "w").write(s)
-PY
-    local roots; roots=$("$TS" trust list 2>/dev/null); roots=${roots//\~/$HOME}
-    [ "$roots" = "$proj" ] || { echo "trust roots are not exactly the scratch project: $roots"; return 1; }
+    # Trust v2: nothing is trusted by folder. The seed paste below (from inside the scratch
+    # project) is the grant that keeps scenario 1 silent; nothing else is granted anywhere.
     local port
     port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
     sed -i.bak \
@@ -482,7 +472,7 @@ suite() {   # $1 agent   (runs in its own subshell: the inbox it starts dies wit
     fi
 }
 
-# ── run every agent in parallel (separate homes, stashes, trust roots and inbox ports) ──
+# ── run every agent in parallel (separate homes, stashes, grants and inbox ports) ──
 : >"$OUT/scorecard.txt"
 for a in "${AGENTS[@]}"; do
     ( suite "$a" ) &

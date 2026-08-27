@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// (ts, project, agent, action, name, identity, detail) — never a value.
-pub type AuditRow = (String, Option<String>, Option<String>, String, Option<String>, Option<String>, Option<String>);
+pub type AuditRow = (String, Option<String>, Option<String>, String, Option<String>, Option<String>, Option<String>, Option<String>);
 
 pub struct Db {
     pub conn: Connection,
@@ -61,6 +61,55 @@ pub struct SecretMeta {
     /// probe that says Ok.
     #[serde(default)]
     pub verify_off: bool,
+}
+
+/// Grant scopes and sources (trust v2).
+pub const GRANT_KEY: &str = "key";
+pub const GRANT_BROAD: &str = "broad";
+pub const GRANT_PASTE: &str = "paste";
+pub const GRANT_PAIRING: &str = "pairing";
+pub const GRANT_SENSITIVE: &str = "sensitive";
+pub const GRANT_BACKFILL: &str = "backfill";
+/// Not a grant: the value was already in the workspace's env file (delivery marker only).
+pub const GRANT_ON_DISK: &str = "on_disk";
+/// Not a grant: a one-time approval (`run`).
+pub const GRANT_ONCE: &str = "once";
+
+/// A directory the human has paired keys into.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Workspace {
+    pub id: String,
+    /// Canonical root path.
+    pub root: String,
+    pub ino: u64,
+    /// Directory birth time, when the filesystem reports one; with it, an inode number
+    /// reused by a re-created directory (ext4 does this readily) is still told apart.
+    pub btime: Option<String>,
+    pub dev: u64,
+    pub created: String,
+    /// The filesystem gave no birth time: identity rests on the inode alone.
+    #[serde(default)]
+    pub fingerprint_weak: bool,
+}
+
+pub struct Fingerprint { pub ino: u64, pub btime: Option<String>, pub dev: u64 }
+
+/// (inode, birth time, device) of a directory. `None` if it cannot be stat'ed.
+pub fn fingerprint(root: &Path) -> Option<Fingerprint> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(root).ok()?;
+    if !md.is_dir() {
+        return None;
+    }
+    let btime = md.created().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| format!("{}.{:09}", d.as_secs(), d.subsec_nanos()));
+    Some(Fingerprint { ino: md.ino(), btime, dev: md.dev() })
+}
+
+fn new_workspace_id() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 /// Values for `SecretMeta::stale_source`.
@@ -185,8 +234,35 @@ impl Db {
                 id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, project TEXT, agent TEXT,
                 action TEXT NOT NULL, name TEXT, identity TEXT, detail TEXT
             );
+            -- Trust v2 (§13.1/§13.5): a workspace is a directory the human paired keys into.
+            -- Identity is the canonical root; the fingerprint (inode + birth time) tells a
+            -- re-created directory at the same path from the original. Old tables stay so a
+            -- 0.1 binary can still open this database.
+            CREATE TABLE IF NOT EXISTS workspaces (
+                id TEXT PRIMARY KEY, root TEXT NOT NULL UNIQUE, ino INTEGER NOT NULL,
+                btime TEXT, dev INTEGER NOT NULL, created TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS grants (
+                workspace_id TEXT NOT NULL, name TEXT NOT NULL, identity TEXT NOT NULL,
+                scope TEXT NOT NULL, source TEXT NOT NULL, created TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, name, identity)
+            );
+            CREATE TABLE IF NOT EXISTS workspace_bindings (
+                workspace_id TEXT NOT NULL, name TEXT NOT NULL, identity TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, name)
+            );
             "#,
         )?;
+        {
+            let has: bool = conn.prepare("SELECT 1 FROM pragma_table_info('audit') WHERE name=?1")?.exists(["grant_source"])?;
+            if !has {
+                if let Err(e) = conn.execute_batch("ALTER TABLE audit ADD COLUMN grant_source TEXT") {
+                    if !e.to_string().contains("duplicate column") {
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
         // Columns added after v0.1.0. SQLite has no ADD COLUMN IF NOT EXISTS; probe first.
         for (col, ddl) in [
             ("last_verified", "ALTER TABLE secrets ADD COLUMN last_verified TEXT"),
@@ -213,7 +289,65 @@ impl Db {
             params![STALE_ROTATE, format!("{}%", Self::ROTATE_REASON)],
         )?;
         conn.execute("UPDATE secrets SET stale_source=?1 WHERE stale=1 AND stale_source IS NULL", params![STALE_REPORT])?;
-        Ok(Self { conn })
+        let db = Self { conn };
+        db.migrate_v2()?;
+        Ok(db)
+    }
+
+    /// Data migration to trust v2, once, under one write lock (two processes opening a 0.1
+    /// database at the same time must not both backfill). `user_version` 2 marks it done.
+    /// Backfills from `approvals` only — never from audit rows, which include one-time
+    /// `run` approvals that must not become standing grants.
+    fn migrate_v2(&self) -> Result<()> {
+        let v: i64 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if v >= 2 {
+            return Ok(());
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let done = (|| -> Result<()> {
+            let v: i64 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            if v >= 2 {
+                return Ok(());
+            }
+            let mut st = self.conn.prepare("SELECT project, name FROM approvals")?;
+            let rows: Vec<(String, String)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
+            drop(st);
+            for (project, name) in rows {
+                let root = Path::new(&project);
+                if !root.is_dir() {
+                    continue; // a root that no longer exists gets no grant
+                }
+                let Some(ws) = self.workspace_for_locked(root)? else { continue };
+                let identity = self.legacy_binding(&project, &name)?.unwrap_or_else(|| "default".into());
+                if name == "*" {
+                    self.grant(&ws.id, "*", &identity, GRANT_BROAD, GRANT_BACKFILL)?;
+                } else {
+                    self.grant(&ws.id, &name, &identity, GRANT_KEY, GRANT_BACKFILL)?;
+                }
+            }
+            let mut st = self.conn.prepare("SELECT project, name, identity FROM bindings")?;
+            let rows: Vec<(String, String, String)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<_, _>>()?;
+            drop(st);
+            for (project, name, identity) in rows {
+                let root = Path::new(&project);
+                if !root.is_dir() {
+                    continue;
+                }
+                if let Some(ws) = self.workspace_for_locked(root)? {
+                    self.set_binding(&ws.id, &name, &identity)?;
+                }
+            }
+            self.conn.execute_batch("PRAGMA user_version = 2")?;
+            Ok(())
+        })();
+        match done {
+            Ok(()) => { self.conn.execute_batch("COMMIT")?; Ok(()) }
+            Err(e) => { let _ = self.conn.execute_batch("ROLLBACK"); Err(e) }
+        }
+    }
+
+    fn legacy_binding(&self, project: &str, name: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row("SELECT identity FROM bindings WHERE project=?1 AND name=?2", params![project, name], |r| r.get(0)).optional()?)
     }
 
     pub fn open_default() -> Result<Self> {
@@ -516,6 +650,15 @@ impl Db {
         Ok(self.conn.query_row(&sql, params![project, name, identity, since], Self::row_to_task).optional()?)
     }
 
+    /// The open approval card of one kind (`pairing` | `sensitive`) for a project root.
+    pub fn open_approval_task_kind(&self, project: &str, expects: &str) -> Result<Option<Task>> {
+        let sql = format!(
+            "SELECT {} FROM tasks WHERE kind='approval' AND status='pending' AND project=?1 AND expects=?2 ORDER BY created DESC",
+            Self::TASK_COLS
+        );
+        Ok(self.conn.query_row(&sql, params![project, expects], Self::row_to_task).optional()?)
+    }
+
     pub fn open_approval_task(&self, project: &str) -> Result<Option<Task>> {
         let sql = format!(
             "SELECT {} FROM tasks WHERE kind='approval' AND status='pending' AND project=?1 ORDER BY created DESC",
@@ -553,29 +696,134 @@ impl Db {
         )?)
     }
 
-    // ---------- approvals / bindings ----------
+    // ---------- workspaces / grants / bindings (trust v2) ----------
 
-    /// Approved by name, or by the project-wide `*` that "allow this project" records.
-    /// Only for the LOCATION gate. Never for sensitive keys — see [`Self::is_approved_exact`].
-    pub fn is_approved(&self, project: &str, name: &str) -> Result<bool> {
+    /// Find-or-create the workspace for a root, under the caller's write lock. The root is
+    /// the identity; the fingerprint decides whether it is still the same directory: a
+    /// mismatch (rm -rf + re-clone, a different mount) revokes the old grants and starts
+    /// over — the human never paired keys into THIS directory.
+    fn workspace_for_locked(&self, root: &Path) -> Result<Option<Workspace>> {
+        let Ok(root) = root.canonicalize() else { return Ok(None) };
+        let Some(fp) = fingerprint(&root) else { return Ok(None) };
+        let key = root.to_string_lossy().to_string();
+        let existing: Option<Workspace> = self.conn.query_row(
+            "SELECT id, root, ino, btime, dev, created FROM workspaces WHERE root=?1",
+            params![key],
+            |r| Ok(Workspace { id: r.get(0)?, root: r.get(1)?, ino: r.get::<_, i64>(2)? as u64, btime: r.get(3)?, dev: r.get::<_, i64>(4)? as u64, created: r.get(5)?, fingerprint_weak: false }),
+        ).optional()?;
+        if let Some(mut ws) = existing {
+            if ws.ino == fp.ino && ws.btime == fp.btime {
+                ws.fingerprint_weak = fp.btime.is_none();
+                return Ok(Some(ws));
+            }
+            // Same path, different directory: everything the human granted was for the old one.
+            self.conn.execute("DELETE FROM grants WHERE workspace_id=?1", params![ws.id])?;
+            self.conn.execute("DELETE FROM workspace_bindings WHERE workspace_id=?1", params![ws.id])?;
+            self.conn.execute("DELETE FROM workspaces WHERE id=?1", params![ws.id])?;
+            self.audit(Some(&key), None, "workspace.replaced", None, None, Some("directory re-created; grants revoked"))?;
+        }
+        let id = new_workspace_id();
+        let created = crate::now();
+        self.conn.execute(
+            "INSERT INTO workspaces (id, root, ino, btime, dev, created) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![id, key, fp.ino as i64, fp.btime, fp.dev as i64, created],
+        )?;
+        Ok(Some(Workspace { id, root: key, ino: fp.ino, btime: fp.btime.clone(), dev: fp.dev, created, fingerprint_weak: fp.btime.is_none() }))
+    }
+
+    /// The workspace for a root, created if this is its first contact. Only the delivery
+    /// path (`need`, the MCP bind) may call this; everything path-keyed and read-only
+    /// (rotation rewrite, reports, task_check) uses [`Self::find_workspace`].
+    pub fn workspace_for(&self, root: &Path) -> Result<Workspace> {
+        // Inside a caller's transaction the write lock is already held: no nested BEGIN.
+        let own_tx = self.conn.is_autocommit();
+        if own_tx {
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        let r = self.workspace_for_locked(root);
+        match r {
+            Ok(Some(ws)) => { if own_tx { self.conn.execute_batch("COMMIT")?; } Ok(ws) }
+            Ok(None) => { if own_tx { let _ = self.conn.execute_batch("ROLLBACK"); } anyhow::bail!("{} is not a directory that can be paired", root.display()) }
+            Err(e) => { if own_tx { let _ = self.conn.execute_batch("ROLLBACK"); } Err(e) }
+        }
+    }
+
+    /// Read-only lookup: the workspace on record for this root, if the directory is still
+    /// the one that was paired. Never creates, never revokes.
+    pub fn find_workspace(&self, root: &Path) -> Result<Option<Workspace>> {
+        let Ok(root) = root.canonicalize() else { return Ok(None) };
+        let key = root.to_string_lossy().to_string();
+        let ws: Option<Workspace> = self.conn.query_row(
+            "SELECT id, root, ino, btime, dev, created FROM workspaces WHERE root=?1",
+            params![key],
+            |r| Ok(Workspace { id: r.get(0)?, root: r.get(1)?, ino: r.get::<_, i64>(2)? as u64, btime: r.get(3)?, dev: r.get::<_, i64>(4)? as u64, created: r.get(5)?, fingerprint_weak: false }),
+        ).optional()?;
+        Ok(ws.filter(|w| fingerprint(&root).map(|fp| fp.ino == w.ino && fp.btime == w.btime).unwrap_or(false)))
+    }
+
+    pub fn list_workspaces(&self) -> Result<Vec<Workspace>> {
+        let mut st = self.conn.prepare("SELECT id, root, ino, btime, dev, created FROM workspaces ORDER BY root")?;
+        let rows = st.query_map([], |r| Ok(Workspace { id: r.get(0)?, root: r.get(1)?, ino: r.get::<_, i64>(2)? as u64, btime: r.get(3)?, dev: r.get::<_, i64>(4)? as u64, created: r.get(5)?, fingerprint_weak: false }))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn grant(&self, workspace_id: &str, name: &str, identity: &str, scope: &str, source: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO grants (workspace_id, name, identity, scope, source, created) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![workspace_id, name, identity, scope, source, crate::now()],
+        )?;
+        Ok(())
+    }
+
+    /// The exact grant's source, if this workspace holds one for (name, identity).
+    pub fn grant_source(&self, workspace_id: &str, name: &str, identity: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row(
+            "SELECT source FROM grants WHERE workspace_id=?1 AND name=?2 AND identity=?3",
+            params![workspace_id, name, identity],
+            |r| r.get(0),
+        ).optional()?)
+    }
+
+    /// A broad grant: any registry-confirmed non-sensitive key for this identity here.
+    pub fn has_broad_grant(&self, workspace_id: &str, identity: &str) -> Result<bool> {
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM approvals WHERE project=?1 AND (name=?2 OR name='*')",
-            params![project, name],
+            "SELECT COUNT(*) FROM grants WHERE workspace_id=?1 AND name='*' AND identity=?2 AND scope=?3",
+            params![workspace_id, identity, GRANT_BROAD],
             |r| r.get(0),
         )?;
         Ok(n > 0)
     }
 
-    /// Approved by this exact name only. A sensitive key is a per-key decision: the
-    /// project-wide `*` from an "allow this project" card must not satisfy it, or an
-    /// outside-root project becomes MORE permissive than a trusted one.
-    pub fn is_approved_exact(&self, project: &str, name: &str) -> Result<bool> {
-        let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM approvals WHERE project=?1 AND name=?2",
-            params![project, name],
-            |r| r.get(0),
+    /// (name, identity, scope, source) for a workspace.
+    pub fn grants_for(&self, workspace_id: &str) -> Result<Vec<(String, String, String, String)>> {
+        let mut st = self.conn.prepare("SELECT name, identity, scope, source FROM grants WHERE workspace_id=?1 ORDER BY name, identity")?;
+        let rows = st.query_map(params![workspace_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Every workspace holding an exact or broad grant for (name, identity): the set a
+    /// rotation may rewrite. On-disk equivalence is not a grant and never appears here.
+    pub fn workspaces_granted(&self, name: &str, identity: &str) -> Result<Vec<Workspace>> {
+        let mut st = self.conn.prepare(
+            "SELECT DISTINCT w.id, w.root, w.ino, w.btime, w.dev, w.created FROM workspaces w JOIN grants g ON g.workspace_id = w.id
+             WHERE g.identity=?2 AND (g.name=?1 OR (g.name='*' AND g.scope=?3)) ORDER BY w.root",
         )?;
-        Ok(n > 0)
+        let rows = st.query_map(params![name, identity, GRANT_BROAD], |r| Ok(Workspace { id: r.get(0)?, root: r.get(1)?, ino: r.get::<_, i64>(2)? as u64, btime: r.get(3)?, dev: r.get::<_, i64>(4)? as u64, created: r.get(5)?, fingerprint_weak: false }))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Drop every grant (and binding) of a workspace. Values already written stay written.
+    pub fn revoke_workspace(&self, workspace_id: &str) -> Result<usize> {
+        let n = self.conn.execute("DELETE FROM grants WHERE workspace_id=?1", params![workspace_id])?;
+        Ok(n)
+    }
+
+    /// Forget a workspace entirely: its next `need` pairs again. Deny memory (tasks) stays.
+    pub fn forget_workspace(&self, workspace_id: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM grants WHERE workspace_id=?1", params![workspace_id])?;
+        self.conn.execute("DELETE FROM workspace_bindings WHERE workspace_id=?1", params![workspace_id])?;
+        self.conn.execute("DELETE FROM workspaces WHERE id=?1", params![workspace_id])?;
+        Ok(())
     }
 
     /// Most recent denied approval task for a project after `since`. "Deny" on an approval
@@ -591,41 +839,46 @@ impl Db {
         Ok(rows)
     }
 
-    pub fn approve(&self, project: &str, name: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR IGNORE INTO approvals (project, name, created) VALUES (?1,?2,?3)",
-            params![project, name, crate::now()],
-        )?;
-        Ok(())
-    }
-
-    pub fn binding(&self, project: &str, name: &str) -> Result<Option<String>> {
+    /// Identity bound for a name in a workspace (work vs personal), if any.
+    pub fn binding(&self, workspace_id: &str, name: &str) -> Result<Option<String>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT identity FROM bindings WHERE project=?1 AND name=?2",
-                params![project, name],
+                "SELECT identity FROM workspace_bindings WHERE workspace_id=?1 AND name=?2",
+                params![workspace_id, name],
                 |r| r.get(0),
             )
             .optional()?)
     }
 
+    /// (root, name, identity) for every binding, by workspace root.
     pub fn list_bindings(&self) -> Result<Vec<(String, String, String)>> {
-        let mut st = self.conn.prepare("SELECT project, name, identity FROM bindings ORDER BY project, name")?;
+        let mut st = self.conn.prepare("SELECT w.root, b.name, b.identity FROM workspace_bindings b JOIN workspaces w ON w.id=b.workspace_id ORDER BY w.root, b.name")?;
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    pub fn set_binding(&self, project: &str, name: &str, identity: &str) -> Result<()> {
+    pub fn set_binding(&self, workspace_id: &str, name: &str, identity: &str) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO bindings (project, name, identity) VALUES (?1,?2,?3)
-             ON CONFLICT(project, name) DO UPDATE SET identity=excluded.identity",
-            params![project, name, identity],
+            "INSERT INTO workspace_bindings (workspace_id, name, identity) VALUES (?1,?2,?3)
+             ON CONFLICT(workspace_id, name) DO UPDATE SET identity=excluded.identity",
+            params![workspace_id, name, identity],
         )?;
         Ok(())
     }
 
     // ---------- audit (never values) ----------
+
+    /// An inject row that records which grant authorised it (paste / pairing / broad /
+    /// sensitive / on_disk / backfill / once).
+    #[allow(clippy::too_many_arguments)]
+    pub fn audit_grant(&self, project: Option<&str>, agent: Option<&str>, action: &str, name: Option<&str>, identity: Option<&str>, detail: Option<&str>, grant: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO audit (ts, project, agent, action, name, identity, detail, grant_source) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![crate::now(), project, agent, action, name, identity, detail, grant],
+        )?;
+        Ok(())
+    }
 
     pub fn audit(&self, project: Option<&str>, agent: Option<&str>, action: &str, name: Option<&str>, identity: Option<&str>, detail: Option<&str>) -> Result<()> {
         self.conn.execute(
@@ -637,11 +890,22 @@ impl Db {
 
     pub fn recent_audit(&self, limit: usize) -> Result<Vec<AuditRow>> {
         let mut st = self.conn.prepare(
-            "SELECT ts, project, agent, action, name, identity, detail FROM audit ORDER BY id DESC LIMIT ?1",
+            "SELECT ts, project, agent, action, name, identity, detail, grant_source FROM audit ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = st.query_map(params![limit as i64], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Was an on-disk equivalence check for (project, name) refused since `since`? One
+    /// attempt per window: a planted `NAME=guess` must not become a value-equality oracle.
+    pub fn recent_on_disk_miss(&self, project: &str, name: &str, since: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM audit WHERE project=?1 AND name=?2 AND action='on_disk.miss' AND ts >= ?3",
+            params![project, name, since],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
     }
 }
