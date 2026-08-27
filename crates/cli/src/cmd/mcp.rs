@@ -159,7 +159,9 @@ pub fn serve() -> Result<i32> {
     let mut agent = String::from("mcp");
     let mut binding = Binding { bound: None, roots_supported: false, roots_requested: false, roots: None, roots_raw: vec![] };
     let mut queued: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut eof = false;
     loop {
+        if eof && queued.is_empty() { break; }
         let line = match queued.pop_front() {
             Some(l) => l,
             None => match rx.recv() { Ok(Incoming::Line(l)) => l, _ => break },
@@ -232,7 +234,10 @@ pub fn serve() -> Result<i32> {
                                     .map(|m| { binding.take_roots(&m); true }).unwrap_or(false);
                                 if !is_roots { queued.push_back(l); }
                             }
-                            _ => break,
+                            // stdin closed during the wait: answer this call, drain what was
+                            // queued, then exit — the outer loop must not wait for more
+                            Ok(Incoming::Eof) => { eof = true; break; }
+                            Err(_) => break,
                         }
                     }
                 }
