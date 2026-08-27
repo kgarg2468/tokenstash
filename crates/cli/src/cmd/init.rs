@@ -19,8 +19,8 @@ pub struct InitArgs {
     /// Don't touch any agent config; just set up the stash.
     #[arg(long)]
     pub no_agents: bool,
-    /// Extra trust root(s).
-    #[arg(long = "trust")]
+    /// Retired (0.2): directories pair once instead; accepted and ignored with a notice.
+    #[arg(long = "trust", hide = true)]
     pub trust: Vec<PathBuf>,
     /// Undo a previous `init`: restore every agent config file it changed (from the backups
     /// it took), remove the skill file and the MCP registrations. Leaves the stash alone.
