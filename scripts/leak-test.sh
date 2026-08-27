@@ -39,7 +39,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$TS" init --no-agents --trust "$PROJ" >"$OUT/init.txt" 2>&1 || true
+"$TS" init --no-agents >"$OUT/init.txt" 2>&1 || true
 # Own the inbox for this run: a dedicated port, started by us, killed by PID. Never touch
 # whatever real inbox the developer may have running.
 PORT=$(( 20000 + RANDOM % 20000 ))

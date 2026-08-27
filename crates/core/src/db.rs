@@ -532,6 +532,13 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// (name, identity) pairs ever delivered into this project root.
+    pub fn delivered_names(&self, project: &str) -> Result<Vec<(String, String)>> {
+        let mut st = self.conn.prepare("SELECT DISTINCT name, identity FROM audit WHERE project=?1 AND action IN ('inject','store') AND name IS NOT NULL")?;
+        let rows = st.query_map(params![project], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_else(|| "default".into()))))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Projects that have ever had this key delivered. For re-injecting a rotated value.
     pub fn delivered_projects(&self, name: &str, identity: &str) -> Result<Vec<String>> {
         let mut st = self.conn.prepare("SELECT DISTINCT project FROM audit WHERE name=?1 AND identity=?2 AND action IN ('inject','store') AND project IS NOT NULL")?;
