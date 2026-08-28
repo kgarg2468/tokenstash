@@ -3,6 +3,9 @@ name = "tokenstash-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Core library for tokenstash: stash, ledger, registry and delivery. Use the `tokenstash` CLI."
+readme = "README.md"
 
 [dependencies]
 anyhow.workspace = true

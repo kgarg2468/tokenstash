@@ -118,7 +118,7 @@ Existing per-project approvals become grants automatically — for directories t
 
 ## Install
 
-Prebuilt binaries for macOS and Linux, with sha256 sidecars, are attached to [the latest release](https://github.com/kgarg2468/tokenstash/releases/latest). From source:
+Prebuilt binaries for macOS (arm64, x64) and Linux (x64, arm64; static, any distribution), with sha256 sidecars, are attached to [the latest release](https://github.com/kgarg2468/tokenstash/releases/latest). From source:
 
 ```bash
 cargo install --git https://github.com/kgarg2468/tokenstash tokenstash
