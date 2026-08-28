@@ -4,15 +4,23 @@ on:
     tags: ["v*"]
 permissions: { contents: write }
 jobs:
+  release:
+    # Created once, so the four build jobs never race on creating the same release.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - env: { GH_TOKEN: "${{ github.token }}" }
+        run: gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --generate-notes --notes "See CHANGELOG.md for what changed and how the upgrade behaves."
   build:
+    needs: release
     strategy:
       matrix:
         include:
           # Linux builds are static (musl): the glibc builds required glibc 2.39 and would not
           # start on Ubuntu 22.04 / Debian 12 / Amazon Linux 2023. arm64 builds natively on the
           # free public-repo arm runner (no cross).
-          - { os: ubuntu-latest,   target: x86_64-unknown-linux-musl,  name: linux-x64,    musl: true }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, name: linux-arm64, musl: true }
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-musl,  name: linux-x64,   musl: true, ccvar: CC_x86_64_unknown_linux_musl,  cc: x86_64-linux-musl-gcc }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, name: linux-arm64, musl: true, ccvar: CC_aarch64_unknown_linux_musl, cc: aarch64-linux-musl-gcc }
           - { os: macos-latest,    target: aarch64-apple-darwin,       name: darwin-arm64 }
           - { os: macos-15-intel,  target: x86_64-apple-darwin,        name: darwin-x64 }
     runs-on: ${{ matrix.os }}
@@ -21,7 +29,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with: { toolchain: stable, targets: "${{ matrix.target }}" }
       - if: matrix.musl
-        run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+        # musl-tools installs <arch>-linux-musl-gcc; name it explicitly so cc-rs (bundled
+        # SQLite) never falls back to the host glibc compiler.
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+          command -v ${{ matrix.cc }}
+          echo "${{ matrix.ccvar }}=${{ matrix.cc }}" >> "$GITHUB_ENV"
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - name: binary sanity (static on Linux, runs everywhere)
         run: |
@@ -34,13 +47,8 @@ jobs:
           cp target/${{ matrix.target }}/release/tokenstash dist/
           tar -C dist -czf tokenstash-${{ matrix.name }}.tar.gz tokenstash
           shasum -a 256 tokenstash-${{ matrix.name }}.tar.gz > tokenstash-${{ matrix.name }}.tar.gz.sha256
-      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          generate_release_notes: true
-          body: "See CHANGELOG.md for what changed and how the upgrade behaves."
-          files: |
-            tokenstash-${{ matrix.name }}.tar.gz
-            tokenstash-${{ matrix.name }}.tar.gz.sha256
+      - env: { GH_TOKEN: "${{ github.token }}" }
+        run: gh release upload "$GITHUB_REF_NAME" tokenstash-${{ matrix.name }}.tar.gz tokenstash-${{ matrix.name }}.tar.gz.sha256 --clobber
   npm:
     needs: build
     runs-on: ubuntu-latest
@@ -96,8 +104,14 @@ jobs:
         run: |
           if [ -n "$T" ]; then echo "publish=true" >> "$GITHUB_OUTPUT"; else echo "publish=false" >> "$GITHUB_OUTPUT"; echo "::notice::CARGO_REGISTRY_TOKEN not set; skipping crates.io"; fi
       - if: steps.gate.outputs.publish == 'true'
-        # core first; the CLI depends on the published version, so wait for the index.
+        # Token scopes: publish-new (first release of each crate) + publish-update. Each crate
+        # is skipped when this version is already on crates.io, so a re-run after a later job
+        # failed does not abort here. `cargo publish` blocks until the crate is in the index,
+        # so the CLI (which depends on the published core) can follow directly; it is not
+        # --locked because cargo rewrites the path dependency for the verification build.
         run: |
-          cargo publish -p tokenstash-core --locked
-          for i in $(seq 1 30); do cargo publish -p tokenstash --locked && break; echo "waiting for the index ($i)"; sleep 20; done
+          v="${GITHUB_REF_NAME#v}"
+          published() { curl -sf -H 'User-Agent: tokenstash-release (github.com/kgarg2468/tokenstash)' "https://crates.io/api/v1/crates/$1/$2" >/dev/null; }
+          published tokenstash-core "$v" || cargo publish -p tokenstash-core --locked
+          published tokenstash "$v" || cargo publish -p tokenstash
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }

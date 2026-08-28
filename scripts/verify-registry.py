@@ -41,7 +41,7 @@ import urllib.request
 from collections import defaultdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REGISTRY = os.path.join(HERE, os.pardir, "registry", "providers.json")
+REGISTRY = os.path.join(HERE, os.pardir, "crates", "core", "registry", "providers.json")
 
 # Not a credential for anything. Deliberately shaped like nothing.
 FAKE = "tokenstash-invalid-credential-000000000000"

@@ -1,5 +1,5 @@
 //! Provider registry: how to acquire a key for a given env var name.
-//! Embedded at build time from `crates/core/registry/providers.json` (linked from `registry/providers.json`); meant to move to its own repo.
+//! Embedded at build time from `crates/core/registry/providers.json`; meant to move to its own repo.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

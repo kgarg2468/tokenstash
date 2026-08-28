@@ -38,8 +38,8 @@ TS=${1:-}
 TS=$(cd "$(dirname "$TS")" && pwd)/$(basename "$TS")
 # what `current_exe` reports for a respawned inbox: the fully resolved path
 TS_REAL=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$TS")
-REPO_SKILL=$(cd "$(dirname "$0")/.." && pwd)/SKILL.md
-[ -f "$REPO_SKILL" ] || { echo "SKILL.md not found next to scripts/ (run from a checkout)" >&2; exit 2; }
+REPO_SKILL=$(cd "$(dirname "$0")/.." && pwd)/crates/cli/SKILL.md
+[ -f "$REPO_SKILL" ] || { echo "crates/cli/SKILL.md not found (run from a checkout)" >&2; exit 2; }
 shift
 AGENTS=("$@")
 if [ ${#AGENTS[@]} -eq 0 ]; then
