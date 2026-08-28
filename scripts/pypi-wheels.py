@@ -44,14 +44,14 @@ def pep440(version):
     return base if not kind else f"{base}{kind}{n}"
 
 def absolute_links(readme):
-    """PyPI does not resolve relative links; point them at the repository."""
-    def fix(m):
-        target = m.group(2)
-        if re.match(r"^(https?:|mailto:|#)", target):
-            return m.group(0)
+    """PyPI does not resolve relative links; point Markdown links and HTML href/src at the repository."""
+    def absolute(target):
+        if re.match(r"^(https?:|mailto:|#|data:)", target):
+            return target
         kind = "raw" if re.search(r"\.(png|gif|svg|jpe?g)$", target) else "blob"
-        return f"{m.group(1)}{REPO}/{kind}/main/{target.lstrip('./')})"
-    return re.sub(r"(\]\()([^)\s]+)\)", fix, readme)
+        return f"{REPO}/{kind}/main/{target.lstrip('./')}"
+    readme = re.sub(r"(\]\()([^)\s]+)\)", lambda m: f"{m.group(1)}{absolute(m.group(2))})", readme)
+    return re.sub(r'((?:href|src)=")([^"]+)"', lambda m: f'{m.group(1)}{absolute(m.group(2))}"', readme)
 
 def metadata(version, readme):
     return (
