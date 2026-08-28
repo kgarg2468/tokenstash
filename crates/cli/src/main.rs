@@ -118,7 +118,7 @@ fn run(cli: Cli) -> Result<i32> {
             for p in tokenstash_core::registry::all() {
                 println!("{:<36} {:<22} {}{}", p.name, p.provider, p.url, if p.sensitive { "  [sensitive]" } else { "" });
             }
-            println!("\n{} providers. Add more: registry/providers.json", tokenstash_core::registry::count());
+            println!("\n{} providers. Add more: crates/core/registry/providers.json", tokenstash_core::registry::count());
             Ok(0)
         }
     }

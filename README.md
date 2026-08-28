@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/kgarg2468/tokenstash/releases/latest"><strong>Download</strong></a> ·
-  <a href="registry/providers.json"><strong>Provider registry</strong></a> ·
+  <a href="crates/core/registry/providers.json"><strong>Provider registry</strong></a> ·
   <a href="docs/registry-verification.md"><strong>Verification record</strong></a>
 </p>
 
@@ -78,7 +78,7 @@ flowchart LR
 | Index | SQLite (`rusqlite`, bundled) | Names, identities, projects, grants, tasks, audit log — metadata only, never a value |
 | Inbox | `tiny_http` bound to `127.0.0.1` | Two-scope session tokens, `HttpOnly; SameSite=Strict` cookie, CSRF double-submit, empty 404 for anything unauthenticated |
 | MCP | stdio JSON-RPC server | `secrets_request`, `secrets_list`, `secrets_report_invalid`, `human_request`, `task_check`, `task_list` |
-| Registry | `registry/providers.json` | 79 providers: signup URL, ordered steps, key pattern, optional liveness check |
+| Registry | `crates/core/registry/providers.json` | 79 providers: signup URL, ordered steps, key pattern, optional liveness check |
 | Validation | `validate.rs` over `ureq` | Prefix check at paste time, cheap liveness call, `reject_status` for providers that do not spell auth failure `401` |
 | Portability | argon2 + chacha20poly1305 | `export` / `import`: one passphrase-encrypted bundle moves a stash between machines |
 | Release | GitHub Actions on `v*` tags | Four platform binaries, sha256 sidecars, Homebrew formula |
@@ -153,7 +153,7 @@ Not a vault — use 1Password or Infisical; backends for them are a later step. 
 
 ## Adding a Provider
 
-[`registry/providers.json`](registry/providers.json) — one JSON object per key: name, provider, signup URL, ordered steps, key pattern, optional liveness check. PRs welcome; that file is the whole product's breadth. See [CONTRIBUTING.md](CONTRIBUTING.md) and the verification standard in [`docs/registry-verification.md`](docs/registry-verification.md).
+[`crates/core/registry/providers.json`](crates/core/registry/providers.json) — one JSON object per key: name, provider, signup URL, ordered steps, key pattern, optional liveness check. PRs welcome; that file is the whole product's breadth. See [CONTRIBUTING.md](CONTRIBUTING.md) and the verification standard in [`docs/registry-verification.md`](docs/registry-verification.md).
 
 ## License
 
