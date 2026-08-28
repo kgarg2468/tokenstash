@@ -59,28 +59,24 @@ jobs:
       - env: { GH_TOKEN: "${{ github.token }}" }
         run: gh release upload "$GITHUB_REF_NAME" tokenstash-${{ matrix.name }}.tar.gz tokenstash-${{ matrix.name }}.tar.gz.sha256 --clobber
   npm:
+    # Five packages: four platform packages (binary only, `os`/`cpu` pinned, no scripts) and
+    # the `tokenstash` launcher that lists them as optionalDependencies. No postinstall, so
+    # bun / pnpm 10 / --ignore-scripts installs work. Publishes with npm trusted publishing
+    # (OIDC, provenance automatic) once each package has its publisher configured; before
+    # that, NPM_TOKEN bootstraps. Without either, the job assembles and skips.
     needs: build
     runs-on: ubuntu-latest
+    permissions: { contents: write, id-token: write }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with: { node-version: 20, registry-url: "https://registry.npmjs.org" }
-      - name: embed release checksums in the package
-        # The npm tarball carries the expected digests, so a tampered GitHub asset cannot
-        # pass verification unless npm is compromised as well.
+        with: { node-version: 22, registry-url: "https://registry.npmjs.org" }
+      - run: npm install -g npm@latest && npm --version   # trusted publishing needs npm ≥ 11.5.1
+      - name: download release tarballs
         env: { GH_TOKEN: "${{ github.token }}" }
-        run: |
-          mkdir -p /tmp/sums && gh release download "$GITHUB_REF_NAME" --pattern '*.sha256' --dir /tmp/sums
-          python3 - <<'PY'
-          import json, glob, os
-          sums = {}
-          for f in glob.glob('/tmp/sums/*.sha256'):
-              digest = open(f).read().split()[0]
-              sums[os.path.basename(f)[:-len('.sha256')]] = digest
-          assert len(sums) == 4, sums
-          json.dump(sums, open('npm/checksums.json', 'w'), indent=2)
-          PY
-          cat npm/checksums.json
+        run: gh release download "$GITHUB_REF_NAME" --pattern 'tokenstash-*.tar.gz' --dir /tmp/dist
+      - name: assemble
+        run: scripts/npm-package.sh "${GITHUB_REF_NAME#v}" /tmp/dist /tmp/npm-out
       - name: brew formula
         # Generated from the same release digests; paste into the tap repo
         # (kgarg2468/homebrew-tokenstash, Formula/tokenstash.rb) or let a later job push it.
@@ -90,13 +86,12 @@ jobs:
           cat tokenstash.rb
           gh release upload "$GITHUB_REF_NAME" tokenstash.rb --clobber
       - name: npm publish gate
-        # No NPM_TOKEN secret → the release still ships binaries + formula, npm is just skipped.
         id: gate
-        env: { T: "${{ secrets.NPM_TOKEN }}" }
+        env: { T: "${{ secrets.NPM_TOKEN }}", OIDC: "${{ vars.NPM_TRUSTED_PUBLISHING }}" }
         run: |
-          if [ -n "$T" ]; then echo "publish=true" >> "$GITHUB_OUTPUT"; else echo "publish=false" >> "$GITHUB_OUTPUT"; echo "::notice::NPM_TOKEN not set; skipping npm publish"; fi
+          if [ -n "$T" ] || [ "$OIDC" = "true" ]; then echo "publish=true" >> "$GITHUB_OUTPUT"; else echo "publish=false" >> "$GITHUB_OUTPUT"; echo "::notice::neither NPM_TOKEN nor NPM_TRUSTED_PUBLISHING set; npm skipped"; fi
       - if: steps.gate.outputs.publish == 'true'
-        run: cd npm && npm version ${GITHUB_REF_NAME#v} --no-git-tag-version && npm publish --access public
+        run: NPM_PUBLISH=1 scripts/npm-package.sh "${GITHUB_REF_NAME#v}" /tmp/dist /tmp/npm-out
         env: { NODE_AUTH_TOKEN: "${{ secrets.NPM_TOKEN }}" }
   crates:
     # Gated on CARGO_REGISTRY_TOKEN (crates.io trusted publishing is not used here). Without
