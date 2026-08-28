@@ -1,6 +1,6 @@
 # Registry verification, 2026-08-24
 
-`registry/providers.json` was written from memory and had never been checked
+`crates/core/registry/providers.json` was written from memory and had never been checked
 against the world it describes. This is the record of checking it. Every row was
 produced by an actual HTTP request, not by recollection; where a request could
 not settle the question, the row says UNVERIFIED and says why.

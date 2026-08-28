@@ -18,7 +18,7 @@
 - On-disk equivalence: a copy that brought its `.env.local` along needs no card for that delivery; it grants nothing further, and rotation never follows it.
 - A directory deleted and re-created at the same path is detected (inode + birth time) and pairs again.
 - Every delivery is audited with the grant that allowed it (`tokenstash audit`, `--json`).
-- Linux binaries are static (musl) and run on any distribution; the 0.1 builds required glibc ≥ 2.39. The crates (`tokenstash`, `tokenstash-core`) package correctly for `cargo install tokenstash`.
+- Linux binaries are static (musl) and run on any distribution (DNS goes through musl's resolver: `/etc/resolv.conf` only, no NSS/mDNS); the 0.1 builds required glibc ≥ 2.39. The crates (`tokenstash`, `tokenstash-core`) now package correctly, so `cargo install tokenstash` works once they are on crates.io.
 - MCP results carry per-outcome `next` guidance; blocking calls are capped at 30 s; keys are re-verified with their provider before delivery (`verify_every`); `tokenstash export`/`import`, `export --from-env`, rotation (`rotate`, `check`, `report-bad`).
 
 ## 0.1.0

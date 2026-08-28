@@ -2,7 +2,7 @@
 
 ## Add a provider (the most useful PR)
 
-`registry/providers.json` (a link to `crates/core/registry/providers.json`, which the binary embeds) is what lets an agent get a key it has never seen before. One object:
+`crates/core/registry/providers.json` is what lets an agent get a key it has never seen before. One object:
 
 ```json
 {
