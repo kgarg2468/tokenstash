@@ -20,15 +20,14 @@ if (!bin) {
     process.exit(1);
   }
 }
-// Signals. Ctrl-C reaches the whole foreground group, so the child (which may hold a masked
-// prompt in raw mode) gets SIGINT from the terminal itself: the launcher ignores its copy and
-// waits for the child to clean up. A supervisor stops a process by SIGTERM/SIGHUP to this
-// PID only, so those are forwarded. When the child dies by a signal, the launcher re-raises
-// it so callers see an interrupt, not exit 1.
+// Signals: every one the launcher receives is forwarded to the child, whether it came from
+// the terminal (Ctrl-C reaches the whole foreground group, so the child also gets it directly;
+// a second SIGINT is harmless to it) or from a supervisor that signals this PID only. The
+// launcher never exits before the child; when the child dies by a signal it is re-raised so
+// callers see an interrupt, not exit 1.
 const { spawn } = require("child_process");
 const child = spawn(bin, process.argv.slice(2), { stdio: "inherit" });
-process.on("SIGINT", () => {});
-for (const s of ["SIGTERM", "SIGHUP"]) process.on(s, () => child.kill(s));
+for (const s of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(s, () => child.kill(s));
 child.on("error", (e) => { console.error(`tokenstash: cannot run ${bin}: ${e.message}`); process.exit(1); });
 child.on("exit", (code, signal) => {
   if (signal) { process.removeAllListeners(signal); process.kill(process.pid, signal); }
