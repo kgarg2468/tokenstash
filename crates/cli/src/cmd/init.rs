@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tokenstash_core::Config;
 
-pub const SKILL_MD: &str = include_str!("../../../../SKILL.md");
+pub const SKILL_MD: &str = include_str!("../../SKILL.md");
 
 #[derive(Args)]
 pub struct InitArgs {

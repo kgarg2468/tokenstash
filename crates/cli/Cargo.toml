@@ -3,6 +3,10 @@ name = "tokenstash"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["api-keys", "secrets", "agents", "mcp", "claude-code"]
+categories = ["command-line-utilities", "development-tools"]
 description = "Your agent asks you for a key once. Never again — in any project, in any agent."
 
 [[bin]]
@@ -10,7 +14,7 @@ name = "tokenstash"
 path = "src/main.rs"
 
 [dependencies]
-tokenstash-core = { path = "../core" }
+tokenstash-core = { path = "../core", version = "0.2.0" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

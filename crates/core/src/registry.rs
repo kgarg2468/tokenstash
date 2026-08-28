@@ -1,11 +1,11 @@
 //! Provider registry: how to acquire a key for a given env var name.
-//! Embedded at build time from `registry/providers.json`; meant to move to its own repo.
+//! Embedded at build time from `crates/core/registry/providers.json` (linked from `registry/providers.json`); meant to move to its own repo.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-const RAW: &str = include_str!("../../../registry/providers.json");
+const RAW: &str = include_str!("../registry/providers.json");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
