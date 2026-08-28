@@ -9,8 +9,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: tag matches the workspace version
+        # v0.2.0 or v0.2.0-rc.1 (a pre-release dry run: npm/PyPI get the rc version, the
+        # binary still reports 0.2.0; crates and the tap are skipped for pre-releases).
+        run: |
+          tag="${GITHUB_REF_NAME#v}"; base="${tag%%-*}"
+          cargo=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          [ "$base" = "$cargo" ] || { echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo"; exit 1; }
       - env: { GH_TOKEN: "${{ github.token }}" }
-        run: gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --generate-notes --notes "See CHANGELOG.md for what changed and how the upgrade behaves."
+        run: |
+          pre=""; case "$GITHUB_REF_NAME" in *-*) pre="--prerelease" ;; esac
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" $pre --generate-notes --notes "See CHANGELOG.md for what changed and how the upgrade behaves."
   build:
     needs: release
     strategy:
@@ -92,7 +101,9 @@ jobs:
   crates:
     # Gated on CARGO_REGISTRY_TOKEN (crates.io trusted publishing is not used here). Without
     # the secret the job is skipped and `cargo install tokenstash` keeps working from --git.
+    # Never for a pre-release tag: Cargo.toml carries the final version.
     needs: build
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
