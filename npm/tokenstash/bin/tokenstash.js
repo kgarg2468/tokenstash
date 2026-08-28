@@ -3,7 +3,7 @@
 // through `optionalDependencies` + `os`/`cpu` — no lifecycle scripts, so package managers
 // that refuse dependency postinstalls (bun, pnpm ≥ 10, `npm ci --ignore-scripts`) still
 // get a working install. TOKENSTASH_BINARY overrides (brew/cargo installs, tests).
-const path = require("path"), { spawnSync } = require("child_process");
+const path = require("path");
 const platform = { darwin: "darwin", linux: "linux" }[process.platform];
 const arch = { x64: "x64", arm64: "arm64" }[process.arch];
 let bin = process.env.TOKENSTASH_BINARY;
@@ -20,11 +20,17 @@ if (!bin) {
     process.exit(1);
   }
 }
-// The terminal delivers Ctrl-C to the whole foreground group: let the child (which may hold
-// a masked prompt in raw mode) handle it and clean up; then re-raise its signal so callers
-// see an interrupt, not exit 1.
-for (const s of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(s, () => {});
-const r = spawnSync(bin, process.argv.slice(2), { stdio: "inherit" });
-if (r.error) { console.error(`tokenstash: cannot run ${bin}: ${r.error.message}`); process.exit(1); }
-if (r.signal) { process.removeAllListeners(r.signal); process.kill(process.pid, r.signal); }
-process.exit(r.status ?? 1);
+// Signals. Ctrl-C reaches the whole foreground group, so the child (which may hold a masked
+// prompt in raw mode) gets SIGINT from the terminal itself: the launcher ignores its copy and
+// waits for the child to clean up. A supervisor stops a process by SIGTERM/SIGHUP to this
+// PID only, so those are forwarded. When the child dies by a signal, the launcher re-raises
+// it so callers see an interrupt, not exit 1.
+const { spawn } = require("child_process");
+const child = spawn(bin, process.argv.slice(2), { stdio: "inherit" });
+process.on("SIGINT", () => {});
+for (const s of ["SIGTERM", "SIGHUP"]) process.on(s, () => child.kill(s));
+child.on("error", (e) => { console.error(`tokenstash: cannot run ${bin}: ${e.message}`); process.exit(1); });
+child.on("exit", (code, signal) => {
+  if (signal) { process.removeAllListeners(signal); process.kill(process.pid, signal); }
+  process.exit(code ?? 1);
+});
