@@ -122,7 +122,7 @@ Existing per-project approvals become grants automatically — for directories t
 npm install -g tokenstash      # or: bun add -g tokenstash · pnpm add -g tokenstash
 brew install kgarg2468/tokenstash/tokenstash
 uv tool install tokenstash     # or: pipx install tokenstash
-tokenstash init
+tokenstash init                # macOS and Linux; Windows is not supported yet
 ```
 
 The npm package is a launcher plus one prebuilt binary package per platform (`optionalDependencies`, no install scripts — bun and pnpm install it as-is). The PyPI wheels carry the same binary and no Python code. Prebuilt binaries for macOS (arm64, x64) and Linux (x64, arm64; static, any distribution), with sha256 sidecars, are attached to [the latest release](https://github.com/kgarg2468/tokenstash/releases/latest). From source: `cargo install --git https://github.com/kgarg2468/tokenstash tokenstash`.

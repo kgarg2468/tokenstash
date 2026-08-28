@@ -6,7 +6,7 @@ bit. macOS wheels are tagged per arch; Linux wheels carry manylinux + musllinux 
 
     scripts/pypi-wheels.py <version> <dir-with-tokenstash-*.tar.gz> <out-dir>
 """
-import base64, hashlib, io, os, sys, tarfile, zipfile
+import base64, hashlib, os, re, struct, sys, tarfile, zipfile
 
 # Linux binaries are static, so they need nothing from the platform: tag them for glibc
 # (manylinux_2_17 is the floor old pips accept) AND musl in one compressed tag set, the way
@@ -18,6 +18,40 @@ PLATFORMS = {
     "darwin-arm64": "macosx_11_0_arm64",
 }
 NAME = "tokenstash"
+REPO = "https://github.com/kgarg2468/tokenstash"
+
+# (magic check) → the tarball for a platform must hold a binary of that platform; the
+# fixtures used to test this script are identical across platforms, so nothing else would
+# catch a mix-up.
+def check_arch(name, blob):
+    ok = False
+    if name.startswith("linux") and blob[:4] == b"\x7fELF":
+        machine = struct.unpack("<H", blob[18:20])[0]
+        ok = machine == {"linux-x64": 0x3E, "linux-arm64": 0xB7}[name]
+    elif name.startswith("darwin") and blob[:4] == b"\xcf\xfa\xed\xfe":
+        cputype = struct.unpack("<I", blob[4:8])[0]
+        ok = cputype == {"darwin-x64": 0x01000007, "darwin-arm64": 0x0100000C}[name]
+    if not ok:
+        sys.exit(f"tokenstash-{name}.tar.gz does not contain a {name} binary")
+
+def pep440(version):
+    """Tag versions are semver (0.3.0-rc.1); wheels need PEP 440 (0.3.0rc1)."""
+    m = re.fullmatch(r"(\d+\.\d+\.\d+)(?:-(rc|a|b|alpha|beta)\.?(\d+))?", version)
+    if not m:
+        sys.exit(f"version {version!r} is not X.Y.Z or X.Y.Z-rc.N")
+    base, kind, n = m.groups()
+    kind = {"alpha": "a", "beta": "b"}.get(kind, kind)
+    return base if not kind else f"{base}{kind}{n}"
+
+def absolute_links(readme):
+    """PyPI does not resolve relative links; point them at the repository."""
+    def fix(m):
+        target = m.group(2)
+        if re.match(r"^(https?:|mailto:|#)", target):
+            return m.group(0)
+        kind = "raw" if re.search(r"\.(png|gif|svg|jpe?g)$", target) else "blob"
+        return f"{m.group(1)}{REPO}/{kind}/main/{target.lstrip('./')})"
+    return re.sub(r"(\]\()([^)\s]+)\)", fix, readme)
 
 def metadata(version, readme):
     return (
@@ -34,7 +68,7 @@ def metadata(version, readme):
         "Classifier: Environment :: Console\n"
         "Classifier: Topic :: Security\n"
         "Requires-Python: >=3.8\n"
-        "Description-Content-Type: text/markdown\n\n" + readme
+        "Description-Content-Type: text/markdown\n\n" + absolute_links(readme)
     )
 
 def build(version, src, out, readme, license_text):
@@ -42,7 +76,11 @@ def build(version, src, out, readme, license_text):
     for name, tag in PLATFORMS.items():
         tar = os.path.join(src, f"tokenstash-{name}.tar.gz")
         with tarfile.open(tar) as t:
-            binary = t.extractfile("tokenstash").read()
+            member = t.extractfile("tokenstash")
+            if member is None:
+                sys.exit(f"{tar} has no 'tokenstash' member")
+            binary = member.read()
+        check_arch(name, binary)
         distinfo = f"{NAME}-{version}.dist-info"
         data = f"{NAME}-{version}.data"
         files = [
@@ -73,4 +111,8 @@ def build(version, src, out, readme, license_text):
 if __name__ == "__main__":
     version, src, out = sys.argv[1:4]
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir)
-    build(version, src, out, open(os.path.join(root, "README.md")).read(), open(os.path.join(root, "LICENSE")).read())
+    with open(os.path.join(root, "README.md"), encoding="utf-8") as f:
+        readme = f.read()
+    with open(os.path.join(root, "LICENSE"), encoding="utf-8") as f:
+        license_text = f.read()
+    build(pep440(version), src, out, readme, license_text)
