@@ -1,0 +1,18 @@
+{
+  "name": "tokenstash",
+  "version": "0.2.0",
+  "description": "Your agent asks you for a key once. Never again — in any project, in any agent.",
+  "bin": { "tokenstash": "bin/tokenstash.js" },
+  "files": ["bin", "README.md", "LICENSE"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/kgarg2468/tokenstash.git" },
+  "homepage": "https://github.com/kgarg2468/tokenstash",
+  "keywords": ["api-keys", "secrets", "agents", "claude-code", "codex", "cursor", "mcp"],
+  "engines": { "node": ">=18" },
+  "optionalDependencies": {
+    "tokenstash-darwin-arm64": "0.2.0",
+    "tokenstash-darwin-x64": "0.2.0",
+    "tokenstash-linux-arm64": "0.2.0",
+    "tokenstash-linux-x64": "0.2.0"
+  }
+}
