@@ -61,38 +61,40 @@ jobs:
   npm:
     # Five packages: four platform packages (binary only, `os`/`cpu` pinned, no scripts) and
     # the `tokenstash` launcher that lists them as optionalDependencies. No postinstall, so
-    # bun / pnpm 10 / --ignore-scripts installs work. Publishes with npm trusted publishing
-    # (OIDC, provenance automatic) once each package has its publisher configured; before
-    # that, NPM_TOKEN bootstraps. Without either, the job assembles and skips.
+    # bun / pnpm 10 / --ignore-scripts installs work.
+    # Bootstrap (first release): npm trusted publishers can only be configured on packages
+    # that exist, so set NPM_TOKEN to a granular token (publish, bypass 2FA, short expiry).
+    # Then configure a trusted publisher on all five packages (this repo, release.yml), set
+    # the repo variable NPM_TRUSTED_PUBLISHING=true and delete NPM_TOKEN: OIDC with automatic
+    # provenance from then on. Never unpublish a version: name@version can never be reused
+    # and the launcher pins exact versions; ship a patch release instead.
     needs: build
     runs-on: ubuntu-latest
     permissions: { contents: write, id-token: write }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with: { node-version: 22, registry-url: "https://registry.npmjs.org" }
-      - run: npm install -g npm@latest && npm --version   # trusted publishing needs npm ≥ 11.5.1
+        with: { node-version: 22 }   # no registry-url: it would write an .npmrc with an empty _authToken and break OIDC
+      - run: npm install -g npm@11.17.0 && npm --version   # trusted publishing needs ≥ 11.5.1; pinned on purpose
       - name: download release tarballs
         env: { GH_TOKEN: "${{ github.token }}" }
         run: gh release download "$GITHUB_REF_NAME" --pattern 'tokenstash-*.tar.gz' --dir /tmp/dist
-      - name: assemble
-        run: scripts/npm-package.sh "${GITHUB_REF_NAME#v}" /tmp/dist /tmp/npm-out
-      - name: brew formula
-        # Generated from the same release digests; paste into the tap repo
-        # (kgarg2468/homebrew-tokenstash, Formula/tokenstash.rb) or let a later job push it.
-        env: { GH_TOKEN: "${{ github.token }}" }
-        run: |
-          bash scripts/brew-formula.sh "$GITHUB_REF_NAME" > tokenstash.rb
-          cat tokenstash.rb
-          gh release upload "$GITHUB_REF_NAME" tokenstash.rb --clobber
       - name: npm publish gate
         id: gate
         env: { T: "${{ secrets.NPM_TOKEN }}", OIDC: "${{ vars.NPM_TRUSTED_PUBLISHING }}" }
         run: |
-          if [ -n "$T" ] || [ "$OIDC" = "true" ]; then echo "publish=true" >> "$GITHUB_OUTPUT"; else echo "publish=false" >> "$GITHUB_OUTPUT"; echo "::notice::neither NPM_TOKEN nor NPM_TRUSTED_PUBLISHING set; npm skipped"; fi
-      - if: steps.gate.outputs.publish == 'true'
-        run: NPM_PUBLISH=1 scripts/npm-package.sh "${GITHUB_REF_NAME#v}" /tmp/dist /tmp/npm-out
-        env: { NODE_AUTH_TOKEN: "${{ secrets.NPM_TOKEN }}" }
+          if [ -n "$T" ]; then
+            echo "//registry.npmjs.org/:_authToken=$T" > ~/.npmrc; chmod 600 ~/.npmrc; echo "publish=true" >> "$GITHUB_OUTPUT"
+          elif [ "$OIDC" = "true" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"; echo "::notice::neither NPM_TOKEN nor NPM_TRUSTED_PUBLISHING set; npm skipped"
+          fi
+      - name: assemble (and publish when gated on)
+        env: { NPM_PUBLISH: "${{ steps.gate.outputs.publish == 'true' && '1' || '' }}" }
+        run: scripts/npm-package.sh "${GITHUB_REF_NAME#v}" /tmp/dist /tmp/npm-out
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with: { name: npm-packages, path: /tmp/npm-out, retention-days: 14 }
   crates:
     # Gated on CARGO_REGISTRY_TOKEN (crates.io trusted publishing is not used here). Without
     # the secret the job is skipped and `cargo install tokenstash` keeps working from --git.
