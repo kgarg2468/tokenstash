@@ -123,3 +123,41 @@ jobs:
           published tokenstash-core "$v" || cargo publish -p tokenstash-core --locked
           published tokenstash "$v" || cargo publish -p tokenstash
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
+  pypi:
+    # Wheels are the release tarballs repacked (binary under .data/scripts, no Python code):
+    # `pipx install tokenstash` / `uv tool install tokenstash`. Published with PyPI trusted
+    # publishing (a pending publisher for kgarg2468/tokenstash, release.yml, environment
+    # `pypi` creates the project on first use); no token. Skipped until that environment exists.
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions: { contents: read, id-token: write }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - env: { GH_TOKEN: "${{ github.token }}" }
+        run: gh release download "$GITHUB_REF_NAME" --pattern 'tokenstash-*.tar.gz' --dir /tmp/dist
+      - run: python3 scripts/pypi-wheels.py "${GITHUB_REF_NAME#v}" /tmp/dist dist
+      - uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with: { packages-dir: dist, verbose: true }
+  brew:
+    # Formula from the release digests, attached to the release and pushed to the tap
+    # (kgarg2468/homebrew-tokenstash). TAP_TOKEN: a fine-grained PAT with contents: write on the
+    # tap repo only; without it the formula is still attached to the release for a manual paste.
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          bash scripts/brew-formula.sh "$GITHUB_REF_NAME" > tokenstash.rb
+          cat tokenstash.rb
+          gh release upload "$GITHUB_REF_NAME" tokenstash.rb --clobber
+      - name: push to the tap
+        env: { TAP_TOKEN: "${{ secrets.TAP_TOKEN }}" }
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then echo "::notice::TAP_TOKEN not set; formula attached to the release only"; exit 0; fi
+          git clone -q "https://x-access-token:${TAP_TOKEN}@github.com/kgarg2468/homebrew-tokenstash.git" /tmp/tap
+          cp tokenstash.rb /tmp/tap/Formula/tokenstash.rb
+          cd /tmp/tap
+          git -c user.name=tokenstash-release -c user.email=noreply@github.com commit -qam "tokenstash $GITHUB_REF_NAME" || { echo "formula unchanged"; exit 0; }
+          git push -q origin HEAD
