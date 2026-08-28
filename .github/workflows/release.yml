@@ -126,9 +126,12 @@ jobs:
   pypi:
     # Wheels are the release tarballs repacked (binary under .data/scripts, no Python code):
     # `pipx install tokenstash` / `uv tool install tokenstash`. Published with PyPI trusted
-    # publishing (a pending publisher for kgarg2468/tokenstash, release.yml, environment
-    # `pypi` creates the project on first use); no token. Skipped until that environment exists.
+    # publishing: a pending publisher for kgarg2468/tokenstash, workflow release.yml,
+    # environment `pypi`, creates the project on first use; no token. Gated on the repo
+    # variable PYPI_TRUSTED_PUBLISHING=true so the run stays green until that is configured
+    # (GitHub creates the environment on first reference, so the environment is no gate).
     needs: build
+    if: ${{ vars.PYPI_TRUSTED_PUBLISHING == 'true' }}
     runs-on: ubuntu-latest
     environment: pypi
     permissions: { contents: read, id-token: write }
@@ -137,27 +140,35 @@ jobs:
       - env: { GH_TOKEN: "${{ github.token }}" }
         run: gh release download "$GITHUB_REF_NAME" --pattern 'tokenstash-*.tar.gz' --dir /tmp/dist
       - run: python3 scripts/pypi-wheels.py "${GITHUB_REF_NAME#v}" /tmp/dist dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with: { name: wheels, path: dist, retention-days: 14 }
       - uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
-        with: { packages-dir: dist, verbose: true }
+        with: { packages-dir: dist, verbose: true, skip-existing: true }
   brew:
     # Formula from the release digests, attached to the release and pushed to the tap
-    # (kgarg2468/homebrew-tokenstash). TAP_TOKEN: a fine-grained PAT with contents: write on the
-    # tap repo only; without it the formula is still attached to the release for a manual paste.
+    # (kgarg2468/homebrew-tokenstash — must be public). TAP_TOKEN: a fine-grained PAT with
+    # contents: write on the tap repo only; without it the formula is still attached to the
+    # release for a manual paste. Never for a pre-release tag.
     needs: build
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - env: { GH_TOKEN: "${{ github.token }}" }
         run: |
           bash scripts/brew-formula.sh "$GITHUB_REF_NAME" > tokenstash.rb
+          ruby -c tokenstash.rb
           cat tokenstash.rb
           gh release upload "$GITHUB_REF_NAME" tokenstash.rb --clobber
       - name: push to the tap
         env: { TAP_TOKEN: "${{ secrets.TAP_TOKEN }}" }
+        # The token travels in a header, never in the remote URL or on disk.
         run: |
           if [ -z "$TAP_TOKEN" ]; then echo "::notice::TAP_TOKEN not set; formula attached to the release only"; exit 0; fi
-          git clone -q "https://x-access-token:${TAP_TOKEN}@github.com/kgarg2468/homebrew-tokenstash.git" /tmp/tap
-          cp tokenstash.rb /tmp/tap/Formula/tokenstash.rb
-          cd /tmp/tap
-          git -c user.name=tokenstash-release -c user.email=noreply@github.com commit -qam "tokenstash $GITHUB_REF_NAME" || { echo "formula unchanged"; exit 0; }
-          git push -q origin HEAD
+          auth="AUTHORIZATION: bearer $TAP_TOKEN"
+          git -c http.extraheader="$auth" clone -q --depth 1 https://github.com/kgarg2468/homebrew-tokenstash.git /tmp/tap
+          mkdir -p /tmp/tap/Formula && cp tokenstash.rb /tmp/tap/Formula/tokenstash.rb
+          cd /tmp/tap && git add Formula/tokenstash.rb
+          if git diff --cached --quiet; then echo "formula unchanged"; exit 0; fi
+          git -c user.name=tokenstash-release -c user.email=noreply@github.com commit -qm "tokenstash $GITHUB_REF_NAME"
+          git -c http.extraheader="$auth" push -q origin HEAD
