@@ -242,17 +242,6 @@ JTID=$("$TS" tasks --json | python3 -c "import json,sys;print([t for t in json.l
 curl -fsS -b "$JAR" -o "$WEB/jslink.html" "http://127.0.0.1:$PORT/t/$JTID"
 grep -qi "javascript:" "$WEB/jslink.html" && { echo "FAIL: an agent-supplied javascript: link reached the page"; exit 1; }
 
-# an agent cannot approve its own card from the shell either — the CLI path has the same
-# guard the paste-scope session does
-"$TS" need STRIPE_SECRET_KEY --agent ci --why "self-approve test" >"$OUT/need-appr.txt" 2>&1 || true
-ATID=$("$TS" tasks --json | python3 -c "import json,sys;print([t for t in json.load(sys.stdin) if t.get('kind')=='approval'][0]['id'])" 2>/dev/null || true)
-if [ -n "${ATID:-}" ]; then
-  TOKENSTASH_AGENT=claude-code "$TS" answer "$ATID" --allow >"$OUT/self-approve.txt" 2>&1 && { echo "FAIL: an agent approved its own card"; exit 1; }
-  grep -q "person at a terminal" "$OUT/self-approve.txt" || { echo "FAIL: the refusal does not explain itself"; cat "$OUT/self-approve.txt"; exit 1; }
-  "$TS" tasks --json | python3 -c "import json,sys;sys.exit(0 if [t for t in json.load(sys.stdin) if t['id']=='$ATID' and t['status']=='pending'] else 1)" \
-    || { echo "FAIL: the refused approval changed the card"; exit 1; }
-fi
-
 # the real thing
 GOOD="sk-GOODCANARY-$(date +%s)-0123456789abcdef"
 curl -fsS -c "$JAR" -b "$JAR" -L -o "$WEB/answered.html" \
@@ -283,6 +272,19 @@ UNTRUSTED="$(mktemp -d)/untrusted"; mkdir -p "$UNTRUSTED"
 (cd "$UNTRUSTED" && "$TS" need EVIL_TARGET_KEY --agent ci) >"$OUT/need-untrusted.txt" 2>&1 || true
 ATID=$("$TS" tasks --all --json | python3 -c "import json,sys;l=[t for t in json.load(sys.stdin) if t.get('kind')=='approval' and t['status']=='pending'];print(l[0]['id'] if l else '')")
 [ -n "$ATID" ] || { echo "FAIL: a stash hit in an unpaired directory did not create an approval card"; sed -n 1,5p "$OUT/need-untrusted.txt"; exit 1; }
+# The CLI has the same guard the paste-scope link does: an agent with a shell can read this
+# card's id out of `tasks --json`, so `answer --allow` must refuse it. (Not a boundary on its
+# own — an agent that scrubs its env and allocates a PTY looks like a person — which is why
+# the token scope above is the real control and this is the second lock on the same door.)
+TOKENSTASH_AGENT=claude-code "$TS" answer "$ATID" --allow >"$OUT/self-approve.txt" 2>&1 \
+  && { echo "FAIL: an agent approved its own card from the shell"; exit 1; }
+grep -q "person at a terminal" "$OUT/self-approve.txt" || { echo "FAIL: the refusal does not explain itself"; cat "$OUT/self-approve.txt"; exit 1; }
+TOKENSTASH_AGENT=claude-code "$TS" answer "$ATID" --allow-broad >>"$OUT/self-approve.txt" 2>&1 \
+  && { echo "FAIL: an agent granted itself broadly from the shell"; exit 1; }
+"$TS" tasks --all --json | ATID="$ATID" python3 -c "import json,sys,os;sys.exit(0 if [t for t in json.load(sys.stdin) if t['id']==os.environ['ATID'] and t['status']=='pending'] else 1)" \
+  || { echo "FAIL: the refused approval changed the card"; exit 1; }
+grep -q "EVIL_TARGET_KEY=" "$UNTRUSTED/.env.local" 2>/dev/null && { echo "FAIL: a refused CLI approval injected a key"; exit 1; }
+
 curl -fsS -c "$PJAR" -b "$PJAR" -L -o "$WEB/paste-approval.html" "http://127.0.0.1:$PORT/t/$ATID"
 grep -q "value=allow" "$WEB/paste-approval.html" && { echo "FAIL: the paste-scope session was offered an Allow button"; exit 1; }
 grep -q "full inbox session" "$WEB/paste-approval.html" || { echo "FAIL: the paste-scope approval page does not explain how to get the full session"; exit 1; }

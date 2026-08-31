@@ -758,6 +758,17 @@ impl Db {
         Ok(n == 1)
     }
 
+    /// Undo a claim that could not be completed. The card is claimed before the value is
+    /// stored (so a racing answer cannot overwrite the winner); if storing then fails,
+    /// leaving the card "answered" would tell the human it is done when nothing was kept.
+    pub fn reopen_task(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET status='pending', answered_at=NULL WHERE id=?1 AND status='answered'",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     pub fn set_task_status(&self, id: &str, status: TaskStatus, note: Option<&str>) -> Result<()> {
         self.conn.execute(
             "UPDATE tasks SET status=?2, answered_at=?3, note=COALESCE(?4, note) WHERE id=?1",

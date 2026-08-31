@@ -458,7 +458,12 @@ pub fn store_and_inject(
             bail!("task {tid} was answered somewhere else while this was in flight; nothing was stored");
         }
     }
-    ctx.stash.set(&stash_key(name, identity), value)?;
+    if let Err(e) = ctx.stash.set(&stash_key(name, identity), value) {
+        if let Some(tid) = answering_task {
+            let _ = ctx.db.reopen_task(tid);
+        }
+        return Err(e).context("storing the value");
+    }
     let pid = project.to_string_lossy().to_string();
     let tx = ctx.db.conn.unchecked_transaction()?;
     ctx.db.upsert_secret(&crate::db::SecretMeta {
@@ -577,7 +582,28 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, decision: Decision, seen: Option<
             continue;
         }
         let (n, identity) = split_identity(entry);
-        if let Some(v) = ctx.stash.get(&stash_key(n, identity))? {
+        // A card can gate a key that does not exist yet: a `run`-derived request for a
+        // generatable name is approved *before* anything is generated, so the stash is
+        // empty here. Approving is the human saying yes to the delivery — generate it now,
+        // or the card would be answered and nothing would ever arrive.
+        let stashed = ctx.stash.get(&stash_key(n, identity))?;
+        let stashed = match stashed {
+            Some(v) => Some(v),
+            None => match registry::lookup(n).and_then(|p| p.generate.clone()) {
+                Some(spec) if project.is_dir() => match crate::need::generate(&spec) {
+                    Some(v) => {
+                        match store_and_inject(ctx, n, identity, &v, registry::lookup(n).map(|p| p.provider.clone()), None, false, project, &task.agent, None, Verified::Unknown, crate::db::GRANT_GENERATED) {
+                            Ok(_) => injected.push(n.to_string()),
+                            Err(e) => failures.push(format!("{n}: {e:#}")),
+                        }
+                        None // delivered here; the loop below is for stashed values
+                    }
+                    None => { failures.push(format!("{n}: could not generate a value")); None }
+                },
+                _ => None,
+            },
+        };
+        if let Some(v) = stashed {
             if project.is_dir() {
                 // The approval is the authorization; delivery still verifies on use. A key
                 // the provider rejects becomes a Replace card for this project instead of
