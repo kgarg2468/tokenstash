@@ -1,6 +1,6 @@
 # tokenstash agent conformance — 2026-08-27T20:46Z
 
-binary: /home/kg/projects/token-cache/target/release/tokenstash (tokenstash 0.2.0)
+binary: <repo>/target/release/tokenstash (tokenstash 0.2.0)
 revision: 7706e01
 - codex: codex-cli 0.149.0 (model: codex default)
 

@@ -1,0 +1,15 @@
+# Security updates for the two things that reach users: what the binary links, and what
+# the release workflow runs. Monthly, grouped, so this stays a signal rather than noise.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule: { interval: monthly }
+    open-pull-requests-limit: 5
+    groups:
+      cargo: { patterns: ["*"] }
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule: { interval: monthly }
+    groups:
+      actions: { patterns: ["*"] }

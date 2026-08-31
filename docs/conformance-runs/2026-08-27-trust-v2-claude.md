@@ -1,6 +1,6 @@
 # tokenstash agent conformance — 2026-08-27T20:45Z
 
-binary: /home/kg/projects/token-cache/target/release/tokenstash (tokenstash 0.2.0)
+binary: <repo>/target/release/tokenstash (tokenstash 0.2.0)
 revision: 7706e01
 - claude: 2.1.241 (Claude Code) (skill: this checkout's SKILL.md, project-level; ~/.claude/skills/tokenstash also present)
 
