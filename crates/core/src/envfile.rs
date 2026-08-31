@@ -128,6 +128,27 @@ fn upsert(project: &Path, env_file: &str, name: &str, value: &SecretString, path
     Ok(path)
 }
 
+/// The value this project's env file already holds for NAME, if it can be trusted to be
+/// ours to read: a regular file (no symlink redirect), owned by this user, and not tracked
+/// by git. Used to adopt a value rather than overwrite it — never to authorise a delivery,
+/// which is [`crate::trust::on_disk_equivalent`]'s job.
+pub fn read_value(project: &Path, env_file: &str, name: &str) -> Option<SecretString> {
+    let path = resolve(project, env_file).ok()?;
+    let md = fs::symlink_metadata(&path).ok()?;
+    if !md.is_file() || is_git_tracked(project, &path) {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if md.uid() != unsafe { libc_geteuid() } {
+            return None;
+        }
+    }
+    let text = fs::read_to_string(&path).ok()?;
+    text.lines().filter_map(parse_line).find(|(k, _)| k == name).map(|(_, v)| SecretString::from(v))
+}
+
 /// Does the env file already contain NAME= ?
 pub fn has(project: &Path, env_file: &str, name: &str) -> bool {
     let Ok(path) = resolve(project, env_file) else { return false };

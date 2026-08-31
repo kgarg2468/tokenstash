@@ -50,7 +50,7 @@ impl Outcome {
 }
 
 /// Auto-generate local secrets (session secrets etc.) instead of asking a human.
-fn generate(spec: &str) -> Option<SecretString> {
+pub(crate) fn generate(spec: &str) -> Option<SecretString> {
     use rand::RngCore;
     let (kind, n) = spec.split_once(':')?;
     let n: usize = n.parse().ok()?;
@@ -239,6 +239,17 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
             if opts.require_approval {
                 once.push(format!("{name}@{identity}"));
                 outcomes.push(Outcome::Pending { name: name.clone(), identity: identity.clone(), task_id: String::new(), title: String::new(), url: None });
+                continue;
+            }
+            // Adopt before generating. This project's env file may already hold a value
+            // under this name — one an earlier tokenstash generated under the old shared
+            // identity, or one the human wrote by hand. Minting a new one would overwrite
+            // it: every session signed with the old JWT_SECRET becomes invalid, and
+            // anything encrypted with the old ENCRYPTION_KEY becomes unreadable.
+            if let Some(existing) = crate::envfile::read_value(project, &ctx.cfg.env_file, name) {
+                tasks::store_and_inject(ctx, name, &identity, &existing, provider.map(|p| p.provider.clone()), None, false, project, agent, None, tasks::Verified::Unknown, crate::db::GRANT_ON_DISK)?;
+                ctx.db.audit(Some(&pid), Some(agent), "adopt.generated", Some(name), Some(&identity), Some("kept the value this project's env file already held instead of generating a new one"))?;
+                outcomes.push(Outcome::Injected { name: name.clone(), identity, written_to: project.join(&ctx.cfg.env_file).display().to_string(), generated: false, unverified: false });
                 continue;
             }
             if let Some(v) = generate(spec) {

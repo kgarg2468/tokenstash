@@ -2130,6 +2130,42 @@ fn generating_a_secret_still_needs_the_run_approval() {
         o => panic!("{o:?}"),
     }
     assert!(!proj.join(".env.local").exists(), "nothing generated before the human said yes");
+
+    // ...and saying yes completes it. The card gated a value that did not exist yet, so
+    // approving has to generate it — otherwise the card is answered and nothing arrives.
+    let card = db.list_tasks(Some(&proj.to_string_lossy()), true).unwrap().into_iter().next().unwrap();
+    tasks::answer_approval(&ctx, &card, tasks::Decision::Allow, Some(&card.names)).unwrap();
+    let text = std::fs::read_to_string(proj.join(".env.local")).unwrap();
+    let (k, v) = envfile::parse_line(text.lines().next().unwrap()).unwrap();
+    assert_eq!(k, "AUTH_SECRET");
+    assert!(v.len() >= 32, "a real generated value: {}", v.len());
+    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+/// Upgrading must not mint a new signing key over the one an application is already using:
+/// a value the project's env file already holds is adopted, not replaced.
+#[test]
+fn a_generated_secret_already_in_the_env_file_is_adopted_not_regenerated() {
+    let _g = env_lock();
+    let (home, proj) = v2_world("gen-adopt");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    // What a 0.2.0-or-earlier tokenstash left behind: the value in the env file, stored in
+    // the stash under the old shared identity, nothing under the per-project one.
+    let old_value = "kept-across-the-upgrade-0123456789";
+    std::fs::write(proj.join(".env.local"), format!("JWT_SECRET={old_value}
+")).unwrap();
+    stash.set(&stash::stash_key("JWT_SECRET", "default"), &SecretString::from(old_value.to_string())).unwrap();
+
+    let out = need::need(&ctx, &proj, "agent", &["JWT_SECRET".to_string()], &Default::default()).unwrap();
+    assert!(matches!(&out[0], need::Outcome::Injected { generated: false, .. }), "adopted, not generated: {:?}", out[0]);
+    let text = std::fs::read_to_string(proj.join(".env.local")).unwrap();
+    assert_eq!(envfile::parse_line(text.lines().next().unwrap()).unwrap().1, old_value, "the application's key is untouched");
+    // ...and it is now the project's own, so the next request is a plain hit.
+    let out = need::need(&ctx, &proj, "agent", &["JWT_SECRET".to_string()], &Default::default()).unwrap();
+    assert!(matches!(&out[0], need::Outcome::Injected { generated: false, .. }), "{:?}", out[0]);
     std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
 }
 
