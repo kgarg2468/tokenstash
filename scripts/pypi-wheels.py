@@ -18,7 +18,6 @@ PLATFORMS = {
     "darwin-arm64": "macosx_11_0_arm64",
 }
 NAME = "tokenstash"
-REPO = "https://github.com/kgarg2468/tokenstash"
 
 # (magic check) → the tarball for a platform must hold a binary of that platform; the
 # fixtures used to test this script are identical across platforms, so nothing else would
@@ -43,15 +42,12 @@ def pep440(version):
     kind = {"alpha": "a", "beta": "b"}.get(kind, kind)
     return base if not kind else f"{base}{kind}{n}"
 
-def absolute_links(readme):
-    """PyPI does not resolve relative links; point Markdown links and HTML href/src at the repository."""
-    def absolute(target):
-        if re.match(r"^(https?:|mailto:|#|data:)", target):
-            return target
-        kind = "raw" if re.search(r"\.(png|gif|svg|jpe?g)$", target) else "blob"
-        return f"{REPO}/{kind}/main/{target.lstrip('./')}"
-    readme = re.sub(r"(\]\()([^)\s]+)\)", lambda m: f"{m.group(1)}{absolute(m.group(2))})", readme)
-    return re.sub(r'((?:href|src)=")([^"]+)"', lambda m: f'{m.group(1)}{absolute(m.group(2))}"', readme)
+# One implementation, shared with the npm packager: two copies drifting apart is how one
+# registry ends up with working links and the other with 404s.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from importlib import import_module  # noqa: E402
+
+absolute_links = import_module("absolute-links").absolute_links
 
 def metadata(version, readme):
     return (

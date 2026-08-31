@@ -58,6 +58,11 @@ jobs:
           shasum -a 256 tokenstash-${{ matrix.name }}.tar.gz > tokenstash-${{ matrix.name }}.tar.gz.sha256
       - env: { GH_TOKEN: "${{ github.token }}" }
         run: gh release upload "$GITHUB_REF_NAME" tokenstash-${{ matrix.name }}.tar.gz tokenstash-${{ matrix.name }}.tar.gz.sha256 --clobber
+      # The same bytes, kept inside this run. Release assets are mutable by anyone holding
+      # contents: write, so publishing from them would let a clobber in the window between
+      # this upload and the npm/PyPI download ship an attacker's binary under our provenance.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with: { name: "binary-${{ matrix.name }}", path: "tokenstash-${{ matrix.name }}.tar.gz*", retention-days: 7 }
   npm:
     # Five packages: four platform packages (binary only, `os`/`cpu` pinned, no scripts) and
     # the `tokenstash` launcher that lists them as optionalDependencies. No postinstall, so
@@ -70,15 +75,15 @@ jobs:
     # and the launcher pins exact versions; ship a patch release instead.
     needs: build
     runs-on: ubuntu-latest
-    permissions: { contents: write, id-token: write }
+    permissions: { contents: read, id-token: write }   # publishes; never writes to the repo
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with: { node-version: 22 }   # no registry-url: it would write an .npmrc with an empty _authToken and break OIDC
       - run: npm install -g npm@11.17.0 && npm --version   # trusted publishing needs ≥ 11.5.1; pinned on purpose
-      - name: download release tarballs
-        env: { GH_TOKEN: "${{ github.token }}" }
-        run: gh release download "$GITHUB_REF_NAME" --pattern 'tokenstash-*.tar.gz' --dir /tmp/dist
+      - name: take the binaries from this run, not from the mutable release
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0 # v4
+        with: { pattern: "binary-*", merge-multiple: true, path: /tmp/dist }
       - name: npm publish gate
         id: gate
         env: { T: "${{ secrets.NPM_TOKEN }}", OIDC: "${{ vars.NPM_TRUSTED_PUBLISHING }}" }
@@ -102,6 +107,7 @@ jobs:
     needs: build
     if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
+    permissions: { contents: read }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
@@ -137,8 +143,9 @@ jobs:
     permissions: { contents: read, id-token: write }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - env: { GH_TOKEN: "${{ github.token }}" }
-        run: gh release download "$GITHUB_REF_NAME" --pattern 'tokenstash-*.tar.gz' --dir /tmp/dist
+      - name: take the binaries from this run, not from the mutable release
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0 # v4
+        with: { pattern: "binary-*", merge-multiple: true, path: /tmp/dist }
       - run: python3 scripts/pypi-wheels.py "${GITHUB_REF_NAME#v}" /tmp/dist dist
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with: { name: wheels, path: dist, retention-days: 14 }

@@ -21,7 +21,7 @@
   <img alt="Keychain" src="https://img.shields.io/badge/Storage-OS_keychain-BF6A2B?style=for-the-badge">
   <img alt="SQLite" src="https://img.shields.io/badge/Index-SQLite-2D2A26?style=for-the-badge&logo=sqlite&logoColor=white">
   <img alt="Providers" src="https://img.shields.io/badge/Registry-79_providers-BF6A2B?style=for-the-badge">
-  <img alt="Tests" src="https://img.shields.io/badge/Tests-99_passing-2D2A26?style=for-the-badge">
+  <a href="https://github.com/kgarg2468/tokenstash/actions/workflows/ci.yml"><img alt="Tests" src="https://github.com/kgarg2468/tokenstash/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Telemetry" src="https://img.shields.io/badge/Telemetry-none-BF6A2B?style=for-the-badge">
 </p>
 
@@ -39,10 +39,10 @@ tokenstash gives the agent one command instead. If the key is already in your st
 agent › tokenstash need OPENAI_API_KEY RESEND_API_KEY TAVUS_API_KEY
       ✓ OPENAI_API_KEY injected → .env.local
       ✓ RESEND_API_KEY injected → .env.local
-      ⏳ TAVUS_API_KEY pending — task t_7fa2 → http://127.0.0.1:7433/t/t_7fa2
+      ⏳ TAVUS_API_KEY pending — task t_7fa2 → http://127.0.0.1:7433/t/t_7fa2?t=…
 ```
 
-Works with Claude Code, Codex, Cursor, Gemini CLI, and anything that can run a shell command. MIT, local-only, no accounts, no telemetry, never in the request path.
+Works with Claude Code, Codex and Cursor (each measured by the conformance harness), with Gemini CLI also registered by `init`, and with anything that can run a shell command. MIT, local-only, no accounts, no telemetry, never in the request path.
 
 ## First Run
 
@@ -74,7 +74,7 @@ flowchart LR
 | Layer | Stack | Role |
 | --- | --- | --- |
 | CLI | Rust 2021, clap 4 | `need` is the whole product surface an agent touches |
-| Stash | `keyring` 3, OS-native | macOS Keychain, Windows Credential Manager, Linux Secret Service, kernel-keyring fallback; `insecure-file` is CI-only and warns |
+| Stash | `keyring` 3, OS-native | macOS Keychain, Linux Secret Service, kernel-keyring fallback (Windows Credential Manager is supported by the library but no Windows binary ships yet); `insecure-file` is CI-only and warns |
 | Index | SQLite (`rusqlite`, bundled) | Names, identities, projects, grants, tasks, audit log — metadata only, never a value |
 | Inbox | `tiny_http` bound to `127.0.0.1` | Two-scope session tokens, `HttpOnly; SameSite=Strict` cookie, CSRF double-submit, empty 404 for anything unauthenticated |
 | MCP | stdio JSON-RPC server | `secrets_request`, `secrets_list`, `secrets_report_invalid`, `human_request`, `task_check`, `task_list` |
@@ -107,10 +107,14 @@ flowchart TD
 | Can an agent get a credential without pasting it into a chat? | Yes. `need` is the only path, and it returns an exit code, not a value. Values go clipboard → keychain → env file and are never rendered anywhere the model can read them. |
 | Does "never leaks" mean anything mechanically? | Yes. [`scripts/leak-test.sh`](scripts/leak-test.sh) drives the real binary with a canary secret and asserts the canary appears in none of stdout, stderr, the SQLite index, the config, the audit log, or MCP output — a black-box test, not an inspection of the code that was supposed to redact. |
 | Is loopback treated as authentication? | No, and that is the point. Every inbox request needs a 32-byte session token that arrives as `?t=` on the link you click and becomes an `HttpOnly; SameSite=Strict` cookie. Anything without one gets an empty 404. |
-| Can a model approve its own request? | No. The link an agent prints carries the **paste-scope** token: enough to answer a missing-key card, not enough to approve. The **full-scope** token reaches you only through channels you trigger — the notification, `tokenstash open`, your terminal. |
+| Can a model approve its own request? | No, by two independent paths. The link an agent prints carries the **paste-scope** token: enough to answer a missing-key card, not enough to approve. The **full-scope** token reaches you only through channels you trigger — the notification, `tokenstash open`, your terminal. And `tokenstash answer --allow`, which an agent with a shell could otherwise run, refuses unless a person is at the terminal — the same guard `rotate`, `check`, `bind`, `workspaces`, `export` and `import` use. |
 | Can a hostile repo get a key delivered just by asking for it? | No. Nothing is trusted by folder. The first time a directory asks for a stored key you see one card naming the directory, the file, and every key with its sensitivity — approve exactly those, "these plus any non-sensitive registry key here", or deny. A paste grants one key to one directory; sensitive and unregistered keys need their own yes per directory; a program's own output choosing a key asks every time. A copy that carries its own `.env.local` with the same value needs no card and gains no grant (non-sensitive registry keys; file yours, untracked, not a symlink). The MCP server binds one directory at startup — the one your agent opened — refuses to act for any other, and refuses `/`, your home, tool and shared temp dirs outright. `tokenstash workspaces` lists and revokes it all (values already written stay written); every delivery is audited with the grant that allowed it. |
 | Can a revoked key be caught before the agent burns a turn on a 401? | Usually. A key unchecked for a day is re-verified with its provider before delivery — one free, read-only request to the host your code already calls. A dead key becomes a "Replace" card; a provider outage just delivers the key unchecked. |
 | Is the provider registry actually true? | It was checked, row by row, by HTTP request rather than recollection — 18 dead URLs fixed, 5 checks corrected, 1 removed for being decoration, and the rows that could not be settled say so. The record is [`docs/registry-verification.md`](docs/registry-verification.md); reproduce it with [`scripts/verify-registry.py`](scripts/verify-registry.py). |
+
+## Security
+
+The guarantees, what is out of scope, and how to report something: [SECURITY.md](SECURITY.md). Two limits worth knowing before you install: an agent with a shell in a paired directory can read that directory's env file — delivery *is* that — and the desktop notification carries a full-scope inbox link, so your notification history is as trusted as your terminal (`notifications = false` turns it off).
 
 ## Upgrading from 0.1
 
@@ -130,6 +134,7 @@ The npm package is a launcher plus one prebuilt binary package per platform (`op
 `init` picks a keychain backend, registers the MCP server with the agents it finds, and installs a skill file so agents reach for it unprompted. It trusts no folder: directories pair once.
 
 - **You create every account.** tokenstash gets you to the right page with the right steps; it never signs up for you, never proxies an API, never reads another tool's credential store.
+- **Generated secrets belong to one project.** `JWT_SECRET` and friends are created by tokenstash, not pasted, and each directory gets its own — one application can never sign with another's key. If two directories must share one, paste it into both.
 - **Directories pair once.** The first time a directory asks for keys you already have, one card shows exactly which keys would go into which file; approve, and that directory is silent from then on. Keys tagged sensitive (live Stripe, AWS, service-role) and keys the registry does not know get their own card per directory; the broad button never covers them. Deny is remembered for a day. A directory deleted and re-created at the same path pairs again (`tokenstash workspaces` flags it). A copy that already carries the same value in its own `.env.local` needs no card for non-sensitive registry keys — the file must be yours, untracked and not a symlink; a wrong value there means a card, and no comparison for a day. Nothing is delivered — by CLI or MCP — into `/`, your home, `/tmp`, anything under tool or credential directories (`~/.ssh`, `~/.aws`, `~/.local`, `~/.claude`, …) or the directory holding the stash itself.
 - **Local secrets are generated, not requested.** `AUTH_SECRET`, `JWT_SECRET`, `SESSION_SECRET` never involve a human.
 - **Verification is tunable.** `verify_every = "24h" | "1h" | "always" | "never"` in `config.toml`; `always` is still at most once a minute per key. Probes that would cost quota, or whose provider cannot distinguish a bad key from a bad request, are never run unattended.

@@ -1,0 +1,4 @@
+disable_all_formatting = true
+# This codebase is formatted by hand: dense match arms and single-line guard clauses that
+# rustfmt would explode into 14k lines of diff. Making `cargo fmt` a no-op is how a
+# contributor finds that out in one second instead of one PR.
