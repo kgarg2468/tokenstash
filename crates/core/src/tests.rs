@@ -2391,3 +2391,65 @@ fn every_auth_style_is_sent_the_way_the_registry_says() {
     assert!(req.contains(&format!("/probe?key={raw}")), "{req}");
     assert!(!req.contains("Authorization"), "a query-auth probe sends no auth header: {req}");
 }
+
+/// The birth-time half of the directory fingerprint. Every existing test runs on a
+/// filesystem that hands out a fresh inode after a delete, so an implementation comparing
+/// only the inode passed all of them — and inode reuse is exactly what the birth time is
+/// there to catch.
+#[test]
+fn a_workspace_fingerprint_compares_more_than_the_inode() {
+    let _g = env_lock();
+    let home = tmp("fingerprint-home");
+    let proj = tmp("fingerprint-proj").canonicalize().unwrap();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let ws = db.workspace_for(&proj).unwrap();
+    assert!(ws.fingerprint_ok);
+    assert!(!ws.fingerprint_weak, "tmpfs/ext4 report a birth time; this test needs it");
+
+    // Same path, same inode, different birth time: a directory re-created fast enough to
+    // recycle the inode. It is not the one the human paired.
+    db.conn.execute("UPDATE workspaces SET btime='1999-01-01T00:00:00Z' WHERE id=?1", rusqlite::params![ws.id]).unwrap();
+    let seen = db.find_workspace(&proj).unwrap();
+    assert!(seen.is_none() || !seen.unwrap().fingerprint_ok, "a changed birth time must close the gate");
+
+    // ...and the device number is compared too, for the same reason across mounts.
+    db.conn.execute("UPDATE workspaces SET btime=NULL, dev=dev+1 WHERE id=?1", rusqlite::params![ws.id]).unwrap();
+    let seen = db.find_workspace(&proj).unwrap();
+    assert!(seen.is_none() || !seen.unwrap().fingerprint_ok, "a changed device must close the gate");
+}
+
+/// Two `need`s running at once (a CLI run and the MCP server) must both land in the env
+/// file. The upsert is read-modify-write, so without a lock the second rename drops the
+/// first key while both calls report success.
+#[test]
+fn concurrent_writes_keep_every_key() {
+    let dir = tmp("concurrent-env").canonicalize().unwrap();
+    let names: Vec<String> = (0..12).map(|i| format!("K{i}")).collect();
+    let handles: Vec<_> = names.iter().cloned().map(|name| {
+        let dir = dir.clone();
+        std::thread::spawn(move || {
+            envfile::write(&dir, ".env.local", &name, &SecretString::from(format!("value-of-{name}"))).unwrap();
+        })
+    }).collect();
+    for h in handles { h.join().unwrap(); }
+    let text = std::fs::read_to_string(dir.join(".env.local")).unwrap();
+    for name in &names {
+        let line = text.lines().find(|l| l.starts_with(&format!("{name}="))).unwrap_or_else(|| panic!("{name} was dropped:\n{text}"));
+        assert_eq!(envfile::parse_line(line).unwrap().1, format!("value-of-{name}"));
+    }
+    assert_eq!(text.lines().count(), names.len());
+}
+
+/// A human's own `export NAME=` line is replaced in place, not duplicated: two lines for one
+/// key means whichever the loader reads last wins, silently.
+#[test]
+fn an_export_line_is_upserted_not_duplicated() {
+    let dir = tmp("export-line").canonicalize().unwrap();
+    std::fs::write(dir.join(".env.local"), "# mine\nexport A_KEY=old\nOTHER=keep\nA_KEY_2=neighbour\n").unwrap();
+    envfile::write(&dir, ".env.local", "A_KEY", &SecretString::from("new-value".to_string())).unwrap();
+    let text = std::fs::read_to_string(dir.join(".env.local")).unwrap();
+    assert_eq!(text.matches("A_KEY=").count(), 1, "exactly one A_KEY line (A_KEY_2 is a different key):\n{text}");
+    assert!(text.contains("A_KEY=new-value"), "{text}");
+    assert!(!text.contains("export A_KEY="), "the export form is replaced, not left beside it:\n{text}");
+    assert!(text.contains("OTHER=keep") && text.contains("A_KEY_2=neighbour") && text.contains("# mine"), "{text}");
+}
