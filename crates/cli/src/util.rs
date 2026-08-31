@@ -176,6 +176,21 @@ pub fn approval_names(names: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// The guard every human-only command shares. An agent is refused on the environment
+    /// marker alone, whatever the streams look like.
+    #[test]
+    fn require_human_refuses_an_agent() {
+        let _g = crate::inbox_auth::env_lock();
+        std::env::set_var("TOKENSTASH_AGENT", "claude-code");
+        let e = require_human("answer --allow", "approving a card is your decision").unwrap_err();
+        std::env::remove_var("TOKENSTASH_AGENT");
+        let msg = format!("{e:#}");
+        assert!(msg.contains("person at a terminal"), "{msg}");
+        assert!(msg.contains("approving a card is your decision"), "the refusal says why: {msg}");
+        // And in a test process the streams are not a terminal either, so it refuses anyway.
+        assert!(require_human("answer --allow", "why").is_err());
+    }
+
     fn with_home<T>(name: &str, f: impl FnOnce(Config) -> T) -> T {
         let _g = crate::inbox_auth::env_lock();
         let home = std::env::temp_dir().join(format!("tokenstash-util-{name}-{}", std::process::id()));

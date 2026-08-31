@@ -99,10 +99,9 @@ pub fn validate_entry(e: &Entry) -> Result<()> {
     if !name_ok {
         bail!("entry name {:?} is not a valid variable name", e.name);
     }
-    let ident_ok = !e.identity.is_empty()
-        && e.identity.len() <= 64
-        && e.identity.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
-    if !ident_ok {
+    // One rule, shared with `need`: a bundle exported from one machine must import on
+    // another, and two definitions of "identity" drifting apart is how that breaks.
+    if !crate::need::valid_identity(&e.identity) {
         bail!("entry {} has an invalid identity {:?}", e.name, e.identity);
     }
     if e.value.chars().count() < crate::tasks::MIN_SECRET_CHARS || e.value.len() > 16 * 1024 {

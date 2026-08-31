@@ -79,7 +79,7 @@ pub fn project_identity(project: &Path) -> String {
     use sha2::{Digest, Sha256};
     let name: String = project
         .file_name()
-        .map(|n| n.to_string_lossy().chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')).take(24).collect())
+        .map(|n| n.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '-' }).take(24).collect())
         .unwrap_or_default();
     let name = if name.is_empty() { "project".to_string() } else { name };
     let digest = format!("{:x}", Sha256::digest(project.as_os_str().as_encoded_bytes()));
@@ -430,7 +430,7 @@ fn window(cfg: &crate::config::Config) -> chrono::Duration {
 pub fn valid_identity(identity: &str) -> bool {
     !identity.is_empty()
         && identity.len() <= 64
-        && identity.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && identity.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 pub fn valid_name(name: &str) -> bool {

