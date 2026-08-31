@@ -115,7 +115,7 @@ pub struct BindArgs {
 }
 
 pub fn bind(a: BindArgs) -> Result<i32> {
-    require_human("bind")?;
+    util::require_human("bind", "it decides which identity a project's keys come from")?;
     let app = App::open()?;
     let project = util::project_from(&a.project);
     let Some(ws) = app.db.find_workspace(&project)? else {
@@ -192,7 +192,7 @@ pub enum WorkspacesCmd {
 
 /// Human-only: this is the cross-project inventory the MCP surface deliberately hides.
 pub fn workspaces(a: WorkspacesArgs) -> Result<i32> {
-    require_human("workspaces")?;
+    util::require_human("workspaces", "it lists and revokes every directory you have paired")?;
     let app = App::open()?;
     match a.cmd.unwrap_or(WorkspacesCmd::List) {
         WorkspacesCmd::List => {
@@ -261,17 +261,6 @@ pub fn audit(a: AuditArgs) -> Result<i32> {
 
 // ---------- rotation ----------
 
-/// Human-only commands: a person at a terminal, not an agent. `rotate` asserts the human's
-/// intent on the card ("you asked to rotate it") and `check` sends every key to its provider
-/// and lists what you have; neither may be driven by a repo's instructions.
-fn require_human(what: &str) -> Result<()> {
-    use std::io::IsTerminal;
-    if !std::io::stdout().is_terminal() || tokenstash_core::project::detect_agent() != "unknown" {
-        bail!("`tokenstash {what}` is for a person at a terminal, not an agent. Run it yourself.");
-    }
-    Ok(())
-}
-
 /// The identity a name resolves to here, the way `need` resolves it: explicit flag, else
 /// the project's binding, else `default`. Without this a `--identity`-less command silently
 /// targets the wrong key in a project bound to `work`.
@@ -294,7 +283,7 @@ pub struct RotateArgs {
 /// Mark a key for replacement and file the paste card now. The old value stays in the
 /// stash until the new one lands; every project still holding it is rewritten then.
 pub fn rotate(a: RotateArgs) -> Result<i32> {
-    require_human("rotate")?;
+    util::require_human("rotate", "it asserts your intent on the card (\"you asked to rotate it\")")?;
     let app = App::open()?;
     let project = util::project_from(&a.project);
     let agent = "human".to_string();
@@ -360,7 +349,7 @@ pub fn check(a: CheckArgs) -> Result<i32> {
             bail!("`tokenstash check` is for a person at a terminal, not an agent. Run it yourself.");
         }
     } else {
-        require_human("check")?;
+        util::require_human("check", "it sends every key to its provider and lists what you have")?;
     }
     let app = App::open()?;
     let rows = sweep(&app, &a.names, a.stale_only, !a.json)?;

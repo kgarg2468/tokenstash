@@ -161,7 +161,8 @@ fn envfile_round_trips_adversarial_values() {
     let dir = tmp("envfile-rt");
     let cases = [
         "plain", "with space", "has#hash", "has\"quote", "back\\slash", "dollar$sign", "back`tick",
-        "single'quote", "=leading-eq", "trailing-eq=", " padded ", "uni-ключ", "multi\nline", "",
+        "single'quote", "=leading-eq", "trailing-eq=", " padded ", "uni-ключ", "multi\nline",
+        "-----BEGIN PRIVATE KEY-----\nMIIBVgIBADAN\n-----END PRIVATE KEY-----", "crlf\r\nvalue", "",
     ];
     for (i, v) in cases.iter().enumerate() {
         let name = format!("K{i}");
@@ -169,13 +170,19 @@ fn envfile_round_trips_adversarial_values() {
     }
     let s = std::fs::read_to_string(dir.join(".env.local")).unwrap();
     for (i, v) in cases.iter().enumerate() {
-        if v.contains('\n') { continue; } // newlines are not representable in a one-line grammar
         let line = s.lines().find(|l| l.starts_with(&format!("K{i}="))).unwrap_or_else(|| panic!("missing K{i}"));
         let (k, parsed) = envfile::parse_line(line).unwrap();
         assert_eq!(k, format!("K{i}"));
         assert_eq!(&parsed, v, "round trip failed for {v:?} (line: {line})");
     }
     assert!(!s.contains("export "), "we never emit export");
+    // One key per line, always: a value with a newline in it is escaped, not emitted raw.
+    // A raw newline would end the line for every one-line reader — including parse_line,
+    // which is what rotation uses to decide a project still holds the old value.
+    assert_eq!(s.lines().count(), cases.len(), "one line per key\n{s}");
+    for line in s.lines() {
+        assert!(envfile::parse_line(line).is_some(), "every line we write parses: {line}");
+    }
 }
 
 #[test]
@@ -805,6 +812,10 @@ fn a_git_dir_in_a_shared_ancestor_never_becomes_the_project_root() {
     assert!(written.starts_with(proj.canonicalize().unwrap()) || written.starts_with(&proj), "{}", written.display());
     assert!(!shared.join(".env.local").exists());
     assert!(!shared.join(".gitignore").exists(), "no ignore rule written into the shared ancestor");
+    // ...but the project is still inside a repo, so it gets the rule in its OWN .gitignore:
+    // the closest file wins, and writing nothing at all would leave the secret committable
+    // by a `git add -A` from the ancestor.
+    assert!(envfile::gitignore_covers(&std::fs::read_to_string(proj.join(".gitignore")).unwrap(), ".env.local"), "the project's own .gitignore covers the env file");
     // a normal, user-owned repo still resolves as before
     let repo = tmp("owned-repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
@@ -816,7 +827,8 @@ fn a_git_dir_in_a_shared_ancestor_never_becomes_the_project_root() {
     // suppressed, only adoption as a write root
     let _ = std::process::Command::new("git").arg("-C").arg(&shared).args(["init", "-q", "."]).status();
     std::fs::write(shared.join("proj/.env.local"), "OLD=1\n").unwrap();
-    let _ = std::process::Command::new("git").arg("-C").arg(&shared).args(["add", "proj/.env.local"]).env("GIT_AUTHOR_NAME","t").env("GIT_AUTHOR_EMAIL","t@t").status();
+    // -f: the project's own .gitignore now covers it, and this test needs it tracked anyway
+    let _ = std::process::Command::new("git").arg("-C").arg(&shared).args(["add", "-f", "proj/.env.local"]).env("GIT_AUTHOR_NAME","t").env("GIT_AUTHOR_EMAIL","t@t").status();
     assert!(envfile::is_git_tracked(&proj, &proj.join(".env.local")));
     assert!(envfile::write(&proj, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).is_err());
 }

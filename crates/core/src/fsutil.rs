@@ -55,6 +55,24 @@ pub fn write_atomic_private_bytes(path: &Path, contents: &[u8]) -> Result<()> {
 /// advisory lock on a sibling `<name>.lock`. The kernel releases it when the holder exits
 /// or dies, so there is no stale-lock heuristic and a live (even suspended) holder is
 /// never preempted — contenders simply wait.
+/// Serialise writers of a file we must not litter next to. `with_lock` puts the lock
+/// beside its target, which is right for tokenstash's own files but wrong for a file inside
+/// the user's project: `.env.lock` would show up in their working tree (and, unlike the env
+/// file, in no .gitignore). The lock lives in tokenstash's config dir instead, named after
+/// the target path so two processes writing the same env file agree on it.
+pub fn with_lock_elsewhere<T>(target: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(target.as_os_str().as_encoded_bytes());
+    let dir = crate::config::config_dir().join("locks");
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    }
+    with_lock(&dir.join(format!("{:x}", digest)), f)
+}
+
 pub fn with_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
     let lock_path = path.with_extension("lock");
     let mut opts = fs::OpenOptions::new();

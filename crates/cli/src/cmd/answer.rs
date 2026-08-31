@@ -82,6 +82,12 @@ pub fn answer(a: AnswerArgs) -> Result<i32> {
             }
         }
         TaskKind::Approval => {
+            // Approving is the human's decision and nothing else in the product. Without this
+            // an agent with a shell reads the card id out of `tokenstash tasks --json` and
+            // runs `answer <id> --allow-broad` to grant itself the human's keys — the exact
+            // thing the inbox's paste-scope token exists to prevent. Denying stays open: it
+            // can only close the agent's own request, never open one.
+            util::require_human("answer --allow", "approving a card is your decision, not an agent's")?;
             println!("{}", task.title);
             if let Some(w) = &task.why { println!("  {w}"); }
             println!("  keys: {}", crate::util::approval_names(&task.names).join(", "));

@@ -69,6 +69,56 @@ pub fn deadline(cfg: &Config) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+/// Everything on a card that an agent chose. The `agent` name is already narrowed to a
+/// label by [`crate::need::clean_agent`]; these are the fields that carry the card's meaning
+/// (title, why, steps) and must not be able to forge UI. Bidi overrides and zero-width
+/// characters can reorder or hide what the human reads, control characters can break the
+/// line the terminal renders, and unbounded text can push the real question off screen.
+/// HTML escaping happens at the inbox; this is the layer above it, and it also protects
+/// `tokenstash answer`, which has no escaping at all.
+pub fn clean_text(raw: &str, max: usize) -> String {
+    let out: String = raw
+        .chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(*c,
+                    '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+        })
+        .take(max)
+        .collect();
+    out.trim().to_string()
+}
+
+fn clean_text_opt(raw: Option<String>, max: usize) -> Option<String> {
+    let c = clean_text(raw.as_deref().unwrap_or_default(), max);
+    if c.is_empty() { None } else { Some(c) }
+}
+
+/// A link an agent supplied. The inbox renders it as an `href` the human clicks, so the
+/// scheme is an allowlist: `javascript:` there would run in the inbox's own origin — the
+/// origin holding the session that approves grants. Whitespace and control characters are
+/// refused outright rather than stripped: a URL that needed cleaning is not one to trust.
+pub fn clean_url(raw: Option<String>) -> Option<String> {
+    let u = raw?;
+    let u = u.trim();
+    if u.len() > MAX_URL_CHARS || u.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+    let lower = u.to_ascii_lowercase();
+    (lower.starts_with("https://") || lower.starts_with("http://")).then(|| u.to_string())
+}
+
+/// Caps for what an agent may put on a card.
+pub const MAX_TITLE_CHARS: usize = 120;
+pub const MAX_WHY_CHARS: usize = 300;
+pub const MAX_STEP_CHARS: usize = 200;
+pub const MAX_STEPS: usize = 8;
+pub const MAX_URL_CHARS: usize = 300;
+
+fn clean_steps(steps: &[String]) -> Vec<String> {
+    steps.iter().map(|s| clean_text(s, MAX_STEP_CHARS)).filter(|s| !s.is_empty()).take(MAX_STEPS).collect()
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct SecretRequest {
     pub why: Option<String>,
@@ -111,9 +161,13 @@ fn create_secret_task_kind(ctx: &Ctx, project: &Path, agent: &str, name: &str, i
         name: Some(name.into()),
         identity: identity.into(),
         title,
-        why: req.why.clone(),
-        url: req.url.clone().or_else(|| p.map(|p| p.url.clone())),
-        steps: if !req.steps.is_empty() { req.steps.clone() } else { p.map(|p| p.steps.clone()).unwrap_or_default() },
+        why: clean_text_opt(req.why.clone(), MAX_WHY_CHARS),
+        // The registry's link wins over the agent's. Otherwise an agent requesting a key it
+        // knows the human has can point "Open openai.com ↗" at its own lookalike page, in
+        // the one flow where the human is about to produce a live credential. An agent link
+        // survives only for a name no provider claims, where it is the only link there is.
+        url: p.map(|p| p.url.clone()).or_else(|| clean_url(req.url.clone())),
+        steps: if !req.steps.is_empty() { clean_steps(&req.steps) } else { p.map(|p| p.steps.clone()).unwrap_or_default() },
         expects: expects.into(),
         pattern: req.pattern.clone().or_else(|| p.and_then(|p| p.pattern.clone())),
         names: vec![],
@@ -259,16 +313,21 @@ pub struct HumanRequest {
 
 pub fn create_human_task(ctx: &Ctx, project: &Path, agent: &str, req: HumanRequest) -> Result<Task> {
     let pid = project.to_string_lossy().to_string();
+    // Clean before the dedup comparison below, not after: the stored card holds the cleaned
+    // text, so comparing raw request text against it would never match and every repeat of
+    // the same question would file another card.
+    let (title, why, url, steps) =
+        (clean_text(&req.title, MAX_TITLE_CHARS), clean_text_opt(req.why, MAX_WHY_CHARS), clean_url(req.url), clean_steps(&req.steps));
     // Same title and answer type, same project, still open, same instructions: that is the
     // same request (an agent whose blocking call timed out and asked again), not a second
     // card. Different instructions under the same title are a different request. Lookup and
     // insert happen under one write lock so two processes asking at once file one card.
     ctx.db.conn.execute_batch("BEGIN IMMEDIATE").context("locking the task table")?;
-    let existing = match ctx.db.open_human_tasks(&pid, &req.title, &req.expects) {
+    let existing = match ctx.db.open_human_tasks(&pid, &title, &req.expects) {
         Ok(e) => e,
         Err(e) => { let _ = ctx.db.conn.execute_batch("ROLLBACK"); return Err(e); }
     };
-    if let Some(t) = existing.into_iter().find(|t| t.why == req.why && t.url == req.url && t.steps == req.steps) {
+    if let Some(t) = existing.into_iter().find(|t| t.why == why && t.url == url && t.steps == steps) {
         ctx.db.conn.execute_batch("COMMIT")?;
         return Ok(t);
     }
@@ -279,10 +338,10 @@ pub fn create_human_task(ctx: &Ctx, project: &Path, agent: &str, req: HumanReque
         agent: agent.into(),
         name: None,
         identity: "default".into(),
-        title: req.title,
-        why: req.why,
-        url: req.url,
-        steps: req.steps,
+        title,
+        why,
+        url,
+        steps,
         expects: req.expects,
         pattern: None,
         names: vec![],

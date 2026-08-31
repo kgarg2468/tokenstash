@@ -11,14 +11,6 @@ use std::path::{Path, PathBuf};
 use tokenstash_core::bundle::{self, Binding, Entry, Payload_};
 use tokenstash_core::stash::stash_key;
 
-fn require_human(what: &str) -> Result<()> {
-    use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() || tokenstash_core::project::detect_agent() != "unknown" {
-        bail!("`tokenstash {what}` is for a person at a terminal, not an agent: it handles every value in the stash. Run it yourself.");
-    }
-    Ok(())
-}
-
 #[derive(Args)]
 pub struct ExportArgs {
     /// Where to write the bundle (default: ./tokenstash.bundle).
@@ -41,7 +33,7 @@ pub fn export(a: ExportArgs) -> Result<i32> {
     if let Some(dir) = a.from_env {
         return from_env(FromEnvArgs { dir, identity: a.identity, no_verify: a.no_verify });
     }
-    require_human("export")?;
+    crate::util::require_human("export", "it handles every value in the stash")?;
     let app = App::open()?;
     let out = a.out.unwrap_or_else(|| PathBuf::from("tokenstash.bundle"));
     let out = if out.is_absolute() { out } else { std::env::current_dir()?.join(out) };
@@ -129,7 +121,7 @@ pub struct ImportArgs {
 }
 
 pub fn import(a: ImportArgs) -> Result<i32> {
-    require_human("import")?;
+    crate::util::require_human("import", "it handles every value in the stash")?;
     let app = App::open()?;
     let size = std::fs::metadata(&a.bundle).with_context(|| format!("reading {}", a.bundle.display()))?.len();
     if size as usize > bundle::MAX_BUNDLE_BYTES {
@@ -305,7 +297,7 @@ pub struct FromEnvArgs {
 /// what the person has, and ticking rows is consent. There is no MCP tool for this and
 /// no non-interactive switch.
 pub fn from_env(a: FromEnvArgs) -> Result<i32> {
-    require_human("export --from-env")?;
+    crate::util::require_human("export --from-env", "it handles every value in the stash")?;
     use std::io::IsTerminal;
     if !std::io::stdout().is_terminal() { bail!("`export --from-env` is interactive; run it in a terminal"); }
     let app = App::open()?;

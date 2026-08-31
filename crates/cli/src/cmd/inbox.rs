@@ -260,7 +260,13 @@ fn respond(req: Request, code: u16, ctype: &str, body: String) -> Result<()> {
         .with_status_code(code)
         .with_header(Header::from_bytes("Content-Type", ctype).unwrap())
         .with_header(Header::from_bytes("Cache-Control", "no-store").unwrap())
-        .with_header(Header::from_bytes("X-Frame-Options", "DENY").unwrap());
+        .with_header(Header::from_bytes("X-Frame-Options", "DENY").unwrap())
+        // The pages are self-contained: one inline <style>, no script, no image, no fetch.
+        // Saying so stops a link or a field that got past the escaping upstream from
+        // running anything in this origin — the origin whose session approves grants.
+        .with_header(Header::from_bytes("Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'").unwrap())
+        .with_header(Header::from_bytes("Referrer-Policy", "no-referrer").unwrap());
     req.respond(r)?;
     Ok(())
 }
@@ -353,7 +359,13 @@ fn page_task(t: &Task, err: Option<&str>, token: &str, scope: inbox_auth::Scope)
     }
     b.push_str(&format!("<div class=card><div class=mut>{} · requested by {}</div><h2>{}</h2>", esc(&tokenstash_core::project::short(std::path::Path::new(&t.project))), esc(&t.agent), esc(&t.title)));
     if let Some(w) = &t.why { b.push_str(&format!("<p>{}</p>", esc(w))); }
-    if let Some(u) = &t.url { b.push_str(&format!("<div class=row><a class='btn p' href='{0}' target=_blank rel=noopener>Open {1} ↗</a></div>", esc(u), esc(u.trim_start_matches("https://").split('/').next().unwrap_or(u)))); }
+    // Second gate on the scheme (tasks::clean_url is the first): this is the one place a
+    // card's text becomes something the human clicks, so it does not inherit trust from the
+    // layer that stored it. A link that is not http(s) is simply not rendered as a link.
+    if let Some(u) = t.url.as_deref().filter(|u| { let l = u.to_ascii_lowercase(); l.starts_with("https://") || l.starts_with("http://") }) {
+        let host = u.split_once("//").map(|(_, r)| r).unwrap_or(u).split('/').next().unwrap_or(u);
+        b.push_str(&format!("<div class=row><a class='btn p' href='{0}' target=_blank rel='noopener noreferrer'>Open {1} ↗</a></div>", esc(u), esc(host)));
+    }
     if !t.steps.is_empty() {
         b.push_str("<ol>");
         for s in &t.steps { b.push_str(&format!("<li>{}</li>", esc(s))); }
