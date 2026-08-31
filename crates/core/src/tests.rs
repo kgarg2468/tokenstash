@@ -2369,7 +2369,6 @@ fn a_probe_never_sends_the_key_over_plain_http() {
 /// header were ever asserted against a real request.
 #[test]
 fn every_auth_style_is_sent_the_way_the_registry_says() {
-    use secrecy::ExposeSecret;
     let raw = "KEYVALUE123456789012345678";
     let v = SecretString::from(raw.to_string());
     let t = std::time::Duration::from_secs(1);
