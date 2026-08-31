@@ -449,6 +449,15 @@ pub fn store_and_inject(
     verified: Verified,
     grant_source: &str,
 ) -> Result<Option<PathBuf>> {
+    // Claim the card before anything is written. Two answers racing (an inbox POST and a
+    // `tokenstash answer`, or two tabs) both read it as pending; whoever closes it first
+    // owns the answer, and the loser must not reach the stash — otherwise its value
+    // overwrites the winner's and the human is told nothing.
+    if let Some(tid) = answering_task {
+        if !ctx.db.close_task_if_open(tid, TaskStatus::Answered, None)? {
+            bail!("task {tid} was answered somewhere else while this was in flight; nothing was stored");
+        }
+    }
     ctx.stash.set(&stash_key(name, identity), value)?;
     let pid = project.to_string_lossy().to_string();
     let tx = ctx.db.conn.unchecked_transaction()?;
@@ -481,14 +490,6 @@ pub fn store_and_inject(
             // not silently wipe it; the next request pairs this directory with a card, and
             // answering that is what replaces the record.
             ctx.db.audit(Some(&pid), Some(agent), "grant.skipped", Some(name), Some(identity), Some("directory re-created since it was paired; it will pair again on its next request"))?;
-        }
-    }
-    if let Some(tid) = answering_task {
-        // Compare-and-set: whoever closes the card first wins. Two answers racing (a
-        // `tokenstash answer` and an inbox POST) both read a pending card, and an
-        // unconditional update would let the loser overwrite a committed denial.
-        if !ctx.db.close_task_if_open(tid, TaskStatus::Answered, None)? {
-            bail!("task {tid} was answered somewhere else while this was in flight; nothing was stored");
         }
     }
     tx.commit().context("recording the stored secret")?;
