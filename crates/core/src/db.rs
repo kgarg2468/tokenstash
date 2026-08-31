@@ -65,6 +65,9 @@ pub struct SecretMeta {
 }
 
 /// Grant scopes and sources (trust v2).
+/// What `PRAGMA user_version` this build writes and understands.
+pub const SCHEMA_VERSION: i64 = 2;
+
 pub const GRANT_KEY: &str = "key";
 pub const GRANT_BROAD: &str = "broad";
 pub const GRANT_PASTE: &str = "paste";
@@ -223,9 +226,19 @@ impl Db {
         // CLI, inbox and MCP server each hold their own connection; a write collision must
         // wait, not error.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.execute_batch("PRAGMA journal_mode=WAL")?;
+        // WAL brings two sidecar files that SQLite creates at umask (0644 on most systems).
+        // They hold recently written rows — project paths, key names, identities, grants —
+        // so they get the same 0600 as the database itself. The parent dir is already 0700;
+        // this makes the files safe on their own if it ever is not.
+        for suffix in ["-wal", "-shm"] {
+            let side = path.with_file_name(format!("{}{suffix}", path.file_name().unwrap_or_default().to_string_lossy()));
+            if side.exists() {
+                let _ = restrict_file(&side);
+            }
+        }
         conn.execute_batch(
             r#"
-            PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS secrets (
                 name TEXT NOT NULL, identity TEXT NOT NULL, provider TEXT,
                 sensitive INTEGER NOT NULL DEFAULT 0, source_url TEXT,
@@ -317,13 +330,21 @@ impl Db {
     /// `run` approvals that must not become standing grants.
     fn migrate_v2(&self) -> Result<()> {
         let v: i64 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if v >= 2 {
+        if v > SCHEMA_VERSION {
+            // A newer tokenstash wrote this database. Its grants may mean something this
+            // build does not implement, and guessing is how an old binary hands out a key
+            // the human revoked in a model it never learned. Refuse instead.
+            anyhow::bail!(
+                "this tokenstash database was written by a newer version (schema {v}, this build understands {SCHEMA_VERSION}). Upgrade tokenstash."
+            );
+        }
+        if v >= SCHEMA_VERSION {
             return Ok(());
         }
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let done = (|| -> Result<()> {
             let v: i64 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            if v >= 2 {
+            if v >= SCHEMA_VERSION {
                 return Ok(());
             }
             let mut st = self.conn.prepare("SELECT project, name, created FROM approvals")?;
@@ -641,6 +662,26 @@ impl Db {
         }
     }
 
+    /// `find_task`, but the search itself is confined to one project. `find_task` reports an
+    /// ambiguous prefix by naming the tasks it matched, and those matches are drawn from
+    /// every project — so an agent passing a one-character prefix learns the task ids of
+    /// projects it has nothing to do with. Callers that serve an agent use this.
+    pub fn find_task_in(&self, project: &str, id_or_prefix: &str) -> Result<Option<Task>> {
+        let q = id_or_prefix.trim();
+        if q.is_empty() || !q.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Ok(None);
+        }
+        let mine: Vec<Task> = self.list_tasks(Some(project), false)?;
+        if let Some(t) = mine.iter().find(|t| t.id == q) {
+            return Ok(Some(t.clone()));
+        }
+        let mut hits = mine.into_iter().filter(|t| t.id.starts_with(q) || t.id.get(2..).map(|r| r.starts_with(q)).unwrap_or(false));
+        match (hits.next(), hits.next()) {
+            (Some(t), None) => Ok(Some(t)),
+            _ => Ok(None), // no match, or ambiguous: same answer either way, no oracle
+        }
+    }
+
     pub fn list_tasks(&self, project: Option<&str>, only_open: bool) -> Result<Vec<Task>> {
         let mut sql = format!("SELECT {} FROM tasks WHERE 1=1", Self::TASK_COLS);
         if only_open {
@@ -702,6 +743,19 @@ impl Db {
             Self::TASK_COLS
         );
         Ok(self.conn.query_row(&sql, params![project], Self::row_to_task).optional()?)
+    }
+
+    /// Close a card, but only while it is still open. The answer paths check the status of
+    /// the `Task` they were handed, which was read some time ago: two answers racing (an
+    /// inbox POST and a `tokenstash answer`, or two browser tabs) would both pass that check
+    /// and the second would overwrite the first — turning a committed *denial* into an
+    /// approval. Returns false when someone else already closed it.
+    pub fn close_task_if_open(&self, id: &str, status: TaskStatus, note: Option<&str>) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE tasks SET status=?2, answered_at=?3, note=COALESCE(?4, note) WHERE id=?1 AND status='pending'",
+            params![id, status.as_str(), crate::now(), note],
+        )?;
+        Ok(n == 1)
     }
 
     pub fn set_task_status(&self, id: &str, status: TaskStatus, note: Option<&str>) -> Result<()> {
@@ -883,13 +937,31 @@ impl Db {
     }
 
     /// Drop every grant (and binding) of a workspace. Values already written stay written.
+    /// The v1 `approvals` table is left in place by the migration so a 0.1 binary can still
+    /// open this database. That also means a 0.1 binary still *honours* it — and it gates on
+    /// approvals alone, with no fingerprint check. Revoking has to reach those rows too, or
+    /// an older binary someone still has wired into an agent keeps delivering keys the human
+    /// took back.
+    fn clear_legacy_approvals(&self, workspace_id: &str) -> Result<()> {
+        let root: Option<String> = self
+            .conn
+            .query_row("SELECT root FROM workspaces WHERE id=?1", params![workspace_id], |r| r.get(0))
+            .optional()?;
+        if let Some(root) = root {
+            self.conn.execute("DELETE FROM approvals WHERE project=?1", params![root])?;
+        }
+        Ok(())
+    }
+
     pub fn revoke_workspace(&self, workspace_id: &str) -> Result<usize> {
+        self.clear_legacy_approvals(workspace_id)?;
         let n = self.conn.execute("DELETE FROM grants WHERE workspace_id=?1", params![workspace_id])?;
         Ok(n)
     }
 
     /// Forget a workspace entirely: its next `need` pairs again. Deny memory (tasks) stays.
     pub fn forget_workspace(&self, workspace_id: &str) -> Result<()> {
+        self.clear_legacy_approvals(workspace_id)?;
         self.conn.execute("DELETE FROM grants WHERE workspace_id=?1", params![workspace_id])?;
         self.conn.execute("DELETE FROM workspace_bindings WHERE workspace_id=?1", params![workspace_id])?;
         self.conn.execute("DELETE FROM workspaces WHERE id=?1", params![workspace_id])?;

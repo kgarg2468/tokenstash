@@ -67,6 +67,25 @@ fn generate(spec: &str) -> Option<SecretString> {
     Some(SecretString::from(s))
 }
 
+/// The identity a generated secret is stored under: one per project directory.
+///
+/// A generated value has no provider account behind it — it is this application's signing
+/// key. Stored under the plain `default` identity it would be one value shared by every
+/// project that asks, so a directory holding a broad grant would silently receive another
+/// application's `JWT_SECRET` and could mint sessions for it. The label is the directory
+/// name plus a digest of its canonical path: readable in `tokenstash list`, distinct per
+/// directory, and stable across a re-pair (unlike the workspace id).
+pub fn project_identity(project: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let name: String = project
+        .file_name()
+        .map(|n| n.to_string_lossy().chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')).take(24).collect())
+        .unwrap_or_default();
+    let name = if name.is_empty() { "project".to_string() } else { name };
+    let digest = format!("{:x}", Sha256::digest(project.as_os_str().as_encoded_bytes()));
+    format!("{name}-{}", &digest[..6])
+}
+
 pub fn need(ctx: &Ctx, project: &Path, agent: &str, names: &[String], opts: &NeedOpts) -> Result<Vec<Outcome>> {
     need_with_budget(ctx, project, agent, names, opts, &mut ProbeBudget::default())
 }
@@ -93,12 +112,20 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
         if !valid_name(name) {
             anyhow::bail!("{name:?} is not an environment variable name (letters, digits and underscores, not starting with a digit)");
         }
+        let provider = registry::lookup(name);
+        if let Some(i) = opts.identity.as_deref() {
+            if !valid_identity(i) {
+                anyhow::bail!("{i:?} is not an identity (letters, digits, dot, dash and underscore, up to 64 characters)");
+            }
+        }
         let identity = opts
             .identity
             .clone()
             .or(ctx.db.binding(&ws.id, name)?)
-            .unwrap_or_else(|| "default".into());
-        let provider = registry::lookup(name);
+            .unwrap_or_else(|| match provider.and_then(|p| p.generate.as_deref()) {
+                Some(_) => project_identity(project),
+                None => "default".into(),
+            });
         let hit = ctx.stash.get(&stash_key(name, &identity))?;
 
         if let Some(value) = hit {
@@ -158,6 +185,24 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
                 }
                 g => g,
             };
+            // A grant for this exact key is the human deciding about this key. A broad grant
+            // (or an on-disk match) is not: it was a decision about the directory, made
+            // earlier, and it must not quietly overrule "no" to this key here. Without this
+            // a denied card followed by a paste elsewhere turns into a silent delivery.
+            let gate = match &gate {
+                Gate::Open { source } if source == crate::db::GRANT_BROAD || source == crate::db::GRANT_ON_DISK => {
+                    let since = (chrono::Utc::now() - chrono::Duration::hours(ctx.cfg.task_ttl_hours as i64)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                    match ctx.db.recent_denial(&pid, name, &identity, &since)? {
+                        Some(d) if !opts.force => {
+                            ctx.db.audit(Some(&pid), Some(agent), "deny.honored", Some(name), Some(&identity), Some("a broad grant does not overrule a denial for this key here"))?;
+                            outcomes.push(Outcome::Denied { name: name.clone(), task_id: d.id });
+                            continue;
+                        }
+                        _ => gate,
+                    }
+                }
+                _ => gate,
+            };
             match gate {
                 Gate::Open { source } => match deliver(ctx, project, agent, name, &identity, &value, None, &source, budget)? {
                     Delivery::Injected { path, unverified } => {
@@ -188,6 +233,14 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
 
         // Miss. Generate locally if the registry says so.
         if let Some(spec) = provider.and_then(|p| p.generate.as_deref()) {
+            // Generating is delivering: it writes a value into the env file and leaves a
+            // standing grant. A `run`-derived request (a program's own output chose the
+            // name) gets the same one-time approval here as it does on a hit.
+            if opts.require_approval {
+                once.push(format!("{name}@{identity}"));
+                outcomes.push(Outcome::Pending { name: name.clone(), identity: identity.clone(), task_id: String::new(), title: String::new(), url: None });
+                continue;
+            }
             if let Some(v) = generate(spec) {
                 let p = tasks::store_and_inject(ctx, name, &identity, &v, provider.map(|p| p.provider.clone()), None, false, project, agent, None, tasks::Verified::Unknown, crate::db::GRANT_GENERATED)?;
                 outcomes.push(Outcome::Injected { name: name.clone(), identity, written_to: p.map(|p| p.display().to_string()).unwrap_or_default(), generated: true, unverified: false });
@@ -369,6 +422,17 @@ fn window(cfg: &crate::config::Config) -> chrono::Duration {
 }
 
 /// An env var name and nothing else: what the env file grammar and the cards can carry.
+/// An identity is a label the human reads on a card and a component of the stash key.
+/// `@` would split a different key out of `NAME@identity`, `,` is the separator the inbox
+/// uses for the list of names on a card, and an empty one makes `split_identity` hand back
+/// a name that is not the one requested. None of that is worth tolerating for a field the
+/// caller chooses freely.
+pub fn valid_identity(identity: &str) -> bool {
+    !identity.is_empty()
+        && identity.len() <= 64
+        && identity.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
 pub fn valid_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
