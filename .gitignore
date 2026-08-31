@@ -9,3 +9,6 @@ node_modules
 # internal, local-only planning docs — never publish
 tokenstash.md
 PRD.md
+
+# local-only review scratch (diffs, briefs, notes handed to reviewers)
+.review-context/
