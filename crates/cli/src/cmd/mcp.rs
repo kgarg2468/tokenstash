@@ -142,16 +142,57 @@ fn root_path(uri: &str) -> Option<PathBuf> {
     Some(PathBuf::from(s))
 }
 
-enum Incoming { Line(String), Eof }
+enum Incoming {
+    Line(String),
+    Eof,
+    /// A frame longer than the cap: answered and skipped, never fatal.
+    TooLong,
+}
 
 pub fn serve() -> Result<i32> {
     // stdin on its own thread so the first tool call can wait (bounded) for the client's
     // roots/list answer without ever blocking on a client that never sends one.
     let (tx, rx) = std::sync::mpsc::channel::<Incoming>();
     std::thread::spawn(move || {
+        // Bounded, and never fatal. `lines()` grows one String until a newline arrives, so a
+        // client that sends a gigabyte without one takes the process down with it; and its
+        // Err arm — a single non-UTF-8 byte — used to end the loop, killing the server for
+        // the rest of the session. An over-long line is answered and skipped; invalid UTF-8
+        // becomes a parse error like any other malformed frame.
+        const MAX_LINE: usize = 4 * 1024 * 1024;
         let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            match line { Ok(l) => { if tx.send(Incoming::Line(l)).is_err() { return; } } Err(_) => break }
+        let mut reader = std::io::BufReader::new(stdin.lock());
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            buf.clear();
+            let n = match std::io::Read::take(&mut reader, MAX_LINE as u64 + 1).read_until(b'\n', &mut buf) {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if n == 0 {
+                break;
+            }
+            if !buf.ends_with(b"\n") && buf.len() > MAX_LINE {
+                // drain the rest of the oversized line so the next frame starts clean
+                let mut sink = Vec::new();
+                loop {
+                    sink.clear();
+                    match std::io::Read::take(&mut reader, MAX_LINE as u64).read_until(b'\n', &mut sink) {
+                        Ok(0) => break,
+                        Ok(_) if sink.ends_with(b"\n") => break,
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+                if tx.send(Incoming::TooLong).is_err() {
+                    return;
+                }
+                continue;
+            }
+            let line = String::from_utf8_lossy(&buf).into_owned();
+            if tx.send(Incoming::Line(line)).is_err() {
+                return;
+            }
         }
         let _ = tx.send(Incoming::Eof);
     });
@@ -164,7 +205,14 @@ pub fn serve() -> Result<i32> {
         if eof && queued.is_empty() { break; }
         let line = match queued.pop_front() {
             Some(l) => l,
-            None => match rx.recv() { Ok(Incoming::Line(l)) => l, _ => break },
+            None => match rx.recv() {
+                Ok(Incoming::Line(l)) => l,
+                Ok(Incoming::TooLong) => {
+                    write_msg(&mut out, &error(Value::Null, -32600, "request too large"))?;
+                    continue;
+                }
+                _ => break,
+            },
         };
         if line.trim().is_empty() { continue; }
         let msg: Value = match serde_json::from_str(&line) {
@@ -234,6 +282,9 @@ pub fn serve() -> Result<i32> {
                                     .map(|m| { binding.take_roots(&m); true }).unwrap_or(false);
                                 if !is_roots { queued.push_back(l); }
                             }
+                            // an oversized frame during the roots wait is answered now:
+                            // queueing an empty line would drop it silently
+                            Ok(Incoming::TooLong) => write_msg(&mut out, &error(Value::Null, -32600, "request too large"))?,
                             // stdin closed during the wait: answer this call, drain what was
                             // queued, then exit — the outer loop must not wait for more
                             Ok(Incoming::Eof) => { eof = true; break; }
@@ -473,7 +524,7 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
             // Scoped to this project: a task id (or prefix) from another project reveals
             // that project's path and state to a model that has no business with it.
             let pid = project.to_string_lossy().to_string();
-            match app.db.find_task(id)?.filter(|t| t.project == pid) {
+            match app.db.find_task_in(&pid, id)? {
                 Some(t) => {
                     // An approval can be answered yet deliver nothing: the provider rejected
                     // the stored key at delivery and a Replace card was filed instead. Point

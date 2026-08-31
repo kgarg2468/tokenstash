@@ -484,7 +484,12 @@ pub fn store_and_inject(
         }
     }
     if let Some(tid) = answering_task {
-        ctx.db.set_task_status(tid, TaskStatus::Answered, None)?;
+        // Compare-and-set: whoever closes the card first wins. Two answers racing (a
+        // `tokenstash answer` and an inbox POST) both read a pending card, and an
+        // unconditional update would let the loser overwrite a committed denial.
+        if !ctx.db.close_task_if_open(tid, TaskStatus::Answered, None)? {
+            bail!("task {tid} was answered somewhere else while this was in flight; nothing was stored");
+        }
     }
     tx.commit().context("recording the stored secret")?;
     let injected_to = if project.is_dir() {
@@ -516,7 +521,9 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, decision: Decision, seen: Option<
     }
     let pid = task.project.clone();
     if decision == Decision::Deny {
-        ctx.db.set_task_status(&task.id, TaskStatus::Denied, None)?;
+        if !ctx.db.close_task_if_open(&task.id, TaskStatus::Denied, None)? {
+            bail!("task {} was already answered somewhere else", task.id);
+        }
         ctx.db.audit(Some(&pid), Some(&task.agent), "deny", None, None, Some(&task.names.join(",")))?;
         return Ok(AnswerResult::Denied);
     }
@@ -552,7 +559,9 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, decision: Decision, seen: Option<
                 }
             }
         }
-        ctx.db.set_task_status(&task.id, TaskStatus::Answered, None)?;
+        if !ctx.db.close_task_if_open(&task.id, TaskStatus::Answered, None)? {
+            bail!("task {} was already answered somewhere else; nothing was granted", task.id);
+        }
         ctx.db.audit(Some(&pid), Some(&task.agent), "approve", None, None, Some(&format!("{}{}: {}", kind, if decision == Decision::AllowBroad { "+broad" } else { "" }, task.names.join(","))))?;
         tx.commit().context("recording approval")?;
     }
@@ -603,13 +612,17 @@ pub fn answer_human(ctx: &Ctx, task: &Task, note: Option<&str>) -> Result<Answer
             bail!("that answer looks like a credential; it would be shown to the agent. Decline this task and have the agent request it with `tokenstash need NAME` instead.");
         }
     }
-    ctx.db.set_task_status(&task.id, TaskStatus::Answered, note)?;
+    if !ctx.db.close_task_if_open(&task.id, TaskStatus::Answered, note)? {
+        bail!("task {} was already answered somewhere else", task.id);
+    }
     ctx.db.audit(Some(&task.project), Some(&task.agent), "human.done", None, None, Some(&task.title))?;
     Ok(AnswerResult::Done)
 }
 
 pub fn deny(ctx: &Ctx, task: &Task, note: Option<&str>) -> Result<AnswerResult> {
-    ctx.db.set_task_status(&task.id, TaskStatus::Denied, note)?;
+    if !ctx.db.close_task_if_open(&task.id, TaskStatus::Denied, note)? {
+        bail!("task {} is already {}", task.id, ctx.db.get_task(&task.id)?.map(|t| t.status.as_str().to_string()).unwrap_or_else(|| "gone".into()));
+    }
     ctx.db.audit(Some(&task.project), Some(&task.agent), "deny", task.name.as_deref(), None, None)?;
     Ok(AnswerResult::Denied)
 }
@@ -650,27 +663,62 @@ pub fn rewrite_replaced_value(ctx: &Ctx, name: &str, identity: &str, new: &Secre
         if !dir.is_dir() {
             continue;
         }
-        let still_granted = granted.iter().any(|w| w.root == project) && ctx.db.find_workspace(dir)?.map(|w| granted.iter().any(|g| g.id == w.id)).unwrap_or(false);
+        // A DB error here used to abort the whole fan-out with the value already stored:
+        // some projects rewritten, the rest untouched, and no report of either. One project
+        // failing is one line in the report.
+        let current = match ctx.db.find_workspace(dir) {
+            Ok(w) => w,
+            Err(e) => {
+                report.skipped.push((project.clone(), format!("could not read its workspace record ({e:#})")));
+                continue;
+            }
+        };
+        let still_granted = granted.iter().any(|w| w.root == project) && current.map(|w| granted.iter().any(|g| g.id == w.id)).unwrap_or(false);
         if !still_granted {
             let why = "no standing grant for this key here; it will ask on its next `need`".to_string();
-            ctx.db.audit(Some(&project), None, "rotate.skip", Some(name), Some(identity), Some(&why))?;
+            let _ = ctx.db.audit(Some(&project), None, "rotate.skip", Some(name), Some(identity), Some(&why));
             report.skipped.push((project.clone(), why));
             continue;
         }
-        let Ok(env_path) = crate::envfile::resolve(dir, &ctx.cfg.env_file) else { continue };
-        let Ok(text) = std::fs::read_to_string(&env_path) else { continue };
+        // Both of these used to `continue` in silence. A project whose env file cannot be
+        // resolved or read still holds the old value, and the human is about to revoke it
+        // on the strength of this report — so it has to be named, not dropped.
+        let env_path = match crate::envfile::resolve(dir, &ctx.cfg.env_file) {
+            Ok(p) => p,
+            Err(e) => {
+                report.skipped.push((project.clone(), format!("cannot locate its env file ({e:#})")));
+                continue;
+            }
+        };
+        if !env_path.exists() {
+            continue; // nothing of ours there to replace
+        }
+        let text = match std::fs::read_to_string(&env_path) {
+            Ok(t) => t,
+            Err(e) => {
+                report.skipped.push((project.clone(), format!("cannot read {} ({e})", env_path.display())));
+                continue;
+            }
+        };
         let needs_update = text.lines().filter_map(crate::envfile::parse_line).any(|(k, v)| k == name && v != new.expose_secret());
         if !needs_update {
+            // A `NAME=` line we cannot parse is not "no old value here" — it is a value we
+            // cannot compare (an unterminated quote written by an older build). Say so
+            // rather than counting the project as clean.
+            let prefix = format!("{name}=");
+            if text.lines().any(|l| { let l = l.trim_start().strip_prefix("export ").unwrap_or(l.trim_start()); l.starts_with(&prefix) && crate::envfile::parse_line(l).is_none() }) {
+                report.skipped.push((project.clone(), format!("its {} holds a {name}= line this version cannot read; replace it by hand", env_path.display())));
+            }
             continue;
         }
         match crate::envfile::write(dir, &ctx.cfg.env_file, name, new) {
             Ok(_) => {
-                ctx.db.audit_grant(Some(&project), None, "inject", Some(name), Some(identity), Some("after-rotation"), crate::db::GRANT_ROTATION)?;
+                let _ = ctx.db.audit_grant(Some(&project), None, "inject", Some(name), Some(identity), Some("after-rotation"), crate::db::GRANT_ROTATION);
                 report.rewritten.push(project.clone());
             }
             Err(e) => {
                 let why = format!("{e:#}");
-                ctx.db.audit(Some(&project), None, "rotate.skip", Some(name), Some(identity), Some(&why))?;
+                let _ = ctx.db.audit(Some(&project), None, "rotate.skip", Some(name), Some(identity), Some(&why));
                 report.skipped.push((project.clone(), why));
             }
         }

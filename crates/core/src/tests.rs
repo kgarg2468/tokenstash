@@ -1050,12 +1050,14 @@ fn a_stale_key_still_goes_through_the_trust_gate_and_generated_names_regenerate(
     let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
     assert_eq!(db.get_task(&tid).unwrap().unwrap().kind, db::TaskKind::Approval);
     assert!(!outside.join(".env.local").exists());
-    // generated secrets never become paste cards: a stale AUTH_SECRET regenerates
+    // generated secrets never become paste cards: a stale AUTH_SECRET regenerates.
+    // They are stored per project directory, so the identity is the project's, not "default".
+    let gid = need::project_identity(&proj);
     need::need(&ctx, &proj, "test", &["AUTH_SECRET".to_string()], &Default::default()).unwrap();
-    db.mark_stale("AUTH_SECRET", "default", true, Some("reported ..."), Some(db::STALE_REPORT)).unwrap();
+    db.mark_stale("AUTH_SECRET", &gid, true, Some("reported ..."), Some(db::STALE_REPORT)).unwrap();
     let out = need::need(&ctx, &proj, "test", &["AUTH_SECRET".to_string()], &Default::default()).unwrap();
     assert!(matches!(&out[0], need::Outcome::Injected { generated: true, .. }), "{:?}", out[0]);
-    assert!(!db.get_secret("AUTH_SECRET", "default").unwrap().unwrap().stale);
+    assert!(!db.get_secret("AUTH_SECRET", &gid).unwrap().unwrap().stale);
     std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
 }
 
