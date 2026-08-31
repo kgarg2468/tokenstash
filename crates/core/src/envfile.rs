@@ -71,6 +71,14 @@ pub fn resolve(project: &Path, env_file: &str) -> Result<PathBuf> {
 pub fn write(project: &Path, env_file: &str, name: &str, value: &SecretString) -> Result<PathBuf> {
     let env_file = &normalize(env_file)?;
     let path = resolve(project, env_file)?;
+    // Read-modify-write: two `need`s for different keys racing (a CLI run and the MCP
+    // server, or two shells) would otherwise both read the same file and the second rename
+    // would drop the first key — a secret reported as delivered that is not in the file.
+    let target = path.clone();
+    crate::fsutil::with_lock_elsewhere(&target, move || upsert(project, env_file, name, value, path))
+}
+
+fn upsert(project: &Path, env_file: &str, name: &str, value: &SecretString, path: PathBuf) -> Result<PathBuf> {
     if fs::symlink_metadata(&path).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
         anyhow::bail!("{} is a symlink; refusing to write a secret through it", path.display());
     }
@@ -79,6 +87,14 @@ pub fn write(project: &Path, env_file: &str, name: &str, value: &SecretString) -
             "{} is tracked by git, so .gitignore cannot keep it out of the next commit. Run `git rm --cached {}` (keeps the local file) and re-run.",
             path.display(), env_file
         );
+    }
+    // A FIFO here would block read_to_string forever (and never reach the non-regular-file
+    // refusal inside write_atomic_private), hanging the CLI or the MCP server on a path an
+    // agent can create with one mkfifo.
+    if let Ok(md) = fs::symlink_metadata(&path) {
+        if !md.file_type().is_file() {
+            anyhow::bail!("{} is not a regular file; refusing to write a secret there", path.display());
+        }
     }
     let existing = if path.exists() { fs::read_to_string(&path)? } else { String::new() };
     let mut out = String::with_capacity(existing.len() + 64);
@@ -125,7 +141,13 @@ fn quote(v: &str) -> String {
     if !v.is_empty() && v.chars().all(safe) {
         v.to_string()
     } else {
-        format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
+        // `\n` and `\r` are escaped, not emitted raw: a literal newline inside the quotes
+        // ends the line for every one-line-at-a-time reader — including our own parse_line,
+        // which then reports the key as absent and makes rotation silently skip the project,
+        // leaving a revoked key on disk. Multi-line secrets (PEM keys, service-account JSON)
+        // are exactly the case that hits this. `\n` is decoded by parse_line and by
+        // python-dotenv / dotenv-rails / node dotenv inside double quotes.
+        format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r"))
     }
 }
 
@@ -149,6 +171,7 @@ pub fn parse_line(line: &str) -> Option<(String, String)> {
             match c {
                 '\\' => match chars.next() {
                     Some('n') => out.push('\n'),
+                    Some('r') => out.push('\r'),
                     Some(o) => out.push(o),
                     None => out.push('\\'),
                 },
@@ -241,8 +264,7 @@ pub fn is_git_tracked(project: &Path, path: &Path) -> bool {
     // Detection, not policy: a tracked file is refused wherever the repo lives.
     let Some(root) = git_root(project) else { return false };
     let Ok(rel) = path.strip_prefix(&root) else { return false };
-    std::process::Command::new("git")
-        .arg("-C").arg(&root)
+    git_cmd(&root)
         .args(["ls-files", "--error-unmatch", "--"])
         .arg(rel)
         .stdout(std::process::Stdio::null())
@@ -340,15 +362,27 @@ unsafe fn libc_geteuid() -> u32 {
 /// the project's own `.gitignore` (closest wins) and re-verified; if that still fails, the
 /// caller must not write the secret. Symlinked ignore files are refused.
 pub fn ensure_gitignore(project: &Path, env_file: &str) -> Result<bool> {
-    let Some(root) = owned_git_root(project)? else { return Ok(false) };
-    let mut changed = add_rule_if_uncovered(&root.join(".gitignore"), env_file)?;
+    // Two different questions. Which repo will commit this file (`git_root`, plain
+    // detection) and which `.gitignore` we may write into (`owned_git_root`, which refuses
+    // to adopt $HOME, /tmp and other shared roots). They diverge for a project that is not
+    // itself a repo but sits inside one — a dotfiles repo at $HOME being the common case.
+    // Writing no rule at all there, which is what this used to do, left the secret sitting
+    // unignored inside a real repo: `git add -A` from the root would commit it. The project
+    // gets its own .gitignore instead — the closest file wins, so it is enough.
+    let Some(root) = git_root(project) else { return Ok(false) };
+    let ignore_dir = match owned_git_root(project)? {
+        Some(owned) => owned,
+        None => project.to_path_buf(),
+    };
+    let mut changed = add_rule_if_uncovered(&ignore_dir.join(".gitignore"), env_file)?;
     let target = project.join(env_file);
     match git_check_ignore(&root, &target) {
-        Some(true) | None => Ok(changed),
+        Some(true) => Ok(changed),
+        None => unverified(&root, &ignore_dir, project, env_file, changed),
         Some(false) => {
             // a closer .gitignore re-includes it; the project's own file is closest
             let local = project.join(".gitignore");
-            if local != root.join(".gitignore") {
+            if local != ignore_dir.join(".gitignore") {
                 changed |= add_rule_if_uncovered(&local, env_file)?;
                 if !gitignore_covers(&fs::read_to_string(&local).unwrap_or_default(), env_file) {
                     // covered-by-our-evaluation but still re-included means a later negation
@@ -358,18 +392,70 @@ pub fn ensure_gitignore(project: &Path, env_file: &str) -> Result<bool> {
                 }
             }
             match git_check_ignore(&root, &target) {
+                Some(true) => Ok(changed),
                 Some(false) => anyhow::bail!("git still does not ignore {} after updating .gitignore (a nested rule re-includes it); refusing to write a secret there", target.display()),
-                _ => Ok(changed),
+                None => unverified(&root, &ignore_dir, project, env_file, changed),
             }
         }
     }
 }
 
+/// git could not answer (not installed, or it ran and failed — a broken `.git`, a repo it
+/// refuses as unsafe). We are inside a repo, so "cannot tell" is not "ignored".
+///
+/// Our own evaluator is allowed to settle it in the one case where it is complete: the rule
+/// we just wrote is the only `.gitignore` between the project and the repo root, so there is
+/// no nested file that could re-include the env file behind our back. Anything else refuses
+/// — an unverifiable ignore rule is exactly how a secret reaches a commit.
+fn unverified(root: &Path, ignore_dir: &Path, project: &Path, env_file: &str, changed: bool) -> Result<bool> {
+    let gi = ignore_dir.join(".gitignore");
+    let covered = gitignore_covers(&fs::read_to_string(&gi).unwrap_or_default(), env_file);
+    if covered && !has_nested_ignore(root, project, &gi) {
+        return Ok(changed);
+    }
+    anyhow::bail!(
+        "cannot ask git whether {} is ignored (git is not runnable here, or this repo is in a state it refuses),          and the rule in {} is not conclusive on its own. Install git, or fix the repo, and re-run;          refusing to write a secret that might be committed.",
+        project.join(env_file).display(), gi.display()
+    )
+}
+
+/// Any `.gitignore` between `project` and `root` (inclusive, excluding the one we wrote).
+/// Those are the files that can re-include what a higher rule ignored.
+fn has_nested_ignore(root: &Path, project: &Path, ours: &Path) -> bool {
+    let mut p = project.to_path_buf();
+    loop {
+        let gi = p.join(".gitignore");
+        if gi != ours && gi.exists() {
+            return true;
+        }
+        if p == root || !p.pop() {
+            return false;
+        }
+    }
+}
+
+/// `git`, with every `GIT_*` variable dropped from its environment.
+///
+/// These commands are the two protections standing between a secret and a commit, and both
+/// answer differently under `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` or `GIT_CONFIG_*`:
+/// `GIT_DIR=/nonexistent` alone turns "tracked" into "untracked" and the ignore check into
+/// "cannot tell". An agent that inherits or sets those variables must not be able to talk
+/// tokenstash out of the checks; the human's own git, run without them, is the authority.
+fn git_cmd(root: &Path) -> std::process::Command {
+    let mut c = std::process::Command::new("git");
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("GIT_") {
+            c.env_remove(&k);
+        }
+    }
+    c.arg("-C").arg(root);
+    c
+}
+
 /// Ask git for the effective ignore decision. None if git cannot be run.
 pub fn git_check_ignore(root: &Path, path: &Path) -> Option<bool> {
     let rel = path.strip_prefix(root).ok()?;
-    let st = std::process::Command::new("git")
-        .arg("-C").arg(root)
+    let st = git_cmd(root)
         .args(["check-ignore", "-q", "--no-index", "--"])
         .arg(rel)
         .stdout(std::process::Stdio::null())

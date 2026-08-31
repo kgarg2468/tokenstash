@@ -23,6 +23,19 @@ impl App {
     }
 }
 
+/// Commands only a person at a terminal may run. Two independent signals: the agent
+/// environment markers, and both standard streams being a TTY (an agent's shell has
+/// neither, even when it inherits a terminal for one of them). `what` names the command,
+/// `why` the reason it is human-only, so the refusal teaches rather than just blocks.
+pub fn require_human(what: &str, why: &str) -> Result<()> {
+    use std::io::IsTerminal;
+    let agent = tokenstash_core::project::detect_agent();
+    if agent != "unknown" || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        anyhow::bail!("`tokenstash {what}` is for a person at a terminal, not an agent: {why}. Run it yourself.");
+    }
+    Ok(())
+}
+
 pub fn project_from(arg: &Option<PathBuf>) -> PathBuf {
     match arg {
         Some(p) => tokenstash_core::project::canonical(p),
