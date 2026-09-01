@@ -2489,3 +2489,38 @@ fn an_export_line_is_upserted_not_duplicated() {
     assert!(!text.contains("export A_KEY="), "the export form is replaced, not left beside it:\n{text}");
     assert!(text.contains("OTHER=keep") && text.contains("A_KEY_2=neighbour") && text.contains("# mine"), "{text}");
 }
+
+/// A one-time approval records no grant, so the card is the only trace of the human's yes.
+/// If the delivery it authorised fails outright, the card has to come back — otherwise the
+/// human said yes, received nothing, and must say yes again to a brand new card.
+#[test]
+fn a_one_time_approval_that_delivers_nothing_reopens_its_card() {
+    let _g = env_lock();
+    let (home, proj) = v2_world("once-reopen");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+
+    // A stash that reads empty and refuses every write: what a locked keyring looks like
+    // from here. Generation succeeds, storing it does not.
+    struct DeadStash;
+    impl stash::Stash for DeadStash {
+        fn backend(&self) -> &'static str { "dead" }
+        fn get(&self, _: &str) -> anyhow::Result<Option<SecretString>> { Ok(None) }
+        fn set(&self, _: &str, _: &SecretString) -> anyhow::Result<()> { anyhow::bail!("the keyring is locked") }
+        fn delete(&self, _: &str) -> anyhow::Result<bool> { Ok(false) }
+    }
+    let st = DeadStash;
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: &st, probe: tasks::Probe::Off };
+
+    let opts = need::NeedOpts { require_approval: true, ..Default::default() };
+    let out = need::need(&ctx, &proj, "prog", &["AUTH_SECRET".to_string()], &opts).unwrap();
+    let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
+    let card = db.get_task(&tid).unwrap().unwrap();
+    assert_eq!(card.expects.as_str(), tasks::APPROVAL_ONCE, "a run-derived approval records no grant");
+
+    let err = tasks::answer_approval(&ctx, &card, tasks::Decision::Allow, Some(&card.names)).unwrap_err();
+    assert!(format!("{err:#}").contains("still open"), "the human is told the card survived: {err:#}");
+    assert_eq!(db.get_task(&tid).unwrap().unwrap().status, db::TaskStatus::Pending, "nothing was delivered, so the yes is still owed an answer");
+    assert!(!proj.join(".env.local").exists(), "and nothing was written");
+    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+}

@@ -623,7 +623,19 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, decision: Decision, seen: Option<
         }
     }
     if !failures.is_empty() {
-        bail!("approval recorded, but injection failed for {}. Re-run `need`; it will inject from the stash without asking again.", failures.join("; "));
+        // What the human has to do next depends entirely on what their answer recorded.
+        // A pairing or sensitive approval wrote grants, so re-running `need` completes
+        // silently. A one-time approval wrote none: the card is the only trace of the yes,
+        // so if nothing at all was delivered their decision bought nothing — put the card
+        // back rather than make them approve the same request a second time.
+        if kind == APPROVAL_ONCE {
+            if injected.is_empty() && replaced.is_empty() {
+                let _ = ctx.db.reopen_task(&task.id);
+                bail!("approval recorded, but nothing could be delivered: {}. The card is still open — fix that and answer it again.", failures.join("; "));
+            }
+            bail!("approval recorded, but {} failed. A one-time approval covers only this run, so re-running `need` asks again for what did not arrive.", failures.join("; "));
+        }
+        bail!("approval recorded, but injection failed for {}. Re-run `need`; the approval stands, so it will not ask again.", failures.join("; "));
     }
     Ok(AnswerResult::Approved { injected, replaced })
 }
