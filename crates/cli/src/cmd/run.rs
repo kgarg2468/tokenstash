@@ -3,7 +3,7 @@
 //!
 //! The program's own output chooses which key gets requested, and that output may be
 //! attacker-influenced. So requests that originate here are never silent: every stash hit
-//! goes through an approval task ("<program> wants OPENAI_API_KEY — allow?") on every
+//! goes through an approval task (`<program> wants OPENAI_API_KEY — allow?`) on every
 //! invocation, regardless of earlier approvals. The human authorizes the injection, not the
 //! child process. Once approved the key is in the env file, so a later run does not fail
 //! on it and nothing is re-asked in normal use.

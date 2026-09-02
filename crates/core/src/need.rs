@@ -454,7 +454,7 @@ pub fn valid_name(name: &str) -> bool {
 }
 
 /// Agent names come from the caller (`--agent`, `TOKENSTASH_AGENT`, MCP `clientInfo.name`)
-/// and end up in audit rows and on cards ("found at use by <agent>"). Short and printable,
+/// and end up in audit rows and on cards (`found at use by <agent>`). Short and printable,
 /// so a caller cannot write the card's body.
 pub fn clean_agent(raw: &str) -> String {
     let clean: String = raw.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-')).take(48).collect();

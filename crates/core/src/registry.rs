@@ -14,7 +14,7 @@ pub struct Check {
     #[serde(default = "default_get")]
     pub method: String,
     pub url: String,
-    /// "bearer" | "header:<Name>" | "basic-user" (value as username, empty password) | "query:<param>"
+    /// `bearer` | `header:<Name>` | `basic-user` (value as username, empty password) | `query:<param>`
     pub auth: String,
     #[serde(default)]
     pub headers: HashMap<String, String>,

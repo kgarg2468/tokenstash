@@ -44,7 +44,7 @@ pub struct SecretMeta {
     /// Last time a liveness probe (paste-time or `check`) accepted this value.
     #[serde(default)]
     pub last_verified: Option<String>,
-    /// Why it is stale: "rejected by X (HTTP n) on <date>, reported by <agent> in <project>",
+    /// Why it is stale: `rejected by X (HTTP n) on <date>, reported by <agent> in <project>`,
     /// "you asked to rotate", ... Shown on the replacement card.
     #[serde(default)]
     pub stale_reason: Option<String>,

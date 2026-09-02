@@ -29,7 +29,7 @@ pub struct Config {
     #[serde(default = "default_links")]
     pub inbox_links: String,
     /// How often a key with a registry probe is re-checked with its provider before an agent
-    /// `need` delivers it: "24h" (default), "<n>h", "<n>m", "always", or "never". One free
+    /// `need` delivers it: `24h` (default), `<n>h`, `<n>m`, `always`, or `never`. One free
     /// authenticated request per key per window; a rejected key becomes a Replace card
     /// before the agent ever sees a 401.
     #[serde(default)]
