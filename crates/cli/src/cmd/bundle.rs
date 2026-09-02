@@ -282,7 +282,7 @@ pub fn apply_entry(app: &App, e: &Entry, source: &str, no_verify: bool) -> Resul
 
 #[derive(Args)]
 pub struct FromEnvArgs {
-    /// Directory tree to scan for .env / .env.local / .env.<stage> / .envrc files.
+    /// Directory tree to scan for .env / .env.local / .env.{stage} / .envrc files.
     pub dir: PathBuf,
     /// Identity for everything imported (distinct values under one name get a numbered suffix).
     #[arg(long, default_value = "default")]
