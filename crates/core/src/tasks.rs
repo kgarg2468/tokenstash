@@ -485,6 +485,31 @@ pub fn store_and_inject(
         return Err(e).context("storing the value");
     }
     let pid = project.to_string_lossy().to_string();
+    // The value is in the stash; the record of it is one transaction. If that fails, the
+    // card comes back like it does when the stash write fails: an answered card with no
+    // index row and no grant would make the next `need` ask the human a second time.
+    // Best effort — a database that just failed a transaction may refuse this too.
+    let recorded = record_stored(ctx, name, identity, provider, source_url, sensitive, project, agent, verified, grant_source, &pid);
+    if let Err(e) = recorded {
+        if let Some(tid) = answering_task {
+            let _ = ctx.db.reopen_task(tid);
+        }
+        return Err(e);
+    }
+    let injected_to = if project.is_dir() {
+        let p = crate::envfile::write(project, &ctx.cfg.env_file, name, value)?;
+        ctx.db.audit_grant(Some(&pid), Some(agent), "inject", Some(name), Some(identity), None, grant_source)?;
+        Some(p)
+    } else {
+        None
+    };
+    Ok(injected_to)
+}
+
+/// The index row, the audit line and the grant for a value that is now in the stash, as one
+/// transaction.
+#[allow(clippy::too_many_arguments)]
+fn record_stored(ctx: &Ctx, name: &str, identity: &str, provider: Option<String>, source_url: Option<String>, sensitive: bool, project: &Path, agent: &str, verified: Verified, grant_source: &str, pid: &str) -> Result<()> {
     let tx = ctx.db.conn.unchecked_transaction()?;
     ctx.db.upsert_secret(&crate::db::SecretMeta {
         name: name.into(),
@@ -501,7 +526,7 @@ pub fn store_and_inject(
         next_probe: None,
         verify_off: verified == Verified::Skipped,
     })?;
-    ctx.db.audit(Some(&pid), Some(agent), "store", Some(name), Some(identity), None)?;
+    ctx.db.audit(Some(pid), Some(agent), "store", Some(name), Some(identity), None)?;
     // The human just handled this key for this project: that is the grant — this key,
     // this identity, this workspace, nothing broader.
     if project.is_dir() {
@@ -514,18 +539,10 @@ pub fn store_and_inject(
             // The record is for a directory that no longer exists here. A bare paste must
             // not silently wipe it; the next request pairs this directory with a card, and
             // answering that is what replaces the record.
-            ctx.db.audit(Some(&pid), Some(agent), "grant.skipped", Some(name), Some(identity), Some("directory re-created since it was paired; it will pair again on its next request"))?;
+            ctx.db.audit(Some(pid), Some(agent), "grant.skipped", Some(name), Some(identity), Some("directory re-created since it was paired; it will pair again on its next request"))?;
         }
     }
-    tx.commit().context("recording the stored secret")?;
-    let injected_to = if project.is_dir() {
-        let p = crate::envfile::write(project, &ctx.cfg.env_file, name, value)?;
-        ctx.db.audit_grant(Some(&pid), Some(agent), "inject", Some(name), Some(identity), None, grant_source)?;
-        Some(p)
-    } else {
-        None
-    };
-    Ok(injected_to)
+    tx.commit().context("recording the stored secret")
 }
 
 /// `seen` is the list of names the human was shown; if the card grew since (an agent
