@@ -100,9 +100,8 @@ fn upsert(project: &Path, env_file: &str, name: &str, value: &SecretString, path
     let mut out = String::with_capacity(existing.len() + 64);
     let mut replaced = false;
     let prefix = format!("{name}=");
-    let export_prefix = format!("export {name}=");
     for line in existing.lines() {
-        if line.starts_with(&prefix) || line.starts_with(&export_prefix) {
+        if defines(line, name) {
             if !replaced {
                 out.push_str(&prefix);
                 out.push_str(&quote(value.expose_secret()));
@@ -141,7 +140,7 @@ pub fn read_value(project: &Path, env_file: &str, name: &str) -> Option<SecretSt
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if md.uid() != unsafe { libc_geteuid() } {
+        if md.uid() != euid() {
             return None;
         }
     }
@@ -152,9 +151,25 @@ pub fn read_value(project: &Path, env_file: &str, name: &str) -> Option<SecretSt
 /// Does the env file already contain NAME= ?
 pub fn has(project: &Path, env_file: &str, name: &str) -> bool {
     let Ok(path) = resolve(project, env_file) else { return false };
-    let Ok(s) = fs::read_to_string(path) else { return false };
-    let p = format!("{name}=");
-    s.lines().any(|l| l.starts_with(&p) || l.starts_with(&format!("export {p}")))
+    let Some(s) = read_regular_file(&path) else { return false };
+    s.lines().any(|l| defines(l, name))
+}
+
+/// Does this line define NAME? One notion for every reader and the writer: `has`, `upsert`,
+/// `read_value` and the rotation rewrite used to disagree on leading whitespace, so a
+/// hand-written `  NAME=old` was invisible to `has` and got a second `NAME=` appended.
+fn defines(line: &str, name: &str) -> bool {
+    parse_line(line).map(|(k, _)| k == name).unwrap_or(false)
+}
+
+/// Read a file only if it is a regular file. A FIFO an agent can `mkfifo` at any path we
+/// read would block `read_to_string` forever and hang the CLI or the MCP server.
+pub fn read_regular_file(path: &Path) -> Option<String> {
+    let md = fs::symlink_metadata(path).ok()?;
+    if !md.file_type().is_file() {
+        return None;
+    }
+    fs::read_to_string(path).ok()
 }
 
 fn quote(v: &str) -> String {
@@ -255,8 +270,9 @@ fn ignore_line_matches(pat: &str, file: &str) -> Option<bool> {
     Some(glob_match(pat, file))
 }
 
-/// Convenience for a single positive line (kept for callers/tests).
-pub fn ignore_line_covers(line: &str, file: &str) -> bool {
+/// Convenience for a single positive line.
+#[cfg(test)]
+pub(crate) fn ignore_line_covers(line: &str, file: &str) -> bool {
     gitignore_covers(line, file)
 }
 
@@ -359,12 +375,8 @@ fn dir_class(p: &Path) -> DirClass {
     if md.mode() & 0o1002 != 0 {
         return DirClass::Shared;
     }
-    if md.uid() == unsafe { libc_geteuid() } { DirClass::Own } else { DirClass::Foreign }
+    if md.uid() == euid() { DirClass::Own } else { DirClass::Foreign }
 }
-#[cfg(not(unix))]
-fn dir_class(_p: &Path) -> DirClass { DirClass::Own }
-
-#[cfg(unix)]
 /// The effective uid of this process.
 pub fn euid() -> u32 {
     // SAFETY: geteuid has no preconditions.
@@ -405,7 +417,7 @@ pub fn ensure_gitignore(project: &Path, env_file: &str) -> Result<bool> {
             let local = project.join(".gitignore");
             if local != ignore_dir.join(".gitignore") {
                 changed |= add_rule_if_uncovered(&local, env_file)?;
-                if !gitignore_covers(&fs::read_to_string(&local).unwrap_or_default(), env_file) {
+                if !gitignore_covers(&read_regular_file(&local).unwrap_or_default(), env_file) {
                     // covered-by-our-evaluation but still re-included means a later negation
                     // in this same file; append an explicit trailing rule regardless.
                     append_rule(&local, env_file)?;
@@ -430,7 +442,7 @@ pub fn ensure_gitignore(project: &Path, env_file: &str) -> Result<bool> {
 /// — an unverifiable ignore rule is exactly how a secret reaches a commit.
 fn unverified(root: &Path, ignore_dir: &Path, project: &Path, env_file: &str, changed: bool) -> Result<bool> {
     let gi = ignore_dir.join(".gitignore");
-    let covered = gitignore_covers(&fs::read_to_string(&gi).unwrap_or_default(), env_file);
+    let covered = gitignore_covers(&read_regular_file(&gi).unwrap_or_default(), env_file);
     if covered && !has_nested_ignore(root, project, &gi) {
         return Ok(changed);
     }
@@ -494,7 +506,7 @@ fn append_rule(gi: &Path, env_file: &str) -> Result<()> {
     if fs::symlink_metadata(gi).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
         anyhow::bail!("{} is a symlink; refusing to modify it", gi.display());
     }
-    let mut s = fs::read_to_string(gi).unwrap_or_default();
+    let mut s = read_regular_file(gi).unwrap_or_default();
     if !s.is_empty() && !s.ends_with('\n') {
         s.push('\n');
     }
@@ -509,7 +521,11 @@ fn add_rule_if_uncovered(gi: &Path, env_file: &str) -> Result<bool> {
     if fs::symlink_metadata(gi).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
         anyhow::bail!("{} is a symlink; refusing to modify it (and cannot guarantee {env_file} stays uncommitted)", gi.display());
     }
-    let existing = if gi.exists() { fs::read_to_string(gi)? } else { String::new() };
+    let existing = match fs::symlink_metadata(gi) {
+        Ok(md) if md.file_type().is_file() => fs::read_to_string(gi)?,
+        Ok(_) => anyhow::bail!("{} is not a regular file; refusing to modify it", gi.display()),
+        Err(_) => String::new(),
+    };
     if gitignore_covers(&existing, env_file) {
         return Ok(false);
     }

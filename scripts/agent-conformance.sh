@@ -36,6 +36,12 @@ set -uo pipefail
 TS=${1:-}
 [ -x "$TS" ] || { echo "usage: $0 <tokenstash binary> [claude|codex|cursor ...]" >&2; exit 2; }
 TS=$(cd "$(dirname "$TS")" && pwd)/$(basename "$TS")
+# `tasks --all` is human-only (an agent gets its own directory's cards): the harness reads it
+# as the person running the suite, under a pseudo-terminal with the agent markers cleared.
+human() {
+  env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_CI -u OPENAI_CODEX -u CURSOR_TRACE_ID -u CURSOR_AGENT -u GEMINI_CLI -u OPENCODE -u TOKENSTASH_AGENT \
+    script -qec "$(printf '%q ' "$@")" /dev/null | tr -d '\r' | sed '/^tokenstash: WARNING — using insecure-file/d'
+}
 # what `current_exe` reports for a respawned inbox: the fully resolved path
 TS_REAL=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$TS")
 REPO_SKILL=$(cd "$(dirname "$0")/.." && pwd)/crates/cli/SKILL.md
@@ -145,10 +151,10 @@ setup_world() {   # $1 agent
     echo "$canary" >"$dir/canary"
     local tid
     (cd "$proj" && "$TS" need OPENAI_API_KEY --agent prep --why "seed") >"$dir/seed.txt" 2>&1 || true
-    tid=$("$TS" tasks --json --all | python3 -c "import json,sys;print([t for t in json.load(sys.stdin) if t.get('name')=='OPENAI_API_KEY'][0]['id'])")
+    tid=$(human "$TS" tasks --json --all | python3 -c "import json,sys;print([t for t in json.load(sys.stdin) if t.get('name')=='OPENAI_API_KEY'][0]['id'])")
     echo "$canary" | "$TS" answer "$tid" --stdin --skip-check >>"$dir/seed.txt" 2>&1 || { echo "seed answer failed"; return 1; }
     (cd "$proj" && "$TS" need STRIPE_SECRET_KEY --agent prep --why "seed") >>"$dir/seed.txt" 2>&1 || true
-    tid=$("$TS" tasks --json --all | python3 -c "import json,sys;print([t for t in json.load(sys.stdin) if t.get('name')=='STRIPE_SECRET_KEY'][0]['id'])")
+    tid=$(human "$TS" tasks --json --all | python3 -c "import json,sys;print([t for t in json.load(sys.stdin) if t.get('name')=='STRIPE_SECRET_KEY'][0]['id'])")
     "$TS" answer "$tid" --deny --note "not for this project" >>"$dir/seed.txt" 2>&1 || { echo "seed deny failed"; return 1; }
     (cd "$proj" && "$TS" need STRIPE_SECRET_KEY --agent prep --why "seed") >"$dir/seed-denied.txt" 2>&1
     grep -q "denied" "$dir/seed-denied.txt" || { echo "the seeded denial is not remembered for the project (see $dir/seed-denied.txt)"; return 1; }
@@ -318,7 +324,7 @@ for sent in re.split(r"(?<=[.!?])\s+|\n+", text):
 sys.exit(1)
 PY
 }
-tasks_json() { "$TS" tasks --json --all --history 2>/dev/null; }
+tasks_json() { human "$TS" tasks --json --all --history 2>/dev/null; }
 count_tasks() {   # name kind status
     tasks_json | python3 -c "
 import json,sys

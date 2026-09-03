@@ -36,6 +36,7 @@ pub struct Check {
 fn default_get() -> String { "GET".into() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Provider {
     /// Env var name, e.g. OPENAI_API_KEY
     pub name: String,
@@ -91,4 +92,19 @@ pub fn all() -> Vec<&'static Provider> {
 
 pub fn count() -> usize {
     table().len()
+}
+
+/// Is this value sensitive for its provider: tagged as such, or matching the provider's
+/// `sensitive_pattern` (a live Stripe key beside a test one). One answer for the paste path,
+/// the index, the crawl and the bundle; four hand-rolled copies used to disagree on what a
+/// bad pattern meant.
+pub fn is_sensitive(p: Option<&Provider>, value: &secrecy::SecretString) -> anyhow::Result<bool> {
+    let Some(p) = p else { return Ok(false) };
+    if p.sensitive {
+        return Ok(true);
+    }
+    match &p.sensitive_pattern {
+        Some(sp) => crate::validate::matches_pattern(sp, value),
+        None => Ok(false),
+    }
 }

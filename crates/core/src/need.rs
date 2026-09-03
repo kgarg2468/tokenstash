@@ -118,14 +118,16 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
                 anyhow::bail!("{i:?} is not an identity (letters, digits, dot, dash and underscore, up to 64 characters)");
             }
         }
-        let identity = opts
-            .identity
-            .clone()
-            .or(ctx.db.binding(&ws.id, name)?)
-            .unwrap_or_else(|| match provider.and_then(|p| p.generate.as_deref()) {
-                Some(_) => project_identity(project),
-                None => "default".into(),
-            });
+        // A generated secret is this directory's own signing key and nothing else's. The
+        // caller does not get to choose its identity: `identity: "default"` from project B
+        // would hit the value an older tokenstash stored for project A under the shared
+        // label, and a broad grant would deliver A's key to B without a card. The binding
+        // is ignored for the same reason.
+        let identity = if provider.and_then(|p| p.generate.as_deref()).is_some() {
+            project_identity(project)
+        } else {
+            opts.identity.clone().or(ctx.db.binding(&ws.id, name)?).unwrap_or_else(|| "default".into())
+        };
         let hit = ctx.stash.get(&stash_key(name, &identity))?;
 
         if let Some(value) = hit {
@@ -137,7 +139,7 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
                 // Adopt it into this index, visibly, before anything else happens.
                 // Sensitivity as a paste derives it: the registry tag, or the value
                 // matching the provider's sensitive pattern (a live-mode Stripe key).
-                let by_pattern = provider.and_then(|p| p.sensitive_pattern.as_ref()).map(|sp| crate::validate::matches_pattern(sp, &value).unwrap_or(true)).unwrap_or(false);
+                let by_pattern = registry::is_sensitive(provider, &value).unwrap_or(true);
                 let m = crate::db::SecretMeta {
                     name: name.clone(),
                     identity: identity.clone(),
@@ -171,7 +173,7 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
                     // The env file may already hold this very value (a copy that brought its
                     // .env.local along). One check per (directory, key) per TTL: a planted
                     // guess must not be an oracle for the stash.
-                    let since = (chrono::Utc::now() - chrono::Duration::hours(ctx.cfg.task_ttl_hours as i64)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                    let since = ctx.cfg.ttl_since();
                     if !ctx.db.recent_on_disk_miss(&pid, name, &identity, &since)? && crate::envfile::has(project, &ctx.cfg.env_file, name) {
                         if trust::on_disk_equivalent(project, &ctx.cfg.env_file, name, &value) {
                             Gate::Open { source: crate::db::GRANT_ON_DISK.into() }
@@ -191,11 +193,19 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
             // a denied card followed by a paste elsewhere turns into a silent delivery.
             let gate = match &gate {
                 Gate::Open { source } if source == crate::db::GRANT_BROAD || source == crate::db::GRANT_ON_DISK => {
-                    let since = (chrono::Utc::now() - chrono::Duration::hours(ctx.cfg.task_ttl_hours as i64)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-                    match ctx.db.recent_denial(&pid, name, &identity, &since)? {
-                        Some(d) if !opts.force => {
+                    let since = ctx.cfg.ttl_since();
+                    // Both kinds of "no" count: a refused paste card and a refused pairing or
+                    // sensitive card that named this key. Only the pairing path used to look
+                    // at the second, so "deny the card, later allow-broad on another key"
+                    // delivered the denied key silently.
+                    let denied = match ctx.db.recent_denial(&pid, name, &identity, &since)? {
+                        Some(d) => Some(d.id),
+                        None => denied_card_for(ctx, &pid, &format!("{name}@{identity}"), &since)?,
+                    };
+                    match denied {
+                        Some(tid) if !opts.force => {
                             ctx.db.audit(Some(&pid), Some(agent), "deny.honored", Some(name), Some(&identity), Some("a broad grant does not overrule a denial for this key here"))?;
-                            outcomes.push(Outcome::Denied { name: name.clone(), task_id: d.id });
+                            outcomes.push(Outcome::Denied { name: name.clone(), task_id: tid });
                             continue;
                         }
                         _ => gate,
@@ -246,7 +256,7 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
             // identity, or one the human wrote by hand. Minting a new one would overwrite
             // it: every session signed with the old JWT_SECRET becomes invalid, and
             // anything encrypted with the old ENCRYPTION_KEY becomes unreadable.
-            if let Some(existing) = crate::envfile::read_value(project, &ctx.cfg.env_file, name) {
+            if let Some(existing) = adoptable(project, &ctx.cfg.env_file, name) {
                 tasks::store_and_inject(ctx, name, &identity, &existing, provider.map(|p| p.provider.clone()), None, false, project, agent, None, tasks::Verified::Unknown, crate::db::GRANT_ON_DISK)?;
                 ctx.db.audit(Some(&pid), Some(agent), "adopt.generated", Some(name), Some(&identity), Some("kept the value this project's env file already held instead of generating a new one"))?;
                 outcomes.push(Outcome::Injected { name: name.clone(), identity, written_to: project.join(&ctx.cfg.env_file).display().to_string(), generated: false, unverified: false });
@@ -261,7 +271,7 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
 
         // Honor a recent refusal: "denied — do not ask again" must actually mean that.
         if !opts.force {
-            let since = (chrono::Utc::now() - chrono::Duration::hours(ctx.cfg.task_ttl_hours as i64)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let since = ctx.cfg.ttl_since();
             if let Some(d) = ctx.db.recent_denial(&pid, name, &identity, &since)? {
                 outcomes.push(Outcome::Denied { name: name.clone(), task_id: d.id });
                 continue;
@@ -281,7 +291,7 @@ pub fn need_with_budget(ctx: &Ctx, project: &Path, agent: &str, names: &[String]
         }
         let mut denied_entries: Vec<(String, String)> = vec![]; // (entry, denying task id)
         if !opts.force {
-            let since = (chrono::Utc::now() - chrono::Duration::hours(ctx.cfg.task_ttl_hours as i64)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let since = ctx.cfg.ttl_since();
             for d in ctx.db.recent_denied_approvals(&pid, &since)? {
                 // A denied "this run only" card says nothing about pairing; a denied pairing
                 // or sensitive card does block a later one-time request for the same key.
@@ -442,6 +452,35 @@ pub fn valid_identity(identity: &str) -> bool {
     !identity.is_empty()
         && identity.len() <= 64
         && identity.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// The value this project's env file already holds for a generatable name, if it is worth
+/// keeping: long enough to be a secret and not a placeholder. `cp .env.example .env.local`
+/// leaves `JWT_SECRET=changeme`; adopting that would store a known signing key and report
+/// it delivered.
+pub(crate) fn adoptable(project: &Path, env_file: &str, name: &str) -> Option<SecretString> {
+    use secrecy::ExposeSecret;
+    let v = crate::envfile::read_value(project, env_file, name)?;
+    let s = v.expose_secret();
+    if s.chars().count() < tasks::MIN_SECRET_CHARS || crate::envcrawl::is_placeholder(s) {
+        return None;
+    }
+    Some(v)
+}
+
+/// A denied pairing or sensitive card within the TTL that named this entry. A denied
+/// "this run only" card says nothing about the key in general.
+fn denied_card_for(ctx: &Ctx, pid: &str, entry: &str, since: &str) -> Result<Option<String>> {
+    let name_only = tasks::split_identity(entry).0.to_string();
+    for d in ctx.db.recent_denied_approvals(pid, since)? {
+        if d.expects == tasks::APPROVAL_ONCE {
+            continue;
+        }
+        if d.names.iter().any(|n| n == entry || n == &name_only) {
+            return Ok(Some(d.id));
+        }
+    }
+    Ok(None)
 }
 
 pub fn valid_name(name: &str) -> bool {
@@ -620,7 +659,7 @@ fn replacement(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &st
         }
     }
     if !opts.force {
-        let since = (chrono::Utc::now() - chrono::Duration::hours(ctx.cfg.task_ttl_hours as i64)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let since = ctx.cfg.ttl_since();
         if let Some(d) = ctx.db.recent_denial(&pid, name, identity, &since)? {
             return Ok(Outcome::Denied { name: name.into(), task_id: d.id });
         }

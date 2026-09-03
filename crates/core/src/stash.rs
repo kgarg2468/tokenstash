@@ -16,6 +16,21 @@ use std::path::PathBuf;
 
 const SERVICE: &str = "tokenstash";
 
+/// The keyring service name. The OS store is per user, while every grant and inbox token
+/// is per `TOKENSTASH_HOME`. A process that re-homes tokenstash into a directory it controls
+/// gets an empty stash there, not the real keys under a database it can approve against.
+/// The default home keeps the plain name, so existing entries are untouched.
+pub(crate) fn service() -> String {
+    let home = crate::config::config_dir();
+    if home == crate::config::default_config_dir() {
+        return SERVICE.into();
+    }
+    use sha2::Digest;
+    let canon = home.canonicalize().unwrap_or(home);
+    let d = sha2::Sha256::digest(canon.to_string_lossy().as_bytes());
+    format!("{SERVICE}-{}", d[..4].iter().map(|b| format!("{b:02x}")).collect::<String>())
+}
+
 pub trait Stash {
     fn backend(&self) -> &'static str;
     fn get(&self, key: &str) -> Result<Option<SecretString>>;
@@ -89,7 +104,7 @@ impl KeyringStash {
     /// Round-trip a throwaway entry to confirm the backend works.
     pub fn probe(&self) -> Result<()> {
         let key = "__tokenstash_probe__";
-        let e = keyring::Entry::new(SERVICE, key)?;
+        let e = keyring::Entry::new(&service(), key)?;
         e.set_password("ok")?;
         let got = e.get_password()?;
         let _ = e.delete_credential();
@@ -105,7 +120,7 @@ impl Stash for KeyringStash {
         self.name
     }
     fn get(&self, key: &str) -> Result<Option<SecretString>> {
-        let e = keyring::Entry::new(SERVICE, key)?;
+        let e = keyring::Entry::new(&service(), key)?;
         match e.get_password() {
             Ok(v) => Ok(Some(SecretString::from(v))),
             Err(keyring::Error::NoEntry) => Ok(None),
@@ -113,11 +128,11 @@ impl Stash for KeyringStash {
         }
     }
     fn set(&self, key: &str, value: &SecretString) -> Result<()> {
-        let e = keyring::Entry::new(SERVICE, key)?;
+        let e = keyring::Entry::new(&service(), key)?;
         e.set_password(value.expose_secret()).map_err(|err| anyhow!("keyring write failed: {err}"))
     }
     fn delete(&self, key: &str) -> Result<bool> {
-        let e = keyring::Entry::new(SERVICE, key)?;
+        let e = keyring::Entry::new(&service(), key)?;
         match e.delete_credential() {
             Ok(()) => Ok(true),
             Err(keyring::Error::NoEntry) => Ok(false),

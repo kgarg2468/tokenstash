@@ -18,7 +18,9 @@ pub fn current() -> PathBuf {
 /// Best-effort agent detection from the environment.
 pub fn detect_agent() -> String {
     if let Ok(a) = std::env::var("TOKENSTASH_AGENT") {
-        return a;
+        // Every path that puts the name on a card or a notification must see the same
+        // filtered string; `run` and `report-bad` used to take it raw.
+        return crate::need::clean_agent(&a);
     }
     let has = |k: &str| std::env::var_os(k).is_some();
     if has("CLAUDECODE") || has("CLAUDE_CODE_ENTRYPOINT") {

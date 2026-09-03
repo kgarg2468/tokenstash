@@ -1,4 +1,4 @@
-//! Task lifecycle: create (secret / approval / human), answer, deny, expire.
+//! Task lifecycle: create (secret / approval / human), answer, deny.
 //! Answering a secret task is the only place a value enters the system: validate → store → inject.
 
 use crate::db::{Task, TaskKind, TaskStatus};
@@ -110,6 +110,8 @@ pub fn clean_url(raw: Option<String>) -> Option<String> {
 
 /// Caps for what an agent may put on a card.
 pub const MAX_TITLE_CHARS: usize = 120;
+/// An approval card explains the decision and names the destination file; longer than a why.
+pub const MAX_APPROVAL_WHY_CHARS: usize = 700;
 pub const MAX_WHY_CHARS: usize = 300;
 pub const MAX_STEP_CHARS: usize = 200;
 pub const MAX_STEPS: usize = 8;
@@ -169,7 +171,10 @@ fn create_secret_task_kind(ctx: &Ctx, project: &Path, agent: &str, name: &str, i
         url: p.map(|p| p.url.clone()).or_else(|| clean_url(req.url.clone())),
         steps: if !req.steps.is_empty() { clean_steps(&req.steps) } else { p.map(|p| p.steps.clone()).unwrap_or_default() },
         expects: expects.into(),
-        pattern: req.pattern.clone().or_else(|| p.and_then(|p| p.pattern.clone())),
+        // The registry's pattern wins, like its link. An agent pattern survives only for a
+        // name no provider claims, and only if it compiles: a bad regex would make the card
+        // unanswerable, and an unbounded one is compiled on the human's side.
+        pattern: p.and_then(|p| p.pattern.clone()).or_else(|| req.pattern.clone().filter(|s| s.len() <= 200 && regex::Regex::new(s).is_ok())),
         names: vec![],
         status: TaskStatus::Pending,
         created: crate::now(),
@@ -277,6 +282,10 @@ pub fn create_approval_task(ctx: &Ctx, project: &Path, agent: &str, names: &[Str
             "The key was chosen by a running program's output, not by you or the agent. Allowing delivers it once; the next run asks again.".to_string(),
         ),
     };
+    // The directory name is the agent's to choose (`mkdir`, `cd`): a card title must not
+    // carry its control, bidi or zero-width characters into `tasks` output or the inbox.
+    let title = clean_text(&title, MAX_TITLE_CHARS);
+    let why = clean_text(&why, MAX_APPROVAL_WHY_CHARS);
     let t = Task {
         id: new_id("a"),
         kind: TaskKind::Approval,
@@ -369,6 +378,21 @@ pub enum AnswerResult {
     Done,
 }
 
+/// Would answering this card reach beyond the card's own directory? A replacement card
+/// rewrites every project holding the old value, and a standing grant elsewhere delivers the
+/// new value there on its next `need`. Either way the paste decides for other directories, so
+/// it is not one the agent's own link (or an agent at a shell) may make: without this, a
+/// hostile repo's agent runs `report-bad` → `need` → `answer --stdin` and points every project
+/// of the user at its own database.
+pub fn fans_out(ctx: &Ctx, task: &Task) -> Result<bool> {
+    if task.expects == EXPECTS_REPLACE {
+        return Ok(true);
+    }
+    let Some(name) = task.name.as_deref() else { return Ok(false) };
+    let granted = ctx.db.workspaces_granted(name, &task.identity, false)?;
+    Ok(granted.iter().any(|w| w.root != task.project))
+}
+
 /// Store a secret value for a task: pattern → liveness → stash → index → inject → audit.
 pub fn answer_secret(ctx: &Ctx, task: &Task, value: SecretString, skip_liveness: bool) -> Result<AnswerResult> {
     if task.kind != TaskKind::Secret {
@@ -400,11 +424,7 @@ pub fn answer_secret(ctx: &Ctx, task: &Task, value: SecretString, skip_liveness:
             }
         }
     }
-    let sensitive = provider.map(|p| p.sensitive).unwrap_or(false)
-        || match provider.and_then(|p| p.sensitive_pattern.as_ref()) {
-            Some(sp) => validate::matches_pattern(sp, &value)?,
-            None => false,
-        };
+    let sensitive = registry::is_sensitive(provider, &value)?;
     // Rotation: when a STALE key is being replaced, remember the value so every other project
     // still holding it can be rewritten below. An ordinary paste that happens to differ from
     // a stored value (two projects with their own pending cards) is not a rotation.
@@ -590,16 +610,22 @@ pub fn answer_approval(ctx: &Ctx, task: &Task, decision: Decision, seen: Option<
         let stashed = match stashed {
             Some(v) => Some(v),
             None => match registry::lookup(n).and_then(|p| p.generate.clone()) {
-                Some(spec) if project.is_dir() => match crate::need::generate(&spec) {
+                Some(spec) if project.is_dir() => {
+                    // Same rule as `need`: a value the env file already holds is kept, not
+                    // overwritten — minting a new JWT_SECRET over a live one logs every user out.
+                    let adopted = crate::need::adoptable(project, &ctx.cfg.env_file, n);
+                    let source = if adopted.is_some() { crate::db::GRANT_ON_DISK } else { crate::db::GRANT_GENERATED };
+                    match adopted.or_else(|| crate::need::generate(&spec)) {
                     Some(v) => {
-                        match store_and_inject(ctx, n, identity, &v, registry::lookup(n).map(|p| p.provider.clone()), None, false, project, &task.agent, None, Verified::Unknown, crate::db::GRANT_GENERATED) {
+                        match store_and_inject(ctx, n, identity, &v, registry::lookup(n).map(|p| p.provider.clone()), None, false, project, &task.agent, None, Verified::Unknown, source) {
                             Ok(_) => injected.push(n.to_string()),
                             Err(e) => failures.push(format!("{n}: {e:#}")),
                         }
                         None // delivered here; the loop below is for stashed values
                     }
                     None => { failures.push(format!("{n}: could not generate a value")); None }
-                },
+                    }
+                }
                 _ => None,
             },
         };
@@ -659,15 +685,17 @@ pub fn answer_human(ctx: &Ctx, task: &Task, note: Option<&str>) -> Result<Answer
 }
 
 pub fn deny(ctx: &Ctx, task: &Task, note: Option<&str>) -> Result<AnswerResult> {
+    // The note goes back to the agent as the reason. Same rule as a human answer.
+    if let Some(n) = note {
+        if validate::looks_like_secret(n) {
+            bail!("that note looks like a credential; it would be shown to the agent. Deny without it.");
+        }
+    }
     if !ctx.db.close_task_if_open(&task.id, TaskStatus::Denied, note)? {
         bail!("task {} is already {}", task.id, ctx.db.get_task(&task.id)?.map(|t| t.status.as_str().to_string()).unwrap_or_else(|| "gone".into()));
     }
     ctx.db.audit(Some(&task.project), Some(&task.agent), "deny", task.name.as_deref(), None, None)?;
     Ok(AnswerResult::Denied)
-}
-
-pub fn expire(ctx: &Ctx) -> Result<usize> {
-    ctx.db.expire_overdue()
 }
 
 /// After a key is replaced, every other project that was given this key and whose env
@@ -732,12 +760,9 @@ pub fn rewrite_replaced_value(ctx: &Ctx, name: &str, identity: &str, new: &Secre
         if !env_path.exists() {
             continue; // nothing of ours there to replace
         }
-        let text = match std::fs::read_to_string(&env_path) {
-            Ok(t) => t,
-            Err(e) => {
-                report.skipped.push((project.clone(), format!("cannot read {} ({e})", env_path.display())));
-                continue;
-            }
+        let Some(text) = crate::envfile::read_regular_file(&env_path) else {
+            report.skipped.push((project.clone(), format!("cannot read {} (unreadable, or not a regular file)", env_path.display())));
+            continue;
         };
         let needs_update = text.lines().filter_map(crate::envfile::parse_line).any(|(k, v)| k == name && v != new.expose_secret());
         if !needs_update {
@@ -810,7 +835,7 @@ pub fn report_bad(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: 
     }
     // One report per (project, key) per TTL — but a report made BEFORE the current value
     // was stored is about a previous value and must not shadow a report about this one.
-    let ttl_since = (chrono::Utc::now() - chrono::Duration::hours(ctx.cfg.task_ttl_hours as i64)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let ttl_since = ctx.cfg.ttl_since();
     let since = if meta.created > ttl_since { meta.created.clone() } else { ttl_since };
     if ctx.db.recent_report(&pid, name, identity, &since)?.is_some() {
         return Ok(ReportOutcome::Ignored);

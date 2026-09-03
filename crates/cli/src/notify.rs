@@ -91,7 +91,10 @@ pub fn ensure_inbox(cfg: &Config) -> Inbox {
         use std::os::unix::process::CommandExt;
         c.process_group(0);
     }
-    let _ = c.spawn();
+    if let Err(e) = c.spawn() {
+        eprintln!("tokenstash: could not start the inbox ({e})");
+        return Inbox::Down;
+    }
     for _ in 0..20 {
         let state = inbox_state(cfg);
         if state == Inbox::Ours {

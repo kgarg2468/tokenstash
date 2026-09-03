@@ -92,11 +92,9 @@ impl Drop for Payload_ {
 /// arbitrary bytes into the stash: a name like `FOO=bar` or a value with a newline would
 /// become extra lines in an env file on the next injection.
 pub fn validate_entry(e: &Entry) -> Result<()> {
-    let name_ok = !e.name.is_empty()
-        && e.name.len() <= 128
-        && e.name.as_bytes()[0].is_ascii_uppercase()
-        && e.name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
-    if !name_ok {
+    // The same rule `need` applies, or a key stored on one machine (`my_service_key`) makes
+    // the whole bundle unimportable on the next.
+    if !crate::need::valid_name(&e.name) {
         bail!("entry name {:?} is not a valid variable name", e.name);
     }
     // One rule, shared with `need`: a bundle exported from one machine must import on
@@ -107,7 +105,9 @@ pub fn validate_entry(e: &Entry) -> Result<()> {
     if e.value.chars().count() < crate::tasks::MIN_SECRET_CHARS || e.value.len() > 16 * 1024 {
         bail!("entry {}@{}: value length out of range", e.name, e.identity);
     }
-    if e.value.chars().any(|c| c.is_control()) {
+    // Newlines are how a PEM key or a service-account JSON is stored (the env file quotes
+    // them); any other control character is not part of a credential.
+    if e.value.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')) {
         bail!("entry {}@{}: value contains control characters", e.name, e.identity);
     }
     Ok(())
@@ -274,9 +274,14 @@ mod tests {
         let mut e = sample().entries[0].clone();
         assert!(validate_entry(&e).is_ok());
         e.name = "FOO=bar".into(); assert!(validate_entry(&e).is_err());
-        e.name = "lower".into(); assert!(validate_entry(&e).is_err());
+        // The rule is `need`'s: a lowercase name stored on one machine imports on the next.
+        e.name = "my_service_key".into(); assert!(validate_entry(&e).is_ok());
+        e.name = "9LIVES".into(); assert!(validate_entry(&e).is_err());
         e.name = "OPENAI_API_KEY".into(); e.identity = "a@b".into(); assert!(validate_entry(&e).is_err());
-        e.identity = "work".into(); e.value = "x\nNODE_OPTIONS=--require evil".into(); assert!(validate_entry(&e).is_err());
+        // A newline is a PEM key; the env file quotes it (`envfile::quote`), so it is not an
+        // extra line. Any other control character is not part of a credential.
+        e.identity = "work".into(); e.value = "-----BEGIN KEY-----\nabcdef0123456789\n-----END KEY-----".into(); assert!(validate_entry(&e).is_ok());
+        e.value = "x\u{1b}[31mNODE_OPTIONS=--require evil".into(); assert!(validate_entry(&e).is_err());
         e.value = "short".into(); assert!(validate_entry(&e).is_err());
     }
 

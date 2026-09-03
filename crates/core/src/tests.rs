@@ -7,7 +7,24 @@ use std::path::PathBuf;
 /// harness runs tests in parallel threads, so those tests must not overlap.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    base_home();
     ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A home for every test, set once per process. Without it a test that never takes
+/// `env_lock` — `envfile::write` keeps its lock under `config_dir()/locks`, `FileStash::new`
+/// creates the config dir — writes into the developer's real `~/.config/tokenstash`. Locked
+/// tests set their own home and restore this one instead of unsetting the variable, so an
+/// unlocked test running beside them never falls back to the real home either.
+fn base_home() -> PathBuf {
+    static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let p = std::env::temp_dir().join(format!("tokenstash-test-base-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&p);
+        std::env::set_var("TOKENSTASH_HOME", &p);
+        p
+    })
+    .clone()
 }
 
 /// The human paired this key into this directory (what answering a pairing card records).
@@ -17,6 +34,7 @@ fn pair(db: &Db, proj: &std::path::Path, name: &str) {
 }
 
 fn tmp(name: &str) -> PathBuf {
+    base_home();
     let p = std::env::temp_dir().join(format!("tokenstash-test-{}-{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).unwrap();
@@ -254,7 +272,7 @@ fn require_approval_gates_even_hits() {
     std::env::set_var("TOKENSTASH_HOME", &home);
     std::env::set_var("TOKENSTASH_STASH", "insecure-file");
     let proj = tmp("req-approval-proj").canonicalize().unwrap();
-    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let cfg = Config::default();
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
@@ -340,7 +358,7 @@ fn need_end_to_end_with_file_stash() {
     std::env::set_var("TOKENSTASH_STASH", "insecure-file");
     let proj = tmp("need-proj");
     let proj = proj.canonicalize().unwrap();
-    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let cfg = Config::default();
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
@@ -402,7 +420,7 @@ fn answering_a_secret_marks_the_task_before_injection() {
     std::env::set_var("TOKENSTASH_HOME", &home);
     std::env::set_var("TOKENSTASH_STASH", "insecure-file");
     let proj = tmp("answer-tx-proj").canonicalize().unwrap();
-    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let cfg = Config::default();
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
@@ -435,7 +453,7 @@ fn same_name_different_identities_get_separate_tasks() {
     std::env::set_var("TOKENSTASH_HOME", &home);
     std::env::set_var("TOKENSTASH_STASH", "insecure-file");
     let proj = tmp("ident-proj").canonicalize().unwrap();
-    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let cfg = Config::default();
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
@@ -525,7 +543,7 @@ fn approvals_follow_the_resolved_project_not_the_symlink() {
     let a = base.join("a"); let b = base.join("b"); std::fs::create_dir_all(&a).unwrap(); std::fs::create_dir_all(&b).unwrap();
     let link = base.join("current");
     std::os::unix::fs::symlink(&a, &link).unwrap();
-    let cfg = Config { trust_roots: vec![], ..Default::default() }; // nothing trusted: every project needs approval
+    let cfg = Config::default(); // nothing trusted: every project needs approval
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
@@ -550,7 +568,7 @@ fn approval_injects_the_requested_identity() {
     std::env::set_var("TOKENSTASH_HOME", &home);
     std::env::set_var("TOKENSTASH_STASH", "insecure-file");
     let proj = tmp("approval-ident-proj").canonicalize().unwrap();
-    let cfg = Config { trust_roots: vec![], ..Default::default() }; // untrusted → approval needed
+    let cfg = Config::default(); // untrusted → approval needed
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
@@ -613,7 +631,7 @@ fn approval_is_final_even_if_injection_fails() {
     std::env::set_var("TOKENSTASH_HOME", &home);
     std::env::set_var("TOKENSTASH_STASH", "insecure-file");
     let proj = tmp("approval-final-proj").canonicalize().unwrap();
-    let cfg = Config { trust_roots: vec![], ..Default::default() };
+    let cfg = Config::default();
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
@@ -639,7 +657,7 @@ fn program_derived_approvals_do_not_merge() {
     std::env::set_var("TOKENSTASH_HOME", &home);
     std::env::set_var("TOKENSTASH_STASH", "insecure-file");
     let proj = tmp("approval-merge-proj").canonicalize().unwrap();
-    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let cfg = Config::default();
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
@@ -672,7 +690,7 @@ fn wait_does_not_file_duplicate_program_approvals() {
     std::env::set_var("TOKENSTASH_HOME", &home);
     std::env::set_var("TOKENSTASH_STASH", "insecure-file");
     let proj = tmp("wait-dup-proj").canonicalize().unwrap();
-    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let cfg = Config::default();
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
@@ -856,7 +874,7 @@ fn a_run_shim_approval_is_not_a_standing_grant() {
     std::env::set_var("TOKENSTASH_HOME", &home);
     std::env::set_var("TOKENSTASH_STASH", "insecure-file");
     let proj = tmp("once-proj").canonicalize().unwrap();
-    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let cfg = Config::default();
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
@@ -872,7 +890,7 @@ fn a_run_shim_approval_is_not_a_standing_grant() {
     let t2 = tasks::create_approval_task(&ctx, &proj, "test", &["STRIPE_SECRET_KEY@default".to_string()], tasks::ApprovalKind::Sensitive).unwrap();
     tasks::answer_approval(&ctx, &t2, tasks::Decision::Allow, None).unwrap();
     assert_eq!(db.grant_source(&ws.id, "STRIPE_SECRET_KEY", "default").unwrap().as_deref(), Some(db::GRANT_SENSITIVE));
-    std::env::remove_var("TOKENSTASH_HOME");
+    std::env::set_var("TOKENSTASH_HOME", base_home());
     std::env::remove_var("TOKENSTASH_STASH");
 }
 
@@ -884,7 +902,7 @@ fn a_denied_approval_is_remembered() {
     std::env::set_var("TOKENSTASH_STASH", "insecure-file");
     let proj = tmp("deny-approval-proj").canonicalize().unwrap();
     // outside every trust root, so a stash hit needs approval
-    let cfg = Config { trust_roots: vec![], ..Default::default() };
+    let cfg = Config::default();
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
@@ -910,7 +928,7 @@ fn a_denied_approval_is_remembered() {
     // --force asks again
     let out3 = need::need(&ctx, &proj, "test", &names, &need::NeedOpts { force: true, ..Default::default() }).unwrap();
     assert!(matches!(&out3[0], need::Outcome::Pending { .. }));
-    std::env::remove_var("TOKENSTASH_HOME");
+    std::env::set_var("TOKENSTASH_HOME", base_home());
     std::env::remove_var("TOKENSTASH_STASH");
 }
 
@@ -927,7 +945,7 @@ fn rot_ctx_home(name: &str) -> (PathBuf, PathBuf) {
 fn a_stale_key_is_a_miss_with_the_reason_on_the_card() {
     let _g = env_lock();
     let (home, proj) = rot_ctx_home("stale-miss");
-    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let cfg = Config::default();
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
@@ -949,7 +967,7 @@ fn a_stale_key_is_a_miss_with_the_reason_on_the_card() {
     let m = db.get_secret("OPENAI_API_KEY", "default").unwrap().unwrap();
     assert!(!m.stale && m.stale_reason.is_none());
     assert!(std::fs::read_to_string(proj.join(".env.local")).unwrap().contains("sk-new-"));
-    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 
 #[test]
@@ -957,7 +975,7 @@ fn rotate_files_the_card_and_rewrites_every_project_holding_the_old_value() {
     let _g = env_lock();
     let (home, proj_a) = rot_ctx_home("rotate");
     let proj_b = tmp("rotate-proj-b").canonicalize().unwrap();
-    let cfg = Config { trust_roots: vec![proj_a.clone(), proj_b.clone()], ..Default::default() };
+    let cfg = Config::default();
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
@@ -974,7 +992,7 @@ fn rotate_files_the_card_and_rewrites_every_project_holding_the_old_value() {
     assert!(std::fs::read_to_string(proj_a.join(".env.local")).unwrap().contains("gsk_new_"));
     assert!(std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("gsk_new_"), "project B still held the old value and must be rewritten");
     assert!(!std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("gsk_old_"));
-    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 
 #[test]
@@ -982,7 +1000,7 @@ fn report_bad_needs_standing_and_is_rate_limited() {
     let _g = env_lock();
     let (home, proj) = rot_ctx_home("report");
     let stranger = tmp("report-stranger").canonicalize().unwrap();
-    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let cfg = Config::default();
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
@@ -1013,7 +1031,7 @@ fn report_bad_needs_standing_and_is_rate_limited() {
     tasks::answer_secret(&ctx, &t2, SecretString::from("custom-bbbbbbbbbbbbbbbb".to_string()), true).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(1100));
     assert_eq!(tasks::report_bad(&ctx, &proj, "test", "MY_CUSTOM_TOKEN", "default", Some(401)).unwrap(), tasks::ReportOutcome::MarkedStale, "cooldown must reset when the value changes");
-    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 
 
@@ -1038,7 +1056,7 @@ fn a_stale_key_still_goes_through_the_trust_gate_and_generated_names_regenerate(
     let _g = env_lock();
     let (home, proj) = rot_ctx_home("stale-gate");
     let outside = tmp("stale-gate-outside").canonicalize().unwrap();
-    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let cfg = Config::default();
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
@@ -1058,7 +1076,7 @@ fn a_stale_key_still_goes_through_the_trust_gate_and_generated_names_regenerate(
     let out = need::need(&ctx, &proj, "test", &["AUTH_SECRET".to_string()], &Default::default()).unwrap();
     assert!(matches!(&out[0], need::Outcome::Injected { generated: true, .. }), "{:?}", out[0]);
     assert!(!db.get_secret("AUTH_SECRET", &gid).unwrap().unwrap().stale);
-    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 
 #[test]
@@ -1066,7 +1084,7 @@ fn rotation_reports_projects_it_could_not_rewrite() {
     let _g = env_lock();
     let (home, proj_a) = rot_ctx_home("rotate-skip");
     let proj_b = tmp("rotate-skip-b").canonicalize().unwrap();
-    let cfg = Config { trust_roots: vec![proj_a.clone(), proj_b.clone()], ..Default::default() };
+    let cfg = Config::default();
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
@@ -1083,7 +1101,7 @@ fn rotation_reports_projects_it_could_not_rewrite() {
     assert_eq!(rep.skipped.len(), 1, "{rep:?}");
     assert!(rep.skipped[0].0 == proj_b.to_string_lossy() && rep.skipped[0].1.contains("tracked by git"));
     assert!(std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("gsk_old_"), "B keeps the old value and the human is told");
-    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 
 
@@ -1093,7 +1111,7 @@ fn rotation_never_rewrites_a_project_without_a_standing_grant_and_ordinary_paste
     let (home, proj_a) = rot_ctx_home("rotate-gate");
     let proj_b = tmp("rotate-gate-b").canonicalize().unwrap();
     // B is outside the trust roots: it received the key once via a one-time (run) approval
-    let cfg = Config { trust_roots: vec![proj_a.clone()], ..Default::default() };
+    let cfg = Config::default();
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
@@ -1112,7 +1130,7 @@ fn rotation_never_rewrites_a_project_without_a_standing_grant_and_ordinary_paste
     assert!(std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("gsk_old_"));
     // an ordinary paste in another project with a different value is NOT a rotation
     let proj_c = tmp("rotate-gate-c").canonicalize().unwrap();
-    let cfg2 = Config { trust_roots: vec![proj_a.clone(), proj_c.clone()], ..Default::default() };
+    let cfg2 = Config::default();
     let ctx2 = tasks::Ctx { cfg: &cfg2, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
     let tc = tasks::create_secret_task(&ctx2, &proj_c, "test", "OTHER_KEY", "default", &Default::default()).unwrap();
     tasks::answer_secret(&ctx2, &tc, SecretString::from("other-aaaaaaaaaaaaaaaa".to_string()), true).unwrap();
@@ -1122,7 +1140,7 @@ fn rotation_never_rewrites_a_project_without_a_standing_grant_and_ordinary_paste
     let tasks::AnswerResult::Stored { rotation, .. } = r else { panic!() };
     assert!(rotation.is_none(), "a fresh paste is not a rotation");
     assert!(std::fs::read_to_string(proj_c.join(".env.local")).unwrap().contains("other-aaaa"), "C keeps its own value");
-    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 
 
@@ -1131,7 +1149,7 @@ fn an_ordinary_card_answered_after_a_stale_mark_elsewhere_does_not_propagate() {
     let _g = env_lock();
     let (home, proj_a) = rot_ctx_home("ordinary-vs-stale");
     let proj_b = tmp("ordinary-vs-stale-b").canonicalize().unwrap();
-    let cfg = Config { trust_roots: vec![proj_a.clone(), proj_b.clone()], ..Default::default() };
+    let cfg = Config::default();
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
@@ -1159,7 +1177,7 @@ fn an_ordinary_card_answered_after_a_stale_mark_elsewhere_does_not_propagate() {
     assert_eq!(card.expects, tasks::EXPECTS_REPLACE);
     tasks::answer_secret(&ctx, &card, SecretString::from("gsk_new_dddddddddddddddd".to_string()), true).unwrap();
     assert!(std::fs::read_to_string(proj_b.join(".env.local")).unwrap().contains("gsk_new_dddd"), "B held the ORIGINAL stale value (the ordinary answer changed the stash in between); the replacement still reaches it");
-    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 
 
@@ -1184,7 +1202,7 @@ fn seed(db: &Db, stash: &dyn stash::Stash, proj: &std::path::Path, name: &str, v
 fn at_use_rejection_becomes_a_replace_card_and_writes_nothing() {
     let _env = env_lock();
     let (home, proj) = verify_setup("reject");
-    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let cfg = Config::default();
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let calls = std::cell::Cell::new(0);
@@ -1215,7 +1233,7 @@ fn at_use_rejection_becomes_a_replace_card_and_writes_nothing() {
 fn at_use_ok_refreshes_and_respects_the_window() {
     let _env = env_lock();
     let (home, proj) = verify_setup("ok");
-    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let cfg = Config::default();
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let calls = std::cell::Cell::new(0);
@@ -1265,7 +1283,7 @@ fn at_use_ok_refreshes_and_respects_the_window() {
 fn at_use_unknown_delivers_unverified_with_backoff() {
     let _env = env_lock();
     let (home, proj) = verify_setup("unknown");
-    let cfg = Config { trust_roots: vec![proj.clone()], verify_every: config::VerifyEvery::Always, ..Default::default() };
+    let cfg = Config { verify_every: config::VerifyEvery::Always, ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let calls = std::cell::Cell::new(0);
@@ -1293,7 +1311,7 @@ fn at_use_unknown_delivers_unverified_with_backoff() {
     let in_50m = (chrono::Utc::now() + chrono::Duration::minutes(50)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     assert!(m.next_probe.unwrap() > in_50m, "429 backs off for an hour, not ten minutes");
     // 403 is a verdict that will not change: a restricted key waits a whole window
-    let cfg_day = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let cfg_day = Config::default();
     let ctx_d = tasks::Ctx { cfg: &cfg_day, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Stub(&stub) };
     db.conn.execute("UPDATE secrets SET next_probe=NULL", []).unwrap();
     *verdict.borrow_mut() = validate::Liveness::Unknown("HTTP 403".into());
@@ -1308,7 +1326,7 @@ fn at_use_unknown_delivers_unverified_with_backoff() {
 fn at_use_probe_is_skipped_when_not_allowed() {
     let _env = env_lock();
     let (home, proj) = verify_setup("skip");
-    let cfg = Config { trust_roots: vec![proj.clone()], verify_every: config::VerifyEvery::Always, ..Default::default() };
+    let cfg = Config { verify_every: config::VerifyEvery::Always, ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let calls = std::cell::Cell::new(0);
@@ -1330,7 +1348,7 @@ fn at_use_probe_is_skipped_when_not_allowed() {
     assert!(matches!(out[0], need::Outcome::Injected { .. }), "{out:?}");
     // a project that needs approval gets no probe: the probe transmits the key
     // a directory without a grant gets no probe: the probe transmits the key
-    let cfg_untrusted = Config { trust_roots: vec![], verify_every: config::VerifyEvery::Always, ..Default::default() };
+    let cfg_untrusted = Config { verify_every: config::VerifyEvery::Always, ..Default::default() };
     let ctx_u = tasks::Ctx { cfg: &cfg_untrusted, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Stub(&stub) };
     db.revoke_workspace(&db.find_workspace(&proj).unwrap().unwrap().id).unwrap();
     std::fs::remove_file(proj.join(".env.local")).unwrap(); // else on-disk equivalence would open it
@@ -1347,7 +1365,7 @@ fn at_use_probe_is_skipped_when_not_allowed() {
 fn skip_check_store_turns_verify_off_until_a_probe_says_ok() {
     let _env = env_lock();
     let (home, proj) = verify_setup("skipcheck");
-    let cfg = Config { trust_roots: vec![proj.clone()], verify_every: config::VerifyEvery::Always, ..Default::default() };
+    let cfg = Config { verify_every: config::VerifyEvery::Always, ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let calls = std::cell::Cell::new(0);
@@ -1375,7 +1393,7 @@ fn skip_check_store_turns_verify_off_until_a_probe_says_ok() {
 fn approval_delivery_is_verified_too() {
     let _env = env_lock();
     let (home, proj) = verify_setup("approval");
-    let cfg = Config { trust_roots: vec![], verify_every: config::VerifyEvery::Always, ..Default::default() };
+    let cfg = Config { verify_every: config::VerifyEvery::Always, ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let stub = |_: &registry::Check| validate::Liveness::Rejected(401);
@@ -1409,7 +1427,7 @@ fn approval_delivery_is_verified_too() {
 fn a_verdict_for_a_value_no_longer_stored_is_discarded() {
     let _env = env_lock();
     let (home, proj) = verify_setup("race");
-    let cfg = Config { trust_roots: vec![proj.clone()], verify_every: config::VerifyEvery::Always, ..Default::default() };
+    let cfg = Config { verify_every: config::VerifyEvery::Always, ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     // while the probe is "in flight", another process replaces the key
@@ -1528,7 +1546,7 @@ fn liveness_verdicts_over_loopback() {
 fn probe_budget_delivers_unverified_without_taking_a_lease() {
     let _env = env_lock();
     let (home, proj) = verify_setup("budget");
-    let cfg = Config { trust_roots: vec![proj.clone()], verify_every: config::VerifyEvery::Always, ..Default::default() };
+    let cfg = Config { verify_every: config::VerifyEvery::Always, ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let calls = std::cell::Cell::new(0);
@@ -1584,7 +1602,7 @@ fn agent_names_are_short_and_printable() {
 fn unverified_reports_count_toward_the_cooldown() {
     let _env = env_lock();
     let (home, proj) = verify_setup("reportcool");
-    let cfg = Config { trust_roots: vec![proj.clone()], verify_every: config::VerifyEvery::Never, ..Default::default() };
+    let cfg = Config { verify_every: config::VerifyEvery::Never, ..Default::default() };
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let calls = std::cell::Cell::new(0);
@@ -1604,7 +1622,7 @@ fn unverified_reports_count_toward_the_cooldown() {
 fn skipping_the_check_on_an_uncheckable_key_does_not_flag_it() {
     let _env = env_lock();
     let (home, proj) = verify_setup("uncheckable");
-    let cfg = Config { trust_roots: vec![proj.clone()], ..Default::default() };
+    let cfg = Config::default();
     let db = Db::open(&home.join("t.db")).unwrap();
     let stash = stash::open(&cfg).unwrap();
     let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
@@ -2079,7 +2097,7 @@ fn a_generated_secret_is_per_project() {
     let vb = std::fs::read_to_string(b.join(".env.local")).unwrap();
     assert_ne!(va, vb, "B must not receive A's signing key");
     assert_ne!(need::project_identity(&a), need::project_identity(&b));
-    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 
 /// "No" to this key here outlives a broad grant. Without this, denying a card and then
@@ -2108,7 +2126,7 @@ fn a_broad_grant_does_not_overrule_a_denial_for_this_key() {
     let opts = need::NeedOpts { force: true, ..Default::default() };
     let out = need::need(&ctx, &proj, "agent", &["RESEND_API_KEY".to_string()], &opts).unwrap();
     assert!(matches!(&out[0], need::Outcome::Injected { .. }), "{:?}", out[0]);
-    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 
 /// Generating is delivering: it writes a value and leaves a standing grant, so a
@@ -2139,7 +2157,7 @@ fn generating_a_secret_still_needs_the_run_approval() {
     let (k, v) = envfile::parse_line(text.lines().next().unwrap()).unwrap();
     assert_eq!(k, "AUTH_SECRET");
     assert!(v.len() >= 32, "a real generated value: {}", v.len());
-    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 
 /// Upgrading must not mint a new signing key over the one an application is already using:
@@ -2166,7 +2184,7 @@ fn a_generated_secret_already_in_the_env_file_is_adopted_not_regenerated() {
     // ...and it is now the project's own, so the next request is a plain hit.
     let out = need::need(&ctx, &proj, "agent", &["JWT_SECRET".to_string()], &Default::default()).unwrap();
     assert!(matches!(&out[0], need::Outcome::Injected { generated: false, .. }), "{:?}", out[0]);
-    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 
 /// The card is the human's read of what an agent asked for. The agent writes some of that
@@ -2204,7 +2222,7 @@ fn a_card_never_carries_agent_chosen_markup_or_links() {
     let req = tasks::SecretRequest { url: Some("https://internal.example/keys".to_string()), ..Default::default() };
     let t = tasks::create_secret_task(&ctx, &proj, "agent", "ANOTHER_INTERNAL_KEY", "default", &req).unwrap();
     assert_eq!(t.url.as_deref(), Some("https://internal.example/keys"));
-    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 
 /// `GIT_DIR` and friends change git's answers. Both protections that stand between a secret
@@ -2278,7 +2296,7 @@ fn a_card_that_is_already_answered_cannot_be_answered_again() {
     assert!(format!("{e:#}").contains("somewhere else"), "{e:#}");
     assert_eq!(db.get_task(&t.id).unwrap().unwrap().status, db::TaskStatus::Denied);
     assert!(stash.get(&stash::stash_key("RESEND_API_KEY", "default")).unwrap().is_none(), "nothing stored");
-    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 
 /// The agent-facing lookup is scoped to its own project, including the ambiguous case:
@@ -2299,9 +2317,9 @@ fn a_task_prefix_never_reaches_across_projects() {
     assert_eq!(db.find_task_in(&mine_id, &a.id).unwrap().map(|t| t.id), Some(a.id.clone()));
     assert!(db.find_task_in(&mine_id, &b.id).unwrap().is_none(), "another project's exact id is not found");
     // "t" matches both across the whole table; scoped, it can only ever match this project's
-    assert!(db.find_task(&a.id[..3]).is_err() || db.find_task_in(&mine_id, "t").unwrap().is_some());
+    assert!(db.find_task_in(&mine_id, "t").unwrap().is_some(), "a prefix that is ambiguous table-wide resolves within one project");
     assert!(db.find_task_in(&mine_id, "t").unwrap().map(|t| t.project) != Some(theirs.to_string_lossy().to_string()));
-    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 
 /// An identity is part of the stash key and of what the human reads on the card.
@@ -2446,12 +2464,12 @@ fn a_workspace_fingerprint_compares_more_than_the_inode() {
     // recycle the inode. It is not the one the human paired.
     db.conn.execute("UPDATE workspaces SET btime='1999-01-01T00:00:00Z' WHERE id=?1", rusqlite::params![ws.id]).unwrap();
     let seen = db.find_workspace(&proj).unwrap();
-    assert!(seen.is_none() || !seen.unwrap().fingerprint_ok, "a changed birth time must close the gate");
+    assert!(seen.is_none(), "a changed birth time must close the gate (find_workspace only returns matching records)");
 
     // ...and the device number is compared too, for the same reason across mounts.
     db.conn.execute("UPDATE workspaces SET btime=NULL, dev=dev+1 WHERE id=?1", rusqlite::params![ws.id]).unwrap();
     let seen = db.find_workspace(&proj).unwrap();
-    assert!(seen.is_none() || !seen.unwrap().fingerprint_ok, "a changed device must close the gate");
+    assert!(seen.is_none(), "a changed device must close the gate (find_workspace only returns matching records)");
 }
 
 /// Two `need`s running at once (a CLI run and the MCP server) must both land in the env
@@ -2522,5 +2540,220 @@ fn a_one_time_approval_that_delivers_nothing_reopens_its_card() {
     assert!(format!("{err:#}").contains("still open"), "the human is told the card survived: {err:#}");
     assert_eq!(db.get_task(&tid).unwrap().unwrap().status, db::TaskStatus::Pending, "nothing was delivered, so the yes is still owed an answer");
     assert!(!proj.join(".env.local").exists(), "and nothing was written");
-    std::env::remove_var("TOKENSTASH_HOME"); std::env::remove_var("TOKENSTASH_STASH");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+/// A generated secret is this directory's own; the caller does not pick its identity. With a
+/// broad grant, `identity: "default"` used to deliver the value an older tokenstash stored
+/// for another project under the shared label.
+#[test]
+fn a_generated_name_ignores_the_callers_identity() {
+    let _g = env_lock();
+    let (home, proj) = v2_world("gen-identity");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let other = "another-projects-signing-key-0123456789";
+    stash.set(&stash::stash_key("JWT_SECRET", "default"), &SecretString::from(other.to_string())).unwrap();
+    let ws = db.workspace_for(&proj).unwrap();
+    db.grant(&ws.id, "*", "default", db::GRANT_BROAD, db::GRANT_PAIRING).unwrap();
+    let opts = need::NeedOpts { identity: Some("default".into()), ..Default::default() };
+    let out = need::need(&ctx, &proj, "agent", &["JWT_SECRET".to_string()], &opts).unwrap();
+    match &out[0] {
+        need::Outcome::Injected { generated, identity, .. } => {
+            assert!(*generated, "minted, not delivered from the shared label: {:?}", out[0]);
+            assert_ne!(identity, "default");
+        }
+        o => panic!("{o:?}"),
+    }
+    let text = std::fs::read_to_string(proj.join(".env.local")).unwrap();
+    assert_ne!(envfile::parse_line(text.lines().next().unwrap()).unwrap().1, other, "the other project's key never reached this file");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+/// `cp .env.example .env.local` leaves `JWT_SECRET=changeme`; that is not a key to keep.
+#[test]
+fn a_placeholder_in_the_env_file_is_not_adopted() {
+    let _g = env_lock();
+    let (home, proj) = v2_world("gen-placeholder");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    std::fs::write(proj.join(".env.local"), "JWT_SECRET=changeme\n").unwrap();
+    let out = need::need(&ctx, &proj, "agent", &["JWT_SECRET".to_string()], &Default::default()).unwrap();
+    assert!(matches!(&out[0], need::Outcome::Injected { generated: true, .. }), "{:?}", out[0]);
+    let text = std::fs::read_to_string(proj.join(".env.local")).unwrap();
+    let (_, v) = envfile::parse_line(text.lines().next().unwrap()).unwrap();
+    assert_ne!(v, "changeme");
+    assert!(v.len() >= 32);
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+/// A `run` card for a generatable name is approved before anything is generated. Approving it
+/// must keep the value the env file already holds, exactly as `need` does.
+#[test]
+fn approving_a_once_card_keeps_the_env_files_value() {
+    let _g = env_lock();
+    let (home, proj) = v2_world("gen-once-adopt");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let live = "the-value-every-session-is-signed-with-0123456789";
+    std::fs::write(proj.join(".env.local"), format!("AUTH_SECRET={live}\n")).unwrap();
+    let opts = need::NeedOpts { require_approval: true, ..Default::default() };
+    let out = need::need(&ctx, &proj, "prog", &["AUTH_SECRET".to_string()], &opts).unwrap();
+    let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
+    let card = db.get_task(&tid).unwrap().unwrap();
+    tasks::answer_approval(&ctx, &card, tasks::Decision::Allow, Some(&card.names)).unwrap();
+    let text = std::fs::read_to_string(proj.join(".env.local")).unwrap();
+    assert_eq!(envfile::parse_line(text.lines().next().unwrap()).unwrap().1, live, "approval adopted, not overwrote");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+/// "No" to a pairing card for a key is a no for that key here — a broad grant given later
+/// (allow-broad on some other card) must not turn into a silent delivery of it.
+#[test]
+fn a_denied_pairing_card_blocks_a_later_broad_delivery_of_that_key() {
+    let _g = env_lock();
+    let (home, proj) = v2_world("deny-then-broad");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    stash.set(&stash::stash_key("GROQ_API_KEY", "default"), &SecretString::from("gsk_bbbbbbbbbbbbbbbbbbbb".to_string())).unwrap();
+    let out = need::need(&ctx, &proj, "agent", &["GROQ_API_KEY".to_string()], &Default::default()).unwrap();
+    let tid = match &out[0] { need::Outcome::Pending { task_id, .. } => task_id.clone(), o => panic!("{o:?}") };
+    let card = db.get_task(&tid).unwrap().unwrap();
+    assert_eq!(card.kind, db::TaskKind::Approval);
+    tasks::deny(&ctx, &card, None).unwrap();
+    let ws = db.workspace_for(&proj).unwrap();
+    db.grant(&ws.id, "*", "default", db::GRANT_BROAD, db::GRANT_PAIRING).unwrap();
+    let out = need::need(&ctx, &proj, "agent", &["GROQ_API_KEY".to_string()], &Default::default()).unwrap();
+    assert!(matches!(&out[0], need::Outcome::Denied { .. }), "the broad grant does not overrule the denial: {:?}", out[0]);
+    assert!(!proj.join(".env.local").exists());
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+/// A FIFO at the env path is one `mkfifo` away for an agent; `has` runs on every request.
+#[test]
+fn has_does_not_hang_on_a_fifo() {
+    let dir = tmp("fifo-has");
+    assert!(std::process::Command::new("mkfifo").arg(dir.join(".env.local")).status().unwrap().success());
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let d2 = done.clone(); let dir2 = dir.clone();
+    std::thread::spawn(move || { let _ = envfile::has(&dir2, ".env.local", "A"); d2.store(true, std::sync::atomic::Ordering::SeqCst); });
+    let start = std::time::Instant::now();
+    while !done.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "has() blocked on the FIFO");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(envfile::read_regular_file(&dir.join(".env.local")).is_none());
+}
+
+/// The directory name is the agent's: control and bidi characters in it must not reach the
+/// card title, which `tokenstash tasks` prints raw.
+#[test]
+fn an_approval_card_title_is_cleaned_of_the_directory_names_control_characters() {
+    let _g = env_lock();
+    let home = tmp("card-title-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    let proj = tmp("evil\u{202e}\u{1b}[31mdir").canonicalize().unwrap();
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let st = stash::FileStash::new().unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: &st, probe: tasks::Probe::Off };
+    let t = tasks::create_approval_task(&ctx, &proj, "agent", &["OPENAI_API_KEY@default".to_string()], tasks::ApprovalKind::Pairing).unwrap();
+    assert!(!t.title.contains('\u{202e}') && !t.title.contains('\u{1b}'), "{:?}", t.title);
+    assert!(t.title.contains("dir") && t.title.contains("wants"), "{:?}", t.title);
+    std::env::set_var("TOKENSTASH_HOME", base_home());
+}
+
+/// A paste that other directories will receive — a Replace card, or a key they hold a grant
+/// for — is a decision about them; the agent's own link must not make it.
+#[test]
+fn fans_out_when_another_directory_holds_a_grant_or_the_card_is_a_replacement() {
+    let _g = env_lock();
+    let (home, proj_a) = v2_world("fanout-a");
+    let proj_b = tmp("fanout-b").canonicalize().unwrap();
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    pair(&db, &proj_a, "OPENAI_API_KEY");
+    let req = tasks::SecretRequest::default();
+    let held_elsewhere = tasks::create_secret_task(&ctx, &proj_b, "agent", "OPENAI_API_KEY", "default", &req).unwrap();
+    assert!(tasks::fans_out(&ctx, &held_elsewhere).unwrap(), "A holds a grant for it");
+    let fresh = tasks::create_secret_task(&ctx, &proj_b, "agent", "RESEND_API_KEY", "default", &req).unwrap();
+    assert!(!tasks::fans_out(&ctx, &fresh).unwrap(), "nobody else holds it");
+    let own = tasks::create_secret_task(&ctx, &proj_a, "agent", "GROQ_API_KEY", "default", &req).unwrap();
+    assert!(!tasks::fans_out(&ctx, &own).unwrap());
+    let replace = tasks::create_replacement_task(&ctx, &proj_b, "agent", "RESEND_API_KEY", "default", &req).unwrap();
+    assert!(tasks::fans_out(&ctx, &replace).unwrap(), "a replacement rewrites every holder");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+/// `TOKENSTASH_AGENT` reaches cards, notifications and the terminal; it is filtered where it
+/// is read, so `run` and `report-bad` cannot take it raw by forgetting to.
+#[test]
+fn detect_agent_filters_the_environment_value() {
+    let _g = env_lock();
+    std::env::set_var("TOKENSTASH_AGENT", "my\u{202e}<b onclick=x>agent\u{1b}[31m");
+    let a = project::detect_agent();
+    std::env::remove_var("TOKENSTASH_AGENT");
+    assert!(!a.contains('\u{202e}') && !a.contains('<') && !a.contains('\u{1b}'), "{a:?}");
+    assert!(a.contains("agent"));
+}
+
+/// The OS keyring is per user; every grant is per home. A home the caller invents must not
+/// find the real keys in it. The default home keeps the plain name so nothing migrates.
+#[test]
+fn the_keyring_service_is_namespaced_by_a_non_default_home() {
+    let _g = env_lock();
+    let home = tmp("svc-home");
+    std::env::set_var("TOKENSTASH_HOME", &home);
+    let s = stash::service();
+    assert!(s.starts_with("tokenstash-") && s != "tokenstash", "{s}");
+    let again = stash::service();
+    assert_eq!(s, again, "stable for the same home");
+    std::env::set_var("TOKENSTASH_HOME", base_home());
+    assert_ne!(stash::service(), s, "a different home is a different stash");
+}
+
+/// One notion of "this line defines NAME" for readers and the writer: an indented line used
+/// to be invisible to `has` and to `upsert`, which then appended a second definition.
+#[test]
+fn an_indented_definition_is_seen_and_replaced_not_duplicated() {
+    let dir = tmp("indented");
+    std::fs::write(dir.join(".env.local"), "  A_KEY=old\nB=1\n").unwrap();
+    assert!(envfile::has(&dir, ".env.local", "A_KEY"));
+    envfile::write(&dir, ".env.local", "A_KEY", &SecretString::from("new-value".to_string())).unwrap();
+    let text = std::fs::read_to_string(dir.join(".env.local")).unwrap();
+    assert_eq!(text.lines().filter(|l| envfile::parse_line(l).map(|(k, _)| k == "A_KEY").unwrap_or(false)).count(), 1, "{text}");
+    assert!(text.contains("A_KEY=new-value") && text.contains("B=1"), "{text}");
+}
+
+/// A `query:` probe used to append the value raw; `&` or `#` in a key sent it truncated.
+#[test]
+fn a_query_auth_value_is_percent_encoded() {
+    assert_eq!(validate::percent_encode("a&b#c d~z"), "a%26b%23c%20d~z");
+    assert_eq!(validate::percent_encode("AQ.plain-Key_0"), "AQ.plain-Key_0");
+}
+
+/// A deny note goes back to the agent as the reason; a credential must not ride along.
+#[test]
+fn a_deny_note_that_looks_like_a_secret_is_refused() {
+    let _g = env_lock();
+    let (home, proj) = v2_world("deny-note");
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    let t = tasks::create_secret_task(&ctx, &proj, "agent", "OPENAI_API_KEY", "default", &Default::default()).unwrap();
+    assert!(tasks::deny(&ctx, &t, Some("sk-abcdefghijklmnopqrstuvwxyz012345")).is_err());
+    assert_eq!(db.get_task(&t.id).unwrap().unwrap().status, db::TaskStatus::Pending, "a refused note must not close the card");
+    tasks::deny(&ctx, &t, Some("we use a different provider")).unwrap();
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }

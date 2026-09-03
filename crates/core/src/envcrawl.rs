@@ -39,7 +39,7 @@ pub fn display_path(p: &Path) -> String {
     p.to_string_lossy().chars().filter(|c| !c.is_control()).collect()
 }
 
-fn is_placeholder(value: &str) -> bool {
+pub(crate) fn is_placeholder(value: &str) -> bool {
     let v = value.trim().to_ascii_lowercase();
     PLACEHOLDERS.contains(&v.as_str()) || v.chars().all(|c| c == 'x' || c == '*' || c == '.' || c == '-' || c == '_')
 }
@@ -76,24 +76,20 @@ fn is_env_file(name: &str) -> bool {
     rest.starts_with('.')
 }
 
-#[cfg(unix)]
 fn owned_by_me(md: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
-    extern "C" { fn geteuid() -> u32; }
-    md.uid() == unsafe { geteuid() }
+    md.uid() == crate::envfile::euid()
 }
-#[cfg(not(unix))]
-fn owned_by_me(_md: &std::fs::Metadata) -> bool { true }
-
 /// `.envrc` lines can be code; keep only plain assignments.
 fn envrc_line_is_plain(line: &str) -> bool {
     let t = line.trim();
     !(t.contains("$(") || t.contains('`') || t.starts_with("source ") || t.starts_with(". ") || t.starts_with("eval ") || t.contains("${"))
 }
 
+/// Crawl candidates are the conventional uppercase names: a lowercase `path=` in an `.envrc`
+/// is shell state, not a credential. Import itself accepts what `need` accepts.
 fn name_ok(name: &str) -> bool {
-    !name.is_empty() && name.len() <= 128 && name.as_bytes()[0].is_ascii_uppercase()
-        && name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    crate::need::valid_name(name) && name.bytes().all(|b| !b.is_ascii_lowercase())
 }
 
 fn secret_ish_name(name: &str) -> bool {
@@ -112,7 +108,7 @@ fn classify(name: &str, value: &str) -> Option<(Confidence, Option<String>, bool
             Some(pat) => regex::Regex::new(pat).map(|re| re.is_match(value)).unwrap_or(true),
             None => crate::validate::looks_like_secret(value),
         } && !is_placeholder(value);
-        let sensitive = p.sensitive || p.sensitive_pattern.as_ref().map(|sp| regex::Regex::new(sp).map(|re| re.is_match(value)).unwrap_or(false)).unwrap_or(false);
+        let sensitive = crate::registry::is_sensitive(Some(p), &SecretString::from(value.to_string())).unwrap_or(true);
         return Some((if matches { Confidence::Registry } else { Confidence::RegistryShapeMismatch }, Some(p.provider.clone()), sensitive));
     }
     if secret_ish_name(name) && !is_placeholder(value) && !value.contains("://") && !value.starts_with('/') && crate::validate::looks_like_secret(value) {

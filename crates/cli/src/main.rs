@@ -99,6 +99,9 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Mcp => cmd::mcp::serve(),
         Cmd::Inbox(a) => cmd::inbox::serve(a),
         Cmd::Open => {
+            // The URL below carries the full inbox session, which approves cards. Printed to
+            // a pipe it lands in an agent's context — the one place it must never be.
+            util::require_human("open", "it prints the full inbox session, which can approve cards")?;
             let cfg = tokenstash_core::Config::load()?;
             let state = notify::ensure_inbox(&cfg);
             // `open` exists to put a person in front of the inbox, so it carries the session
@@ -118,7 +121,7 @@ fn run(cli: Cli) -> Result<i32> {
             for p in tokenstash_core::registry::all() {
                 println!("{:<36} {:<22} {}{}", p.name, p.provider, p.url, if p.sensitive { "  [sensitive]" } else { "" });
             }
-            println!("\n{} providers. Add more: crates/core/registry/providers.json", tokenstash_core::registry::count());
+            println!("\n{} providers. Missing one? https://github.com/kgarg2468/tokenstash/blob/main/CONTRIBUTING.md", tokenstash_core::registry::count());
             Ok(0)
         }
     }
