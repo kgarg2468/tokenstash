@@ -17,7 +17,7 @@ def absolute_links(readme, repo=REPO):
         if re.match(r"^(https?:|mailto:|#|data:)", target):
             return target
         kind = "raw" if re.search(r"\.(png|gif|svg|jpe?g)$", target) else "blob"
-        return f"{repo}/{kind}/main/{target.lstrip('./')}"
+        return f"{repo}/{kind}/main/{target.removeprefix('./')}"
 
     readme = re.sub(r"(\]\()([^)\s]+)\)", lambda m: f"{m.group(1)}{absolute(m.group(2))})", readme)
     return re.sub(r'((?:href|src)=")([^"]+)"', lambda m: f'{m.group(1)}{absolute(m.group(2))}"', readme)

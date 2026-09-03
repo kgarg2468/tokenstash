@@ -4,8 +4,23 @@ on:
     tags: ["v*"]
 permissions: { contents: write }
 jobs:
+  test:
+    # A tag on an untested commit must not publish. Same gate as ci.yml, minus the leak test
+    # (the release binaries are checked below).
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with: { toolchain: stable, components: clippy }
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --locked
   release:
-    # Created once, so the four build jobs never race on creating the same release.
+    # Created once, as a DRAFT, so the four build jobs never race on creating the same
+    # release and `releases/latest` keeps pointing at the previous version until every
+    # artifact and every registry step has succeeded (see `publish` at the bottom).
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -16,10 +31,15 @@ jobs:
           tag="${GITHUB_REF_NAME#v}"; base="${tag%%-*}"
           cargo=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
           [ "$base" = "$cargo" ] || { echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo"; exit 1; }
+          # The same pre-release grammar PyPI accepts (scripts/pypi-wheels.py): a suffix that
+          # passed here and failed there used to leave a half-published release.
+          case "$tag" in
+            *-*) echo "$tag" | grep -Eq -- '-(rc|a|b|alpha|beta)\.[0-9]+$' || { echo "pre-release tag must end in -rc.N, -a.N, -b.N, -alpha.N or -beta.N"; exit 1; } ;;
+          esac
       - env: { GH_TOKEN: "${{ github.token }}" }
         run: |
           pre=""; case "$GITHUB_REF_NAME" in *-*) pre="--prerelease" ;; esac
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" $pre --generate-notes --notes "See CHANGELOG.md for what changed and how the upgrade behaves."
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" $pre --draft --generate-notes --notes "See CHANGELOG.md for what changed and how the upgrade behaves."
   build:
     needs: release
     strategy:
@@ -33,6 +53,7 @@ jobs:
           - { os: macos-latest,    target: aarch64-apple-darwin,       name: darwin-arm64 }
           - { os: macos-15-intel,  target: x86_64-apple-darwin,        name: darwin-x64 }
     runs-on: ${{ matrix.os }}
+    permissions: { contents: write, id-token: write, attestations: write }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
@@ -56,6 +77,11 @@ jobs:
           cp target/${{ matrix.target }}/release/tokenstash dist/
           tar -C dist -czf tokenstash-${{ matrix.name }}.tar.gz tokenstash
           shasum -a 256 tokenstash-${{ matrix.name }}.tar.gz > tokenstash-${{ matrix.name }}.tar.gz.sha256
+      # Signed provenance for the tarball itself: `gh attestation verify tokenstash-*.tar.gz
+      # --repo kgarg2468/tokenstash` proves it was built by this workflow from this commit.
+      # npm and PyPI carry their own; the direct-download and brew paths had nothing.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with: { subject-path: "tokenstash-${{ matrix.name }}.tar.gz" }
       - env: { GH_TOKEN: "${{ github.token }}" }
         run: gh release upload "$GITHUB_REF_NAME" tokenstash-${{ matrix.name }}.tar.gz tokenstash-${{ matrix.name }}.tar.gz.sha256 --clobber
       # The same bytes, kept inside this run. Release assets are mutable by anyone holding
@@ -125,7 +151,12 @@ jobs:
         # --locked because cargo rewrites the path dependency for the verification build.
         run: |
           v="${GITHUB_REF_NAME#v}"
-          published() { curl -sf -H 'User-Agent: tokenstash-release (github.com/kgarg2468/tokenstash)' "https://crates.io/api/v1/crates/$1/$2" >/dev/null; }
+          # 200 = already there, 404 = not yet; anything else is crates.io or the network,
+          # which must not be mistaken for "not published" and turned into a failing publish.
+          published() {
+            code=$(curl -s -o /dev/null -w '%{http_code}' -H 'User-Agent: tokenstash-release (github.com/kgarg2468/tokenstash)' "https://crates.io/api/v1/crates/$1/$2")
+            case "$code" in 200) return 0 ;; 404) return 1 ;; *) echo "crates.io answered $code for $1 $2"; exit 1 ;; esac
+          }
           published tokenstash-core "$v" || cargo publish -p tokenstash-core --locked
           published tokenstash "$v" || cargo publish -p tokenstash
         env: { CARGO_REGISTRY_TOKEN: "${{ secrets.CARGO_REGISTRY_TOKEN }}" }
@@ -161,7 +192,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - env: { GH_TOKEN: "${{ github.token }}" }
+      - name: take the digests from this run, not from the mutable release
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with: { pattern: "binary-*", merge-multiple: true, path: /tmp/dist }
+      - env: { GH_TOKEN: "${{ github.token }}", SUMS_DIR: /tmp/dist }
         run: |
           bash scripts/brew-formula.sh "$GITHUB_REF_NAME" > tokenstash.rb
           ruby -c tokenstash.rb
@@ -179,3 +213,20 @@ jobs:
           if git diff --cached --quiet; then echo "formula unchanged"; exit 0; fi
           git -c user.name=tokenstash-release -c user.email=noreply@github.com commit -qm "tokenstash $GITHUB_REF_NAME"
           git -c http.extraheader="$auth" push -q origin HEAD
+  publish:
+    # Flip the draft to a real release only when everything that was supposed to run did.
+    # A failed npm or PyPI step leaves the draft in place: `releases/latest` still points at
+    # the previous version, and re-running the failed jobs completes the set.
+    needs: [build, npm, crates, pypi, brew]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: "${{ github.token }}"
+          RESULTS: "${{ join(needs.*.result, ' ') }}"
+        run: |
+          for r in $RESULTS; do
+            case "$r" in success|skipped) ;; *) echo "a release job ended with '$r'; leaving the release as a draft"; exit 1 ;; esac
+          done
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+          echo "published $GITHUB_REF_NAME"
