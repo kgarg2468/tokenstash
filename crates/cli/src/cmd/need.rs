@@ -31,7 +31,7 @@ pub struct NeedArgs {
     #[arg(long)]
     pub blocking: bool,
     /// Seconds to wait when --blocking.
-    #[arg(long, default_value = "600")]
+    #[arg(long, default_value = "600", requires = "blocking")]
     pub timeout: u64,
     /// Agent name for the audit log (auto-detected).
     #[arg(long)]
@@ -45,6 +45,11 @@ pub struct NeedArgs {
 }
 
 pub fn need(a: NeedArgs) -> Result<i32> {
+    // "Denied" is remembered for a day so a program failing in a loop cannot nag. Asking
+    // again over that is the person's call, never the agent's.
+    if a.force {
+        util::require_human("need --force", "it asks again after the user said no")?;
+    }
     let app = App::open()?;
     // The directory this command runs in is the project: a caller-named path would let a
     // script choose which directory's grants it uses. (Read-only `tasks`/`audit` keep --project.)
@@ -91,7 +96,7 @@ pub fn need(a: NeedArgs) -> Result<i32> {
                 Outcome::Pending { name, task_id, .. } => {
                     println!("⏳ {name} pending — task {task_id} → {}", util::inbox_url_agent(&app.cfg, Some(task_id), state));
                 }
-                Outcome::Denied { name, .. } => println!("✗ {name} denied by the user — do not ask again; work around it"),
+                Outcome::Denied { name, .. } => println!("✗ {name} denied by the user — do not ask again, and do not supply a stand-in value by any route; make the feature optional or report it blocked"),
                 Outcome::Expired { name, .. } => println!("✗ {name} expired unanswered"),
             }
         }
@@ -100,7 +105,7 @@ pub fn need(a: NeedArgs) -> Result<i32> {
             // the line above is an explanation, and an agent following "open the link above"
             // would hand the user an error string as a URL.
             if matches!(state, notify::Inbox::Ours) {
-                eprintln!("\nTell the user to open the link above — it works as-is for pasting the key. The user has also been notified on the desktop. Continue with other work; re-run this command or `tokenstash tasks` to check.");
+                eprintln!("\nTell the user to open the link above: it works as-is for pasting a missing key. If the card is an approval (a stored key waiting for this directory's yes), the user approves it from the desktop notification or by running `tokenstash open` in a terminal. Continue with other work; `tokenstash tasks` shows the status.");
             } else {
                 eprintln!("\nThere is no inbox link yet (see the message above). Tell the user to run `tokenstash open` in a terminal; that starts the inbox and opens it. Continue with other work; re-run this command or `tokenstash tasks` to check.");
             }
@@ -111,9 +116,14 @@ pub fn need(a: NeedArgs) -> Result<i32> {
 
 pub fn notify_pending(app: &App, project: &std::path::Path, agent: &str, outcomes: &[Outcome]) {
     let state = notify::ensure_inbox(&app.cfg);
-    let pending: Vec<&str> = outcomes.iter().filter(|o| o.is_pending()).map(|o| o.name()).collect();
-    let first_id = outcomes.iter().find_map(|o| match o { Outcome::Pending { task_id, .. } => Some(task_id.clone()), _ => None });
-    let _ = &pending;
+    // One notification per card. A polling agent re-runs `need` every few seconds and gets
+    // the same card back; the human must not get the same toast back.
+    let fresh: Vec<&Outcome> = outcomes.iter().filter(|o| matches!(o, Outcome::Pending { task_id, .. } if app.db.mark_notified(task_id).unwrap_or(true))).collect();
+    if fresh.is_empty() {
+        return;
+    }
+    let pending: Vec<&str> = fresh.iter().map(|o| o.name()).collect();
+    let first_id = fresh.iter().find_map(|o| match o { Outcome::Pending { task_id, .. } => Some(task_id.clone()), _ => None });
     notify::desktop(
         &app.cfg,
         &format!("{} needs {}", tokenstash_core::project::short(project), pending.join(", ")),
@@ -152,7 +162,8 @@ pub struct AskArgs {
     pub expects: String,
     #[arg(long)]
     pub blocking: bool,
-    #[arg(long, default_value = "600")]
+    /// Seconds to wait when --blocking.
+    #[arg(long, default_value = "600", requires = "blocking")]
     pub timeout: u64,
     #[arg(long)]
     pub agent: Option<String>,

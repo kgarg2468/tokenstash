@@ -41,6 +41,11 @@ pub fn answer(a: AnswerArgs) -> Result<i32> {
             app.db.list_tasks(Some(&project.to_string_lossy()), true)?.into_iter().next().ok_or_else(|| anyhow::anyhow!("no open tasks in this project"))?
         }
     };
+    // An agent at a shell may answer its own directory's cards and nothing else's: any id is
+    // one `tasks --all` away, and a denial or a note is a decision about that directory.
+    if std::path::Path::new(&task.project) != tokenstash_core::project::current() {
+        util::require_human("answer", "this card belongs to another directory")?;
+    }
     let ctx = app.ctx();
 
     if a.deny {
@@ -51,6 +56,11 @@ pub fn answer(a: AnswerArgs) -> Result<i32> {
 
     match task.kind {
         TaskKind::Secret => {
+            // A paste that other directories will receive (a Replace card; a key they hold a
+            // grant for) is a decision about them, not about this one.
+            if tasks::fans_out(&ctx, &task)? {
+                util::require_human("answer", "this key is held by other directories, so the paste reaches them too")?;
+            }
             let name = task.name.clone().unwrap_or_default();
             println!("{}  [{}]", task.title, util::short(&task.project));
             if let Some(w) = &task.why { println!("  why: {w}"); }

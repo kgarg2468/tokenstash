@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Directories whose projects get silent injection of non-sensitive keys.
+    /// Retired in 0.2 (nothing is trusted by folder); parsed so a 0.1 config still loads.
     #[serde(default)]
     pub trust_roots: Vec<PathBuf>,
     /// Env file name written into projects.
@@ -133,15 +133,30 @@ pub fn config_dir() -> PathBuf {
 /// rather than one home (the init undo manifest).
 pub fn default_config_dir() -> PathBuf {
     dirs::config_dir()
-        .unwrap_or_else(|| dirs::home_dir().expect("no home dir").join(".config"))
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from("/nonexistent")).join(".config"))
         .join("tokenstash")
 }
 
 pub fn config_path() -> PathBuf { config_dir().join("config.toml") }
+
+/// Somewhere to keep state, or a clear error. Without `$HOME`, an XDG config dir or
+/// `TOKENSTASH_HOME` (a container, a bare systemd unit) every command used to panic.
+pub fn require_home() -> Result<()> {
+    if std::env::var("TOKENSTASH_HOME").map(|v| !v.is_empty()).unwrap_or(false) || dirs::config_dir().is_some() || dirs::home_dir().is_some() {
+        return Ok(());
+    }
+    anyhow::bail!("no home directory to keep state in: set TOKENSTASH_HOME to a private directory")
+}
 pub fn db_path() -> PathBuf { config_dir().join("tokenstash.db") }
 
 impl Config {
+    /// Start of the window in which a denial or an unanswered card still counts, RFC 3339.
+    pub fn ttl_since(&self) -> String {
+        (chrono::Utc::now() - chrono::Duration::hours(self.task_ttl_hours as i64)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+
     pub fn load() -> Result<Self> {
+        require_home()?;
         let p = config_path();
         if !p.exists() {
             return Ok(Self::default());
@@ -159,19 +174,6 @@ impl Config {
     }
 
     pub fn exists() -> bool { config_path().exists() }
-
-    /// Guessed trust roots: common code dirs under $HOME that exist. Never the current
-    /// directory — `init` is run from wherever the binary happens to be (a clone of this
-    /// repo, a scratch dir, an agent's worktree), and a guess must not turn that into a
-    /// place secrets flow silently.
-    pub fn default_trust_roots() -> Vec<PathBuf> {
-        let home = dirs::home_dir().unwrap_or_default();
-        ["code", "projects", "dev", "src", "repos", "work"]
-            .iter()
-            .map(|d| home.join(d))
-            .filter(|p| p.is_dir())
-            .collect()
-    }
 }
 
 #[cfg(unix)]
@@ -179,5 +181,3 @@ fn restrict_dir(p: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o700));
 }
-#[cfg(not(unix))]
-fn restrict_dir(_p: &Path) {}

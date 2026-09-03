@@ -205,7 +205,14 @@ pub fn init(a: InitArgs) -> Result<i32> {
 
     // 3. agents
     let mut touched: Vec<PathBuf> = vec![];
-    if !a.no_agents {
+    // Registering points every future agent session at this binary. Run by an agent from a
+    // hostile checkout (`cargo build && ./target/debug/tokenstash init`) that would be a
+    // binary that hands values to the model. The stash and config are set up either way.
+    let register_agents = !a.no_agents && match crate::util::require_human("init", "it registers this binary as every agent's MCP server") {
+        Ok(()) => true,
+        Err(e) => { println!("! {e:#}\n  Agents were not registered; the stash and config are ready. (--no-agents silences this.)"); false }
+    };
+    if register_agents {
         let exe = std::env::current_exe()?;
         let exe_s = exe.display().to_string();
         let home = dirs::home_dir().unwrap_or_default();
@@ -321,7 +328,7 @@ pub fn init(a: InitArgs) -> Result<i32> {
         // MCP servers are loaded when an agent session starts; skill files are picked up
         // live. Installing from inside a running session leaves the agent told to use tools it
         // cannot see yet — the desktop-app tests hit exactly this.
-        let inside = ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_THREAD_ID", "CURSOR_TRACE_ID", "GEMINI_CLI"].iter().any(|k| std::env::var_os(k).is_some());
+        let inside = tokenstash_core::project::detect_agent() != "unknown";
         if inside {
             println!("\n⚠ You are running inside an agent session. Restart it: MCP tools are loaded when a session starts, so this one cannot see tokenstash yet.");
         } else {

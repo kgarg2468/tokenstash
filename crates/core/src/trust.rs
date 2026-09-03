@@ -1,4 +1,4 @@
-//! Trust model v2 (tokenstash.md §13.1, §13.5): trust only humans create.
+//! Trust model v2: trust only humans create.
 //!
 //! The unit of trust is a grant: (workspace, key name, stash identity). A workspace is a
 //! directory the human paired keys into; the first time a stored key is wanted there, one

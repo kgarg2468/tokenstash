@@ -19,6 +19,10 @@ pub struct TasksArgs {
 }
 
 pub fn tasks(a: TasksArgs) -> Result<i32> {
+    // Other directories' cards are a person's to see; an agent gets its own.
+    if a.all {
+        util::require_human("tasks --all", "it lists every directory's cards")?;
+    }
     let app = App::open()?;
     app.db.expire_overdue()?;
     let project = tokenstash_core::project::current();
@@ -56,6 +60,8 @@ pub struct ListArgs {
 }
 
 pub fn list(a: ListArgs) -> Result<i32> {
+    // The MCP side has no inventory oracle; the shell side must not be one either.
+    util::require_human("list", "it is an inventory of every key you hold")?;
     let app = App::open()?;
     let secrets = app.db.list_secrets()?;
     if a.json {
@@ -93,6 +99,9 @@ pub struct ForgetArgs {
 }
 
 pub fn forget(a: ForgetArgs) -> Result<i32> {
+    // Grants outlive the value: whoever fills the next card for this name reaches every
+    // directory that holds one. An agent must not be able to empty the slot.
+    util::require_human("forget", "the next value stored under this name reaches every directory granted it")?;
     let app = App::open()?;
     let had = app.stash.delete(&stash_key(&a.name, &a.identity))?;
     let meta = app.db.delete_secret(&a.name, &a.identity)?;
@@ -134,11 +143,11 @@ pub struct TrustArgs {
 
 #[derive(Subcommand)]
 pub enum TrustCmd {
-    /// Add a trust root (defaults to cwd).
+    /// Retired (0.2): prints how pairing replaced trust roots.
     Add { path: Option<PathBuf> },
-    /// Remove a trust root.
+    /// Remove a retired trust root from config.toml.
     Rm { path: PathBuf },
-    /// List trust roots.
+    /// Retired (0.2): prints how pairing replaced trust roots.
     List,
 }
 
@@ -236,6 +245,7 @@ pub struct AuditArgs {
 }
 
 pub fn audit(a: AuditArgs) -> Result<i32> {
+    util::require_human("audit", "it lists every directory and key")?;
     let app = App::open()?;
     let rows = app.db.recent_audit(a.limit)?;
     if a.json {
@@ -288,11 +298,10 @@ pub fn rotate(a: RotateArgs) -> Result<i32> {
     let project = util::project_from(&a.project);
     let agent = "human".to_string();
     let identity = resolve_identity(&app, &project, &a.name, &a.identity)?;
-    let a = RotateArgs { identity: Some(identity), ..a };
-    let t = tokenstash_core::tasks::rotate(&app.ctx(), &project, &agent, &a.name, a.identity.as_deref().unwrap())?;
+    let t = tokenstash_core::tasks::rotate(&app.ctx(), &project, &agent, &a.name, &identity)?;
     let state = crate::notify::ensure_inbox(&app.cfg);
     crate::notify::desktop(&app.cfg, &format!("Replace {}", a.name), "you asked to rotate it", &util::inbox_notice(&app.cfg, Some(&t.id), state));
-    println!("⏳ {}@{} marked for rotation — task {} → {}", a.name, a.identity.as_deref().unwrap(), t.id, util::inbox_url_tty(&app.cfg, Some(&t.id), state, util::Stream::Stdout));
+    println!("⏳ {}@{identity} marked for rotation — task {} → {}", a.name, t.id, util::inbox_url_tty(&app.cfg, Some(&t.id), state, util::Stream::Stdout));
     println!("  paste the NEW key first; revoke the old one in the dashboard after it says stored");
     Ok(tokenstash_core::exit::PENDING)
 }
@@ -320,7 +329,7 @@ pub struct ReportBadArgs {
 pub fn report_bad(a: ReportBadArgs) -> Result<i32> {
     let app = App::open()?;
     let project = tokenstash_core::project::current();
-    let agent = tokenstash_core::project::detect_agent();
+    let agent = util::agent_from(&None);
     let identity = resolve_identity(&app, &project, &a.name, &a.identity)?;
     let _ = tokenstash_core::tasks::report_bad(&app.ctx(), &project, &agent, &a.name, &identity, a.status)?;
     println!("ok — run `tokenstash need {}` again; if the key is dead the user will be asked for a replacement", a.name);

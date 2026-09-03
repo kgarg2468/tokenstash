@@ -51,10 +51,12 @@ pub fn doctor() -> Result<i32> {
     let claude_skill = home.join(".claude/skills/tokenstash/SKILL.md").exists();
     let codex = std::fs::read_to_string(home.join(".codex/config.toml")).map(|s| s.contains("mcp_servers.tokenstash")).unwrap_or(false);
     let cursor = std::fs::read_to_string(home.join(".cursor/mcp.json")).map(|s| s.contains("tokenstash")).unwrap_or(false);
+    let gemini = std::fs::read_to_string(home.join(".gemini/settings.json")).map(|s| s.contains("tokenstash")).unwrap_or(false);
     let mut agents = vec![];
     if claude_skill { agents.push("claude-code"); }
     if codex { agents.push("codex"); }
     if cursor { agents.push("cursor"); }
+    if gemini { agents.push("gemini-cli"); }
     check("agents", true, if agents.is_empty() { "none configured (run `tokenstash init`)".into() } else { agents.join(", ") });
 
     let project = tokenstash_core::project::current();

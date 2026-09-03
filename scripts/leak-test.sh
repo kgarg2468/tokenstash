@@ -7,6 +7,16 @@ TS="$(cd "$(dirname "${1:-target/debug/tokenstash}")" 2>/dev/null && pwd)/$(base
 # debug binary from an older commit passed for a "flake" once). Refuse rather than test the
 # wrong thing; the gate passes the freshly built release binary explicitly.
 [ -x "$TS" ] || { echo "leak test: no binary at $TS — build it, or pass the path as \$1"; exit 2; }
+command -v script >/dev/null || { echo "leak test: needs script(1) from util-linux"; exit 2; }
+# A person at a terminal. The inventory commands (list, audit, tasks --all, forget, open) refuse
+# a pipe or an agent marker, so the steps of this script that read the stash as its owner run
+# them under a pseudo-terminal with every marker cleared. `script` merges stderr into stdout and
+# ends lines with CRLF; the CR is stripped here. The refusal itself is asserted separately below
+# and in crates/cli/tests/human_only.rs.
+HUMAN_ENV=(env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_CI -u OPENAI_CODEX -u CURSOR_TRACE_ID -u CURSOR_AGENT -u GEMINI_CLI -u OPENCODE -u TOKENSTASH_AGENT)
+# The insecure-file warning goes to stderr, which `script` folds into stdout; drop it so a
+# JSON reader sees JSON. `sed` (not `grep -v`) so an empty result is not a failure.
+human() { "${HUMAN_ENV[@]}" script -qec "$(printf '%q ' "$@")" /dev/null | tr -d '\r' | sed '/^tokenstash: WARNING — using insecure-file/d'; }
 export TOKENSTASH_HOME="$(mktemp -d)"
 export TOKENSTASH_STASH=insecure-file
 PROJ="$(mktemp -d)"; cd "$PROJ"; git init -q .
@@ -29,8 +39,8 @@ cleanup() {
     kill "${INBOX_PID:-}" "${SQUAT_PID:-}" 2>/dev/null || true
     cd / || true
     # every secret the isolated stash knows about is a canary this run created
-    "$TS" list 2>/dev/null | awk '$1 != "NAME" && $1 ~ /^[A-Z][A-Z0-9_]*$/ { print $1, $2 }' \
-        | while read -r n i; do "$TS" forget "$n" --identity "$i" >/dev/null 2>&1 || true; done
+    human "$TS" list 2>/dev/null | awk '$1 != "NAME" && $1 ~ /^[A-Z][A-Z0-9_]*$/ { print $1, $2 }' \
+        | while read -r n i; do human "$TS" forget "$n" --identity "$i" >/dev/null 2>&1 || true; done
     # $WEB and $JAR hold authenticated pages and the session cookie, so they always go
     rm -rf "$TOKENSTASH_HOME" "$PROJ" "$WEB" "$JAR" || true
     # keep $OUT for debugging unless it turns out to hold the canary itself
@@ -70,9 +80,9 @@ for _ in $(seq 1 30); do curl -fs "http://127.0.0.1:$PORT/verify?c=ready" >/dev/
 TID=$("$TS" tasks --json | python3 -c "import json,sys;print([t for t in json.load(sys.stdin) if t.get('name')=='OPENAI_API_KEY'][0]['id'])")
 echo "$CANARY" | "$TS" answer "$TID" --stdin --skip-check >"$OUT/answer.txt" 2>&1
 "$TS" need OPENAI_API_KEY --agent ci --json >"$OUT/need2.txt" 2>&1
-"$TS" list >"$OUT/list.txt" 2>&1
-"$TS" tasks --all --history --json >"$OUT/tasks.txt" 2>&1
-"$TS" audit >"$OUT/audit.txt" 2>&1
+human "$TS" list >"$OUT/list.txt" 2>&1
+human "$TS" tasks --all --history --json >"$OUT/tasks.txt" 2>&1
+human "$TS" audit >"$OUT/audit.txt" 2>&1
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"ci"}}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"secrets_request","arguments":{"secrets":[{"name":"OPENAI_API_KEY"}],"project":"'"$PROJ"'"}}}' \
@@ -140,7 +150,7 @@ SH
 chmod +x "$PROJ/fail.sh"
 ARGSECRET="argsecret-LEAKCANARY-$(date +%s)"
 "$TS" run --timeout 1 -- "$PROJ/fail.sh" --token "$ARGSECRET" >"$OUT/run3.txt" 2>&1 || true
-"$TS" tasks --all --history --json >"$OUT/tasks2.txt" 2>&1
+human "$TS" tasks --all --history --json >"$OUT/tasks2.txt" 2>&1
 grep -q "$ARGSECRET" "$OUT/tasks2.txt" && { echo "LEAK: command argument persisted in task"; exit 1; }
 
 # a registry-named inherited value is redacted even when short (whole-token)
@@ -270,7 +280,7 @@ code=$(curl -s -b "$JAR" -o /dev/null -w '%{http_code}' --data "value=sk-EVIL4&s
 # values, and the env file written here legitimately holds one)
 UNTRUSTED="$(mktemp -d)/untrusted"; mkdir -p "$UNTRUSTED"
 (cd "$UNTRUSTED" && "$TS" need EVIL_TARGET_KEY --agent ci) >"$OUT/need-untrusted.txt" 2>&1 || true
-ATID=$("$TS" tasks --all --json | python3 -c "import json,sys;l=[t for t in json.load(sys.stdin) if t.get('kind')=='approval' and t['status']=='pending'];print(l[0]['id'] if l else '')")
+ATID=$(human "$TS" tasks --all --json | python3 -c "import json,sys;l=[t for t in json.load(sys.stdin) if t.get('kind')=='approval' and t['status']=='pending'];print(l[0]['id'] if l else '')")
 [ -n "$ATID" ] || { echo "FAIL: a stash hit in an unpaired directory did not create an approval card"; sed -n 1,5p "$OUT/need-untrusted.txt"; exit 1; }
 # The CLI has the same guard the paste-scope link does: an agent with a shell can read this
 # card's id out of `tasks --json`, so `answer --allow` must refuse it. (Not a boundary on its
@@ -281,7 +291,7 @@ TOKENSTASH_AGENT=claude-code "$TS" answer "$ATID" --allow >"$OUT/self-approve.tx
 grep -q "person at a terminal" "$OUT/self-approve.txt" || { echo "FAIL: the refusal does not explain itself"; cat "$OUT/self-approve.txt"; exit 1; }
 TOKENSTASH_AGENT=claude-code "$TS" answer "$ATID" --allow-broad >>"$OUT/self-approve.txt" 2>&1 \
   && { echo "FAIL: an agent granted itself broadly from the shell"; exit 1; }
-"$TS" tasks --all --json | ATID="$ATID" python3 -c "import json,sys,os;sys.exit(0 if [t for t in json.load(sys.stdin) if t['id']==os.environ['ATID'] and t['status']=='pending'] else 1)" \
+human "$TS" tasks --all --json | ATID="$ATID" python3 -c "import json,sys,os;sys.exit(0 if [t for t in json.load(sys.stdin) if t['id']==os.environ['ATID'] and t['status']=='pending'] else 1)" \
   || { echo "FAIL: the refused approval changed the card"; exit 1; }
 grep -q "EVIL_TARGET_KEY=" "$UNTRUSTED/.env.local" 2>/dev/null && { echo "FAIL: a refused CLI approval injected a key"; exit 1; }
 
@@ -289,12 +299,12 @@ curl -fsS -c "$PJAR" -b "$PJAR" -L -o "$WEB/paste-approval.html" "http://127.0.0
 grep -q "value=allow" "$WEB/paste-approval.html" && { echo "FAIL: the paste-scope session was offered an Allow button"; exit 1; }
 grep -q "full inbox session" "$WEB/paste-approval.html" || { echo "FAIL: the paste-scope approval page does not explain how to get the full session"; exit 1; }
 curl -s -c "$PJAR" -b "$PJAR" -o "$WEB/paste-approve-try.html" --data "action=allow&t=$PASTE" "http://127.0.0.1:$PORT/t/$ATID"
-"$TS" tasks --all --json | ATID="$ATID" python3 -c "import json,sys,os;sys.exit(0 if [t for t in json.load(sys.stdin) if t['id']==os.environ['ATID'] and t['status']=='pending'] else 1)" \
+human "$TS" tasks --all --json | ATID="$ATID" python3 -c "import json,sys,os;sys.exit(0 if [t for t in json.load(sys.stdin) if t['id']==os.environ['ATID'] and t['status']=='pending'] else 1)" \
   || { echo "FAIL: a paste-scope POST approved a trust gate"; exit 1; }
 grep -q "EVIL_TARGET_KEY=" "$UNTRUSTED/.env.local" 2>/dev/null && { echo "FAIL: a paste-scope approval attempt injected a key"; exit 1; }
 # the full session approves it
 curl -fsS -c "$JAR" -b "$JAR" -L -o "$WEB/full-approved.html" --data "action=allow" --data-urlencode "t=$TOKEN" "http://127.0.0.1:$PORT/t/$ATID"
-grep -q "EVIL_TARGET_KEY=$GOOD" "$UNTRUSTED/.env.local" 2>/dev/null || { echo "FAIL: the full session could not approve"; echo "--- response:"; sed 's/<[^>]*>/ /g' "$WEB/full-approved.html" | tr -s ' \n' | head -c 400; echo; echo "--- tasks:"; "$TS" tasks --all --history --json | python3 -c "import json,sys;[print(t['id'],t['kind'],t['status'],t.get('project')) for t in json.load(sys.stdin)]"; echo "--- audit:"; "$TS" audit | head -5; echo "--- untrusted dir:"; ls -la "$UNTRUSTED"; exit 1; }
+grep -q "EVIL_TARGET_KEY=$GOOD" "$UNTRUSTED/.env.local" 2>/dev/null || { echo "FAIL: the full session could not approve"; echo "--- response:"; sed 's/<[^>]*>/ /g' "$WEB/full-approved.html" | tr -s ' \n' | head -c 400; echo; echo "--- tasks:"; human "$TS" tasks --all --history --json | python3 -c "import json,sys;[print(t['id'],t['kind'],t['status'],t.get('project')) for t in json.load(sys.stdin)]"; echo "--- audit:"; human "$TS" audit | head -5; echo "--- untrusted dir:"; ls -la "$UNTRUSTED"; exit 1; }
 # no downgrade: a full-scope browser that follows an agent (paste) link keeps full scope
 curl -fsS -c "$JAR" -b "$JAR" -L -o /dev/null "http://127.0.0.1:$PORT/?t=$PASTE"
 grep -q "$TOKEN" "$JAR" || { echo "FAIL: following a paste-scope link downgraded a full-scope session"; exit 1; }
@@ -345,21 +355,21 @@ rm -rf "$ESCAPE_DIR"
 HOME2="$(mktemp -d)"; cp "$TOKENSTASH_HOME/config.toml" "$HOME2/config.toml"
 # the insecure-file stash lives inside the home; a real keychain is per-user. Emulate that.
 cp "$TOKENSTASH_HOME/insecure-stash.json" "$HOME2/insecure-stash.json"
-TOKENSTASH_HOME="$HOME2" "$TS" list >"$OUT/home2-list-before.txt" 2>&1 || true
+TOKENSTASH_HOME="$HOME2" human "$TS" list >"$OUT/home2-list-before.txt" 2>&1 || true
 grep -q "no secrets indexed" "$OUT/home2-list-before.txt" || { echo "FAIL: a fresh home must say it has no INDEXED secrets"; fail=1; }
 grep -q "adopted" "$OUT/home2-list-before.txt" || { echo "FAIL: the empty-index message must explain adoption"; fail=1; }
 rc=0; TOKENSTASH_HOME="$HOME2" "$TS" need OPENAI_API_KEY --agent ci >"$OUT/home2-need.txt" 2>&1 || rc=$?
 [ $rc -eq 0 ] || { echo "FAIL: a stash hit from another home should inject (got $rc)"; fail=1; }
-TOKENSTASH_HOME="$HOME2" "$TS" list >"$OUT/home2-list-after.txt" 2>&1 || true
+TOKENSTASH_HOME="$HOME2" human "$TS" list >"$OUT/home2-list-after.txt" 2>&1 || true
 grep -q "OPENAI_API_KEY" "$OUT/home2-list-after.txt" || { echo "FAIL: after injecting, list in the second home still does not show the key"; fail=1; }
-TOKENSTASH_HOME="$HOME2" "$TS" audit | grep -q "adopt" || { echo "FAIL: adoption is not audited"; fail=1; }
+TOKENSTASH_HOME="$HOME2" human "$TS" audit | grep -q "adopt" || { echo "FAIL: adoption is not audited"; fail=1; }
 rm -rf "$HOME2"
 
 # ── MCP task scoping: another project's tasks are invisible ─────────────────────
 # task_check by id/prefix and task_list must not act as a cross-project path oracle.
 OTHER="$(mktemp -d)/otherproj"; mkdir -p "$OTHER"
 (cd "$OTHER" && "$TS" need OTHER_PROJECT_KEY --agent ci) >"$OUT/need-other.txt" 2>&1 || true
-OTID=$("$TS" tasks --all --json | python3 -c "import json,sys;print([t for t in json.load(sys.stdin) if t.get('name')=='OTHER_PROJECT_KEY'][0]['id'])")
+OTID=$(human "$TS" tasks --all --json | python3 -c "import json,sys;print([t for t in json.load(sys.stdin) if t.get('name')=='OTHER_PROJECT_KEY'][0]['id'])")
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"ci"}}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"task_check","arguments":{"task_id":"'"$OTID"'","project":"'"$PROJ"'"}}}' \
@@ -386,8 +396,8 @@ rm -rf "$(dirname "$OTHER")"
 "$TS" report-bad NOT_A_REAL_NAME --status 401 --message "invalid key $PGOOD" >"$OUT/report2.txt" 2>&1 || true
 diff <(sed 's/PASTE_TARGET_KEY\|NOT_A_REAL_NAME/NAME/' "$OUT/report1.txt") <(sed 's/PASTE_TARGET_KEY\|NOT_A_REAL_NAME/NAME/' "$OUT/report2.txt") >/dev/null || { echo "FAIL: report-bad answers differently for a real vs unknown name (oracle)"; fail=1; }
 grep -q "$PGOOD" "$OUT/report1.txt" "$OUT/report2.txt" && { echo "LEAK: report-bad echoed the value"; fail=1; }
-"$TS" audit >"$OUT/audit-after-report.txt" 2>&1; grep -q "$PGOOD" "$OUT/audit-after-report.txt" && { echo "LEAK: the reported message reached the audit log"; fail=1; }
-"$TS" list >"$OUT/list-after-report.txt" 2>&1; grep -q "PASTE_TARGET_KEY.*STALE\|PASTE_TARGET_KEY@default:" "$OUT/list-after-report.txt" || { echo "FAIL: a report from the delivering project did not mark the key stale"; fail=1; }
+human "$TS" audit >"$OUT/audit-after-report.txt" 2>&1; grep -q "$PGOOD" "$OUT/audit-after-report.txt" && { echo "LEAK: the reported message reached the audit log"; fail=1; }
+human "$TS" list >"$OUT/list-after-report.txt" 2>&1; grep -q "PASTE_TARGET_KEY.*STALE\|PASTE_TARGET_KEY@default:" "$OUT/list-after-report.txt" || { echo "FAIL: a report from the delivering project did not mark the key stale"; fail=1; }
 grep -q "$PGOOD" "$OUT/list-after-report.txt" && { echo "LEAK: list shows the value in the stale reason"; fail=1; }
 # rotate refuses an agent / a pipe, and its refusal names nothing
 "$TS" rotate OPENAI_API_KEY >"$OUT/rotate-pipe.txt" 2>&1 && { echo "FAIL: rotate ran without a terminal"; fail=1; }
@@ -405,16 +415,22 @@ if script -qec true /dev/null >/dev/null 2>&1; then
 else
   : >"$OUT/rotate.txt"
 fi
-"$TS" list >"$OUT/list-stale.txt" 2>&1
+human "$TS" list >"$OUT/list-stale.txt" 2>&1
 grep -q "STALE" "$OUT/list-stale.txt" || { echo "FAIL: nothing is marked stale"; fail=1; }
 grep -q "$CANARY" "$OUT/rotate.txt" "$OUT/list-stale.txt" && { echo "LEAK: rotation output contains the value"; fail=1; }
 RTID=$("$TS" tasks --json | python3 -c "import json,sys;l=[t for t in json.load(sys.stdin) if t.get('name')=='OPENAI_API_KEY' and t['status']=='pending'];print(l[0]['id'] if l else '')")
 if [ -z "$RTID" ]; then "$TS" need OPENAI_API_KEY --agent ci >/dev/null 2>&1 || true; RTID=$("$TS" tasks --json | python3 -c "import json,sys;l=[t for t in json.load(sys.stdin) if t.get('name')=='OPENAI_API_KEY' and t['status']=='pending'];print(l[0]['id'] if l else '')"); fi
-[ -n "$RTID" ] || { echo "FAIL: no replacement card for the stale key"; echo "--- rotate.txt:"; sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$OUT/rotate.txt" | head -5; echo "--- tasks:"; "$TS" tasks --all --json | python3 -c "import json,sys;[print(t['id'],t['kind'],t.get('name'),t['status'],t['project']) for t in json.load(sys.stdin)]"; echo "--- list:"; cat "$OUT/list-stale.txt"; fail=1; }
+[ -n "$RTID" ] || { echo "FAIL: no replacement card for the stale key"; echo "--- rotate.txt:"; sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$OUT/rotate.txt" | head -5; echo "--- tasks:"; human "$TS" tasks --all --json | python3 -c "import json,sys;[print(t['id'],t['kind'],t.get('name'),t['status'],t['project']) for t in json.load(sys.stdin)]"; echo "--- list:"; cat "$OUT/list-stale.txt"; fail=1; }
 NEWCANARY="sk-ROTATEDCANARY-$(date +%s)-0123456789abcdef"
-echo "$NEWCANARY" | "$TS" answer "$RTID" --stdin --skip-check >"$OUT/rotate-answer.txt" 2>&1 || true
+# A Replace card's answer is rewritten into every project holding the key, so it is a
+# person's to give: the agent-shaped answer (a pipe) must be refused with nothing stored…
+echo "$NEWCANARY" | "$TS" answer "$RTID" --stdin --skip-check >"$OUT/rotate-answer-pipe.txt" 2>&1 && { echo "FAIL: an agent answered a Replace card"; fail=1; }
+grep -q "for a person at a terminal" "$OUT/rotate-answer-pipe.txt" || { echo "FAIL: the Replace refusal did not say why"; sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$OUT/rotate-answer-pipe.txt" | head -3; fail=1; }
+grep -q "$NEWCANARY" "$PROJ/.env.local" && { echo "FAIL: the refused Replace answer was written anyway"; fail=1; }
+# …and the person at the terminal answers the masked prompt.
+(sleep 2; printf '%s\n' "$NEWCANARY") | human "$TS" answer "$RTID" --skip-check >"$OUT/rotate-answer.txt" 2>&1 || true
 grep -q "OPENAI_API_KEY=$NEWCANARY" "$PROJ/.env.local" || { echo "FAIL: the rotated value did not land in the env file"; fail=1; }
-"$TS" list | grep -q "OPENAI_API_KEY.*STALE" && { echo "FAIL: answering the rotation card did not clear stale"; fail=1; }
+human "$TS" list | grep -q "OPENAI_API_KEY.*STALE" && { echo "FAIL: answering the rotation card did not clear stale"; fail=1; }
 OLDCANARY="$CANARY"; CANARY="$NEWCANARY"
 # the OLD value must not survive anywhere the agent reads, and the new one only in the env file
 if grep -rl "$OLDCANARY" "$OUT" "$WEB"; then echo "LEAK: the pre-rotation value appears in output"; fail=1; fi
@@ -442,14 +458,14 @@ if script -qec true /dev/null >/dev/null 2>&1; then
       script -qec "$TS import $BDIR/t.bundle --no-verify" /dev/null >"$OUT/import.txt" 2>&1 || true
     grep -q "added" "$OUT/import.txt" || { echo "FAIL: import did not report what it added"; sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$OUT/import.txt" | tail -3; fail=1; }
     grep -q "$CANARY\|$PW" "$OUT/import.txt" && { echo "LEAK: import output contains a value or the passphrase"; fail=1; }
-    TOKENSTASH_HOME="$HOME3" "$TS" list >"$OUT/import-list.txt" 2>&1; grep -q "OPENAI_API_KEY" "$OUT/import-list.txt" || { echo "FAIL: imported key is not indexed in the new home"; fail=1; }
-    [ "$(TOKENSTASH_HOME="$HOME3" "$TS" audit 2>/dev/null | grep -c 'approve')" = 0 ] || { echo "FAIL: import granted approvals"; fail=1; }
+    TOKENSTASH_HOME="$HOME3" human "$TS" list >"$OUT/import-list.txt" 2>&1; grep -q "OPENAI_API_KEY" "$OUT/import-list.txt" || { echo "FAIL: imported key is not indexed in the new home"; fail=1; }
+    [ "$(TOKENSTASH_HOME="$HOME3" human "$TS" audit 2>/dev/null | grep -c 'approve')" = 0 ] || { echo "FAIL: import granted approvals"; fail=1; }
     # a wrong passphrase imports nothing
     HOME4="$(mktemp -d)"; cp "$TOKENSTASH_HOME/config.toml" "$HOME4/config.toml"
     (sleep 2; printf 'wrong-passphrase-xx\n') | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_CI -u OPENAI_CODEX -u CURSOR_TRACE_ID -u CURSOR_AGENT -u GEMINI_CLI -u OPENCODE -u TOKENSTASH_AGENT TOKENSTASH_HOME="$HOME4" script -qec "$TS import $BDIR/t.bundle --no-verify" /dev/null >"$OUT/import-wrong.txt" 2>&1 || true
     grep -q "wrong passphrase" "$OUT/import-wrong.txt" || { echo "FAIL: the wrong-passphrase import did not run or did not refuse"; fail=1; }
-    TOKENSTASH_HOME="$HOME4" "$TS" list 2>/dev/null | grep -q "OPENAI_API_KEY" && { echo "FAIL: a wrong passphrase imported keys"; fail=1; }
-    for h in "$HOME3" "$HOME4"; do TOKENSTASH_HOME="$h" "$TS" list 2>/dev/null | awk '$1 ~ /^[A-Z][A-Z0-9_]*$/ {print $1,$2}' | while read -r n i; do TOKENSTASH_HOME="$h" "$TS" forget "$n" --identity "$i" >/dev/null 2>&1 || true; done; rm -rf "$h"; done
+    TOKENSTASH_HOME="$HOME4" human "$TS" list 2>/dev/null | grep -q "OPENAI_API_KEY" && { echo "FAIL: a wrong passphrase imported keys"; fail=1; }
+    for h in "$HOME3" "$HOME4"; do TOKENSTASH_HOME="$h" human "$TS" list 2>/dev/null | awk '$1 ~ /^[A-Z][A-Z0-9_]*$/ {print $1,$2}' | while read -r n i; do TOKENSTASH_HOME="$h" human "$TS" forget "$n" --identity "$i" >/dev/null 2>&1 || true; done; rm -rf "$h"; done
   fi
   rm -rf "$BDIR"
 fi
@@ -467,18 +483,18 @@ if script -qec true /dev/null >/dev/null 2>&1; then
   grep -q "OPENAI_API_KEY" "$OUT/fromenv.txt" || { echo "FAIL: --from-env did not list the found key"; sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$OUT/fromenv.txt" | tail -4; fail=1; }
   grep -q "$CRAWLCANARY" "$OUT/fromenv.txt" && { echo "LEAK: --from-env table shows a value"; fail=1; }
   grep -q "nothing imported" "$OUT/fromenv.txt" || { echo "FAIL: q did not abort the import"; fail=1; }
-  "$TS" list | grep -q "GROQ_API_KEY" && { echo "FAIL: --from-env imported after q"; fail=1; }
+  human "$TS" list | grep -q "GROQ_API_KEY" && { echo "FAIL: --from-env imported after q"; fail=1; }
   # a bare Enter must not import: it shows the summary and asks; N keeps everything out
   (sleep 2; printf '\n'; sleep 1; printf 'n\n') | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_CI -u OPENAI_CODEX -u CURSOR_TRACE_ID -u CURSOR_AGENT -u GEMINI_CLI -u OPENCODE -u TOKENSTASH_AGENT \
     script -qec "$TS export --from-env $CRAWL" /dev/null >"$OUT/fromenv-enter.txt" 2>&1 || true
   grep -q "proceed?" "$OUT/fromenv-enter.txt" || { echo "FAIL: --from-env imported on a bare Enter without asking"; fail=1; }
-  "$TS" list | grep -q "GROQ_API_KEY" && { echo "FAIL: --from-env imported after N"; fail=1; }
+  human "$TS" list | grep -q "GROQ_API_KEY" && { echo "FAIL: --from-env imported after N"; fail=1; }
   # ...and y imports the ticked rows, never printing a value
   (sleep 2; printf '\n'; sleep 1; printf 'y\n') | env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT -u CODEX_SANDBOX -u CODEX_CI -u OPENAI_CODEX -u CURSOR_TRACE_ID -u CURSOR_AGENT -u GEMINI_CLI -u OPENCODE -u TOKENSTASH_AGENT \
     script -qec "$TS export --from-env $CRAWL --no-verify" /dev/null >"$OUT/fromenv-yes.txt" 2>&1 || true
-  "$TS" list | grep -q "GROQ_API_KEY" || { echo "FAIL: --from-env did not import the ticked GROQ key"; sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$OUT/fromenv-yes.txt" | tail -6; fail=1; }
+  human "$TS" list | grep -q "GROQ_API_KEY" || { echo "FAIL: --from-env did not import the ticked GROQ key"; sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$OUT/fromenv-yes.txt" | tail -6; fail=1; }
   grep -q "$CRAWLCANARY" "$OUT/fromenv-yes.txt" && { echo "LEAK: --from-env import printed a value"; fail=1; }
-  "$TS" forget GROQ_API_KEY >/dev/null 2>&1 || true
+  human "$TS" forget GROQ_API_KEY >/dev/null 2>&1 || true
 fi
 grep -q "from_env\|from-env" "$OUT/mcp.txt" 2>/dev/null && { echo "FAIL: an MCP surface mentions --from-env"; fail=1; }
 rm -rf "$CRAWL"
@@ -529,7 +545,7 @@ PY
 python3 "$WEB/squat.py" "$PORT" >/dev/null 2>&1 &
 SQUAT_PID=$!   # cleanup() kills it; do not replace the trap, it also forgets the canaries
 for _ in $(seq 1 50); do curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/" && break; sleep 0.1; done
-BROWSER=/bin/echo "$TS" open >"$OUT/squat-open.txt" 2>&1 || true
+BROWSER=/bin/echo human "$TS" open >"$OUT/squat-open.txt" 2>&1 || true
 "$TS" tasks >"$OUT/squat-tasks.txt" 2>&1 || true
 "$TS" doctor >"$OUT/squat-doctor.txt" 2>&1 || true
 "$TS" need SQUAT_TEST_KEY --agent ci >"$OUT/squat-need.txt" 2>&1 || true

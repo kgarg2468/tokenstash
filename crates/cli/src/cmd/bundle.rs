@@ -58,10 +58,8 @@ pub fn export(a: ExportArgs) -> Result<i32> {
     println!("Choose a passphrase (12+ characters), or press Enter to generate one.");
     let pw = rpassword::prompt_password("passphrase: ")?;
     let pw = if pw.is_empty() {
-        use std::io::IsTerminal;
-        if !std::io::stdout().is_terminal() {
-            bail!("stdout is not a terminal, so a generated passphrase would land in a file or a pipe; choose one instead");
-        }
+        // `require_human` above already proved stdout is a terminal, so the generated
+        // passphrase cannot land in a file or a pipe.
         let g = bundle::generate_passphrase();
         println!("\nGenerated passphrase — write it down now, it is shown once:\n\n    {}\n", g.expose_secret());
         g
@@ -258,14 +256,11 @@ pub fn apply_entry(app: &App, e: &Entry, source: &str, no_verify: bool) -> Resul
     let value = SecretString::from(e.value.clone());
     // Sensitivity is re-derived here exactly as a paste derives it; the source cannot
     // downgrade a registry-sensitive name or a live-mode value.
-    let by_pattern = match provider.and_then(|p| p.sensitive_pattern.as_ref()) {
-        Some(sp) => tokenstash_core::validate::matches_pattern(sp, &value)?,
-        None => false,
-    };
+    let by_registry = tokenstash_core::registry::is_sensitive(provider, &value)?;
     app.db.upsert_secret(&tokenstash_core::db::SecretMeta {
         name: e.name.clone(), identity: e.identity.clone(),
         provider: e.provider.clone().or_else(|| provider.map(|p| p.provider.clone())),
-        sensitive: e.sensitive || provider.map(|p| p.sensitive).unwrap_or(false) || by_pattern,
+        sensitive: e.sensitive || by_registry,
         source_url: e.source_url.clone().or_else(|| provider.map(|p| p.url.clone())),
         created: e.created.clone(), last_used: e.last_used.clone(), stale: e.stale,
         last_verified: None,
@@ -280,15 +275,13 @@ pub fn apply_entry(app: &App, e: &Entry, source: &str, no_verify: bool) -> Resul
     Ok(())
 }
 
-#[derive(Args)]
+/// Built from `ExportArgs` (`export --from-env DIR`); not a clap surface of its own.
 pub struct FromEnvArgs {
     /// Directory tree to scan for .env / .env.local / .env.{stage} / .envrc files.
     pub dir: PathBuf,
     /// Identity for everything imported (distinct values under one name get a numbered suffix).
-    #[arg(long, default_value = "default")]
     pub identity: String,
     /// Skip the liveness sweep afterwards.
-    #[arg(long)]
     pub no_verify: bool,
 }
 
@@ -298,8 +291,6 @@ pub struct FromEnvArgs {
 /// no non-interactive switch.
 pub fn from_env(a: FromEnvArgs) -> Result<i32> {
     crate::util::require_human("export --from-env", "it handles every value in the stash")?;
-    use std::io::IsTerminal;
-    if !std::io::stdout().is_terminal() { bail!("`export --from-env` is interactive; run it in a terminal"); }
     let app = App::open()?;
     let root = a.dir.canonicalize().with_context(|| format!("{} does not exist", a.dir.display()))?;
     println!("scanning {} …", tokenstash_core::envcrawl::display_path(&root));
@@ -426,7 +417,7 @@ pub fn from_env(a: FromEnvArgs) -> Result<i32> {
         n += 1;
         pairs.push((cand.name.clone(), identity));
     }
-    println!("✓ {n} imported. From now on any project under your trust roots gets these silently.");
+    println!("✓ {n} imported. Each directory asks once (a pairing card) before it receives any of them.");
     if !a.no_verify && !pairs.is_empty() {
         println!("verifying against providers (--no-verify to skip)…");
         crate::cmd::admin::sweep_pairs(&app, &pairs, true)?;

@@ -37,7 +37,7 @@ pub struct RunArgs {
 pub fn run(a: RunArgs) -> Result<i32> {
     let app = App::open()?;
     let project = tokenstash_core::project::current();
-    let agent = tokenstash_core::project::detect_agent();
+    let agent = util::agent_from(&None);
     let env_path = project.join(&app.cfg.env_file);
     let mut attempts = 0;
     loop {
@@ -86,7 +86,9 @@ pub fn run(a: RunArgs) -> Result<i32> {
 }
 
 fn load_env(path: &std::path::Path) -> HashMap<String, String> {
-    let Ok(s) = std::fs::read_to_string(path) else { return HashMap::new() };
+    // A regular file only: a symlink a repo commits as `.env.local` must not feed another
+    // project's values into the child, and a FIFO must not hang the run.
+    let Some(s) = tokenstash_core::envfile::read_regular_file(path) else { return HashMap::new() };
     s.lines().filter_map(tokenstash_core::envfile::parse_line).collect()
 }
 

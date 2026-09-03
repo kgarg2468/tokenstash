@@ -47,9 +47,6 @@ pub fn agent_from(arg: &Option<String>) -> String {
     tokenstash_core::need::clean_agent(&arg.clone().unwrap_or_else(tokenstash_core::project::detect_agent))
 }
 
-/// The inbox URL with NO session token. Every place an inbox link is built goes through here
-/// or through [`inbox_url_human`] — there is no third spelling.
-///
 /// The bare inbox URL, no session. Only ever shown when nothing better is available; every
 /// link a person is expected to click carries a session (see `inbox_url_agent`,
 /// `inbox_url_human`).

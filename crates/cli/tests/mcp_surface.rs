@@ -73,12 +73,12 @@ fn seed(home: &Path, proj: &Path, name: &str, value: &str) {
         .current_dir(proj).env("TOKENSTASH_HOME", home).env("TOKENSTASH_STASH", "insecure-file")
         .output().unwrap();
     assert!(out.status.code() == Some(10), "a first request is pending: {out:?}");
-    let tasks = Command::new(env!("CARGO_BIN_EXE_tokenstash")).arg("tasks").arg("--json").arg("--all")
-        .env("TOKENSTASH_HOME", home).env("TOKENSTASH_STASH", "insecure-file").output().unwrap();
+    let tasks = Command::new(env!("CARGO_BIN_EXE_tokenstash")).arg("tasks").arg("--json")
+        .current_dir(proj).env("TOKENSTASH_HOME", home).env("TOKENSTASH_STASH", "insecure-file").output().unwrap();
     let v: serde_json::Value = serde_json::from_slice(&tasks.stdout).unwrap();
     let id = v.as_array().unwrap().iter().find(|t| t["name"] == serde_json::json!(name)).expect("a card for the key")["id"].as_str().unwrap().to_string();
     let mut child = Command::new(env!("CARGO_BIN_EXE_tokenstash")).arg("answer").arg(&id).arg("--stdin").arg("--skip-check")
-        .env("TOKENSTASH_HOME", home).env("TOKENSTASH_STASH", "insecure-file")
+        .current_dir(proj).env("TOKENSTASH_HOME", home).env("TOKENSTASH_STASH", "insecure-file")
         .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
     child.stdin.as_mut().unwrap().write_all(format!("{value}\n").as_bytes()).unwrap();
     assert!(child.wait().unwrap().success(), "the seed answer stored the value");
@@ -119,8 +119,8 @@ fn task_check_never_answers_for_another_project() {
     let out = Command::new(env!("CARGO_BIN_EXE_tokenstash")).arg("need").arg("OPENAI_API_KEY")
         .current_dir(&theirs).env("TOKENSTASH_HOME", &home).env("TOKENSTASH_STASH", "insecure-file").output().unwrap();
     assert_eq!(out.status.code(), Some(10));
-    let tasks = Command::new(env!("CARGO_BIN_EXE_tokenstash")).arg("tasks").arg("--json").arg("--all")
-        .env("TOKENSTASH_HOME", &home).env("TOKENSTASH_STASH", "insecure-file").output().unwrap();
+    let tasks = Command::new(env!("CARGO_BIN_EXE_tokenstash")).arg("tasks").arg("--json")
+        .current_dir(&theirs).env("TOKENSTASH_HOME", &home).env("TOKENSTASH_STASH", "insecure-file").output().unwrap();
     let v: serde_json::Value = serde_json::from_slice(&tasks.stdout).unwrap();
     let their_id = v.as_array().unwrap()[0]["id"].as_str().unwrap().to_string();
 

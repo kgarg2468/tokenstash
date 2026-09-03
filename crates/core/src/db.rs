@@ -8,7 +8,7 @@ use std::path::Path;
 pub type AuditRow = (String, Option<String>, Option<String>, String, Option<String>, Option<String>, Option<String>, Option<String>);
 
 pub struct Db {
-    pub conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 /// The index holds no values, but task/approval/binding metadata is still private.
@@ -26,10 +26,6 @@ fn restrict_file(p: &Path) -> Result<()> {
     }
     Ok(())
 }
-#[cfg(not(unix))]
-fn restrict_dir(_p: &Path) -> Result<()> { Ok(()) }
-#[cfg(not(unix))]
-fn restrict_file(_p: &Path) -> Result<()> { Ok(()) }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretMeta {
@@ -264,7 +260,7 @@ impl Db {
                 id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, project TEXT, agent TEXT,
                 action TEXT NOT NULL, name TEXT, identity TEXT, detail TEXT
             );
-            -- Trust v2 (§13.1/§13.5): a workspace is a directory the human paired keys into.
+            -- Trust v2: a workspace is a directory the human paired keys into.
             -- Identity is the canonical root; the fingerprint (inode + birth time) tells a
             -- re-created directory at the same path from the original. Old tables stay so a
             -- 0.1 binary can still open this database.
@@ -306,6 +302,17 @@ impl Db {
                 // Two processes (CLI + MCP server) can race here; the loser's ALTER fails
                 // with "duplicate column", which is success.
                 if let Err(e) = conn.execute_batch(ddl) {
+                    if !e.to_string().contains("duplicate column") {
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+        // Cards remember whether their one desktop notification went out (0.2.1+).
+        {
+            let has: bool = conn.prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name=?1")?.exists(["notified"])?;
+            if !has {
+                if let Err(e) = conn.execute_batch("ALTER TABLE tasks ADD COLUMN notified TEXT") {
                     if !e.to_string().contains("duplicate column") {
                         return Err(e.into());
                     }
@@ -737,14 +744,6 @@ impl Db {
         Ok(self.conn.query_row(&sql, params![project, expects], Self::row_to_task).optional()?)
     }
 
-    pub fn open_approval_task(&self, project: &str) -> Result<Option<Task>> {
-        let sql = format!(
-            "SELECT {} FROM tasks WHERE kind='approval' AND status='pending' AND project=?1 ORDER BY created DESC",
-            Self::TASK_COLS
-        );
-        Ok(self.conn.query_row(&sql, params![project], Self::row_to_task).optional()?)
-    }
-
     /// Close a card, but only while it is still open. The answer paths check the status of
     /// the `Task` they were handed, which was read some time ago: two answers racing (an
     /// inbox POST and a `tokenstash answer`, or two browser tabs) would both pass that check
@@ -761,18 +760,17 @@ impl Db {
     /// Undo a claim that could not be completed. The card is claimed before the value is
     /// stored (so a racing answer cannot overwrite the winner); if storing then fails,
     /// leaving the card "answered" would tell the human it is done when nothing was kept.
+    /// Claim the one desktop notification a card gets: true the first time, false after. A
+    /// polling agent re-runs `need` every few seconds and the card is reused; the human's
+    /// attention is not.
+    pub fn mark_notified(&self, id: &str) -> Result<bool> {
+        Ok(self.conn.execute("UPDATE tasks SET notified=?2 WHERE id=?1 AND notified IS NULL", params![id, crate::now()])? == 1)
+    }
+
     pub fn reopen_task(&self, id: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE tasks SET status='pending', answered_at=NULL WHERE id=?1 AND status='answered'",
             params![id],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_task_status(&self, id: &str, status: TaskStatus, note: Option<&str>) -> Result<()> {
-        self.conn.execute(
-            "UPDATE tasks SET status=?2, answered_at=?3, note=COALESCE(?4, note) WHERE id=?1",
-            params![id, status.as_str(), crate::now(), note],
         )?;
         Ok(())
     }

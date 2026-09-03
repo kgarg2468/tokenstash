@@ -53,7 +53,7 @@ pub fn liveness(check: &Check, value: &SecretString, timeout: Duration) -> Liven
     let agent = ureq::AgentBuilder::new()
         .timeout(timeout)
         .redirects(0)
-        .user_agent("tokenstash-liveness/0.1")
+        .user_agent(concat!("tokenstash-liveness/", env!("CARGO_PKG_VERSION")))
         .build();
     let v = value.expose_secret();
     let mut url = check.url.clone();
@@ -73,7 +73,7 @@ pub fn liveness(check: &Check, value: &SecretString, timeout: Duration) -> Liven
         a if a.starts_with("query:") => {
             let p = &a["query:".len()..];
             let sep = if url.contains('?') { '&' } else { '?' };
-            url = format!("{url}{sep}{p}={v}");
+            url = format!("{url}{sep}{p}={}", percent_encode(v));
             req = match check.method.to_ascii_uppercase().as_str() {
                 "POST" => agent.post(&url),
                 _ => agent.get(&url),
@@ -160,4 +160,18 @@ pub fn looks_like_secret(text: &str) -> bool {
     let single_token = tokens.len() == 1;
     let is_url_or_path = ["http://", "https://", "/", "./", "../", "~/"].iter().any(|p| t.starts_with(p));
     single_token && long(t) && !is_url_or_path
+}
+
+/// RFC 3986 unreserved characters pass; everything else is `%XX`. A key with `&` or `#`
+/// used to be sent truncated and reported "rejected" at paste time.
+pub(crate) fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }

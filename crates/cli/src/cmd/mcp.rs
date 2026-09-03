@@ -1,12 +1,12 @@
 //! Minimal MCP server over stdio (newline-delimited JSON-RPC 2.0).
-//! Hand-rolled on purpose: five tools, no SDK version churn. Tool results never contain values.
+//! Hand-rolled on purpose: six tools, no SDK version churn. Tool results never contain values.
 //!
 //! Nor do they contain the inbox session token. Everything written here lands in the model's
 //! context, and the token is the credential that lets its holder ANSWER a task — store a value
 //! under a real key name, approve a trust gate. Giving that to the model would let it answer
 //! its own requests and self-approve the gates that exist to ask a person. So every `inbox`
 //! field and every link in a `next` below uses `util::inbox_url_agent` — the paste-scope
-//! session, which can answer a missing-key card but cannot approve (§13.2); the full session
+//! session, which can answer a missing-key card but cannot approve; the full session
 //! goes to the desktop notification and `tokenstash open`, which only a human reads. See
 //! `crate::inbox_auth`.
 
@@ -31,7 +31,7 @@ const PROTOCOL: &str = "2025-06-18";
 /// Which directory this server serves. Decided once, at the first tool call, from the
 /// client's `roots` (when it advertised the capability and answered our `roots/list` —
 /// waited for up to ROOTS_WAIT) or the server's cwd; never from a tool argument. Measured
-/// 2026-08-27 (tokenstash.md §13.7): Claude Code, Codex and Cursor all spawn the server in
+/// 2026-08-27 (docs/agent-conformance.md): Claude Code, Codex and Cursor all spawn the server in
 /// the project directory; only Claude Code offers `roots`.
 struct Binding {
     /// Ok(project) or Err(why this directory is refused).
@@ -56,7 +56,7 @@ impl Binding {
     /// Roots are launcher-descriptive — the directory the client opened — and sit in the
     /// same trust tier as cwd. One root binds; several bind the most specific one
     /// containing cwd (exact match first), else the single root cwd is the parent of;
-    /// anything else is ambiguous and fails closed (§13.5).
+    /// anything else is ambiguous and fails closed.
     fn decide(&mut self) -> std::result::Result<PathBuf, String> {
         if self.bound.is_none() {
             self.roots_requested = false;
@@ -88,7 +88,7 @@ impl Binding {
                 }
             }));
             if let Ok(log) = std::env::var("TOKENSTASH_MCP_LOG") {
-                // measurement aid (§13.7): where clients spawn us and what they say (paths only)
+                // measurement aid: where clients spawn us and what they say (paths only)
                 let bound = match self.bound.as_ref().unwrap() { Ok(p) => format!("ok:{}", p.display()), Err(e) => format!("err:{e}") };
                 let line = format!("{} cwd={} roots_supported={} roots_raw={:?} roots={:?} bound={bound}\n", tokenstash_core::now(), cwd.display(), self.roots_supported, self.roots_raw, self.roots);
                 let _ = std::fs::OpenOptions::new().create(true).append(true).open(log).and_then(|mut f| f.write_all(line.as_bytes()));
@@ -451,12 +451,22 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
                         // it); the link the user needs is the card itself.
                         let card = util::inbox_url_agent(&app.cfg, Some(task_id), state);
                         v["inbox"] = json!(card);
-                        let link = if card.starts_with("http") { format!("Show the user this link: {card}.") } else { format!("The inbox is unavailable ({card}); tell the user to run `tokenstash open`.") };
                         // Why it is pending: a missing key, a stored key waiting for the
                         // user's approval for this project, or a stored key the provider
                         // rejected on re-check (Replace card). The agent must not send the
                         // user to acquire a key they already have.
                         let task = app.db.get_task(task_id)?;
+                        let needs_full = task.as_ref().map(|t| t.kind == tokenstash_core::db::TaskKind::Approval || t.expects == tokenstash_core::tasks::EXPECTS_REPLACE).unwrap_or(false);
+                        // The agent's link is the paste session: it can take a missing key,
+                        // and it cannot approve. Saying "it works as-is" for an approval card
+                        // sends the user to an error box.
+                        let link = if !card.starts_with("http") {
+                            format!("The inbox is unavailable ({card}); tell the user to run `tokenstash open`.")
+                        } else if needs_full {
+                            format!("The user answers it from the desktop notification, or by running `tokenstash open` in a terminal (this link shows the card but cannot approve it: {card}).")
+                        } else {
+                            format!("Show the user this link: {card}.")
+                        };
                         let why = match task.as_ref() {
                             Some(t) if t.kind == tokenstash_core::db::TaskKind::Approval => format!("{name} is stored, but this project needs the user's approval to receive it"),
                             Some(t) if t.expects == tokenstash_core::tasks::EXPECTS_REPLACE => format!("the stored {name} was rejected by its provider on re-check; the user has been asked for a replacement"),
@@ -489,12 +499,18 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
                 title, why: args.get("why").and_then(|v| v.as_str()).map(String::from),
                 url: args.get("url").and_then(|v| v.as_str()).map(String::from),
                 steps: args.get("steps").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default(),
-                expects: args.get("expects").and_then(|v| v.as_str()).unwrap_or("confirm").to_string(),
+                expects: match args.get("expects").and_then(|v| v.as_str()).unwrap_or("confirm") {
+                    e @ ("confirm" | "text") => e.to_string(),
+                    other => anyhow::bail!("expects must be \"confirm\" or \"text\", not {other:?}"),
+                },
             })?;
             let state = crate::notify::ensure_inbox(&app.cfg);
             // The desktop notification is the human's copy, so it may be tokened (subject to
-            // the ownership proof). The tool result below stays bare.
-            crate::notify::desktop(&app.cfg, &t.title, &format!("{} · {agent}", tokenstash_core::project::short(&project)), &util::inbox_notice(&app.cfg, Some(&t.id), state));
+            // the ownership proof). The tool result below stays bare. Once per card: the same
+            // title returns the same task, and must not return the same toast.
+            if app.db.mark_notified(&t.id).unwrap_or(true) {
+                crate::notify::desktop(&app.cfg, &t.title, &format!("{} · {agent}", tokenstash_core::project::short(&project)), &util::inbox_notice(&app.cfg, Some(&t.id), state));
+            }
             let mut task = t;
             if blocking {
                 // Stop polling with a margin for the inbox check that follows, and never
@@ -562,7 +578,7 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
                     } else {
                         out["next"] = json!(match t.status {
                             tokenstash_core::db::TaskStatus::Pending => "Still pending. Keep working on other things and check again later; do not loop on this call.",
-                            tokenstash_core::db::TaskStatus::Answered => "Answered: for a secret task the value is stored — call secrets_request for it once more, which writes it to the env file without asking again, then load it with your runtime (never read or print the file). For a human task the note (if any) is the user's answer.",
+                            tokenstash_core::db::TaskStatus::Answered => "Answered. Secret task: the value is stored — call secrets_request for it once more, which writes it to the env file without asking again, then load it with your runtime (never read or print the file). Approval card: the keys were delivered when it was approved — call secrets_request again to confirm each is in the env file. Human task: the note (if any) is the user's answer.",
                             tokenstash_core::db::TaskStatus::Denied => "The user declined. Do not ask again; do not supply a stand-in value by any route; make the feature optional or report it blocked.",
                             tokenstash_core::db::TaskStatus::Expired => "Expired unanswered. Summarise what is blocked and stop.",
                         });
@@ -598,7 +614,7 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
             Ok((json!({ "ok": true, "next": format!("Call secrets_request for {name} again. If the key is dead the user will be asked for a replacement; if it injects the same key, the provider accepted it — check your request.") }), false))
         }
         "secrets_list" => {
-            // No inventory oracle (§13.1 rule 11): only what this directory already holds a
+            // No inventory oracle: only what this directory already holds a
             // grant for or has been delivered. Discovery of everything else is the registry.
             // Both signals are tied to the CURRENT directory: its grants, and deliveries
             // since it was paired. A re-created directory at the same path has no record
