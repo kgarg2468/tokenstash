@@ -5,19 +5,42 @@ on:
 permissions: { contents: read }
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # A fast follow-up push on a PR supersedes the run; on main every commit keeps its status.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Linux and macOS: the shipped platforms. The macOS-only code (apple-native keyring,
+    # birth-time fingerprints) used to be compiled for the first time by the release run.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with: { toolchain: stable, components: clippy }
-      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0 # v2
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --locked
       # The black-box one: a real binary, a real inbox, a canary that must not appear
-      # anywhere but the project's env file. It needs a release build (it greps the binary's
-      # own output paths) and its own HOME so nothing touches the runner's keyring.
-      - run: cargo build --release --locked -p tokenstash
-      - run: scripts/leak-test.sh
+      # anywhere but the project's env file. It runs against the release binary (passed
+      # explicitly: the script's default is the debug build `cargo test` leaves behind) with
+      # its own HOME so nothing touches the runner's keyring. Linux only: the script is bash
+      # plus GNU tools.
+      - if: runner.os == 'Linux'
+        run: cargo build --release --locked -p tokenstash
+      - if: runner.os == 'Linux'
+        run: scripts/leak-test.sh target/release/tokenstash
+  musl:
+    # The Linux artifact is static musl. Build it here so a dependency that stops linking
+    # under musl fails a PR, not the release run.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with: { toolchain: stable, targets: x86_64-unknown-linux-musl }
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+      - run: cargo build --locked --target x86_64-unknown-linux-musl -p tokenstash
+        env: { CC_x86_64_unknown_linux_musl: x86_64-linux-musl-gcc }

@@ -8,14 +8,16 @@ node_modules
 __pycache__/
 *.pyc
 
-# agent tool scratch dirs
+# agent tool scratch and local settings
 .claude/worktrees/
+.claude/settings.local.json
+.cursor/
 .codex/
 .agents/
 
 # internal, local-only planning docs — never publish
-tokenstash.md
-PRD.md
+/tokenstash.md
+/PRD.md
 
 # local-only review scratch (diffs, briefs, notes handed to reviewers)
 .review-context/
