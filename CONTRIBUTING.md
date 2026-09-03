@@ -19,8 +19,12 @@
 - `url` — where a new user creates the key, as deep a link as possible.
 - `steps` — what to click, in order. Write them as if for someone who has never used the product.
 - `pattern` — regex for the key format, so a bad paste fails immediately. Optional but valuable.
-- `check` — one cheap authenticated GET that returns 200 with a valid key and 401/403 without. Optional.
-  `auth` is `bearer` | `header:<Name>` | `prefix:<Scheme>` | `basic-user` | `query:<param>`.
+- `check` — one cheap authenticated request that returns 200 with a valid key and 401 without. Optional.
+  `auth` is `bearer` | `header:<Name>` | `prefix:<Scheme>` | `basic-user` | `query:<param>`; `method` defaults to GET.
+  403 is read as "live, lacks permission", never as a dead key; if the provider answers something
+  other than 401 to a bad key (Google: 400), list it in `reject_status`. Set `at_use: true` only if
+  the request is free and read-only enough to run before every delivery — without it the check
+  runs at paste time only.
 - `sensitive: true` — live payment keys, cloud credentials, anything with unbounded spend. These,
   and any name the registry does not know, get their own card per directory; the broad pairing
   button never covers them. Use `sensitive_pattern` when only some values are dangerous (e.g.
@@ -31,7 +35,16 @@ Run `cargo test` — `registry_is_sane` validates every entry.
 
 ## Code
 
-`cargo build && cargo test && scripts/leak-test.sh target/debug/tokenstash`
+Before you open a PR:
+
+```bash
+cargo clippy --workspace --all-targets --all-features -- -D warnings   # CI treats warnings as errors
+cargo test --workspace
+cargo build --release -p tokenstash && scripts/leak-test.sh target/release/tokenstash
+```
+
+Formatting is by hand (`rustfmt.toml` disables rustfmt): match the surrounding code. A PR needs the
+`test` check green on Linux and macOS; the release workflow runs the same gate before it publishes.
 
 The rule that matters: **no code path may emit a secret value.** Not stdout, not stderr, not the
 SQLite index, not the audit log, not an MCP tool result, not an error message. `scripts/leak-test.sh`

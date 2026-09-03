@@ -73,10 +73,10 @@ flowchart LR
 
 | Layer | Stack | Role |
 | --- | --- | --- |
-| CLI | Rust 2021, clap 4 | `need` is the whole product surface an agent touches |
+| CLI | Rust 2021, clap 4 | `need`, `ask`, `report-bad`, `tasks` and `run` are the product surface an agent touches; everything else is for a person |
 | Stash | `keyring` 3, OS-native | macOS Keychain, Linux Secret Service, kernel-keyring fallback (Windows Credential Manager is supported by the library but no Windows binary ships yet); `insecure-file` is CI-only and warns |
 | Index | SQLite (`rusqlite`, bundled) | Names, identities, projects, grants, tasks, audit log — metadata only, never a value |
-| Inbox | `tiny_http` bound to `127.0.0.1` | Two-scope session tokens, `HttpOnly; SameSite=Strict` cookie, CSRF double-submit, empty 404 for anything unauthenticated |
+| Inbox | `tiny_http` bound to `127.0.0.1` | Two-scope session tokens, `HttpOnly; SameSite=Strict` cookie, CSRF double-submit, empty 404 for anything unauthenticated (the one open route, `/verify`, answers an ownership challenge and nothing else) |
 | MCP | stdio JSON-RPC server | `secrets_request`, `secrets_list`, `secrets_report_invalid`, `human_request`, `task_check`, `task_list` |
 | Registry | `crates/core/registry/providers.json` | 79 providers: signup URL, ordered steps, key pattern, optional liveness check |
 | Validation | `validate.rs` over `ureq` | Prefix check at paste time, cheap liveness call, `reject_status` for providers that do not spell auth failure `401` |
@@ -104,10 +104,10 @@ flowchart TD
 
 | Question | tokenstash answer |
 | --- | --- |
-| Can an agent get a credential without pasting it into a chat? | Yes. `need` is the only path, and it returns an exit code, not a value. Values go clipboard → keychain → env file and are never rendered anywhere the model can read them. |
+| Can an agent get a credential without pasting it into a chat? | Yes. `need` is the only path, and it returns an exit code, not a value. Values go your paste → keychain → env file and are never rendered anywhere the model can read them. |
 | Does "never leaks" mean anything mechanically? | Yes. [`scripts/leak-test.sh`](scripts/leak-test.sh) drives the real binary with a canary secret and asserts the canary appears in none of stdout, stderr, the SQLite index, the config, the audit log, or MCP output — a black-box test, not an inspection of the code that was supposed to redact. |
 | Is loopback treated as authentication? | No, and that is the point. Every inbox request needs a 32-byte session token that arrives as `?t=` on the link you click and becomes an `HttpOnly; SameSite=Strict` cookie. Anything without one gets an empty 404. |
-| Can a model approve its own request? | No. The link an agent prints carries the **paste-scope** token: enough to answer a missing-key card, not enough to approve. The **full-scope** token reaches you only through channels you trigger — the notification, `tokenstash open`, your terminal. `tokenstash answer --allow` adds a second lock on the same door — it refuses unless both streams are a terminal and no agent marker is set, like `rotate`, `check`, `bind`, `workspaces`, `export` and `import` — though that one is a heuristic an agent with a pseudo-terminal and a scrubbed environment can pass, which is why the token scope is the control. |
+| Can a model approve its own request? | Not with anything tokenstash hands it. The link an agent prints carries the **paste-scope** token: enough to answer a missing-key card, not enough to approve, to close another directory's card, or to paste a value that other directories would receive. The **full-scope** token reaches you only through channels you trigger — the notification, `tokenstash open`, your terminal. Every command that widens reach (`answer --allow`, `open`, `forget`, `list`, `audit`, `tasks --all`, `need --force`, `rotate`, `check`, `bind`, `workspaces`, `export`, `import`, and the agent registration in `init`) refuses unless both streams are a terminal and no agent marker is set. That check is a heuristic. An agent that allocates a pseudo-terminal and scrubs its environment, or that simply reads your keychain and config as your user, is outside what tokenstash can stop: it defends the line between the agent's tools and you, not the line between processes running as you ([SECURITY.md](SECURITY.md)). |
 | Can a hostile repo get a key delivered just by asking for it? | No. Nothing is trusted by folder. The first time a directory asks for a stored key you see one card naming the directory, the file, and every key with its sensitivity — approve exactly those, "these plus any non-sensitive registry key here", or deny. A paste grants one key to one directory; sensitive and unregistered keys need their own yes per directory; a program's own output choosing a key asks every time. A copy that carries its own `.env.local` with the same value needs no card and gains no grant (non-sensitive registry keys; file yours, untracked, not a symlink). The MCP server binds one directory at startup — the one your agent opened — refuses to act for any other, and refuses `/`, your home, tool and shared temp dirs outright. `tokenstash workspaces` lists and revokes it all (values already written stay written); every delivery is audited with the grant that allowed it. |
 | Can a revoked key be caught before the agent burns a turn on a 401? | Usually. A key unchecked for a day is re-verified with its provider before delivery — one free, read-only request to the host your code already calls. A dead key becomes a "Replace" card; a provider outage just delivers the key unchecked. |
 | Is the provider registry actually true? | It was checked, row by row, by HTTP request rather than recollection — 18 dead URLs fixed, 5 checks corrected, 1 removed for being decoration, and the rows that could not be settled say so. The record is [`docs/registry-verification.md`](docs/registry-verification.md); reproduce it with [`scripts/verify-registry.py`](scripts/verify-registry.py). |
@@ -131,7 +131,7 @@ tokenstash init                # macOS and Linux; Windows is not supported yet
 
 The npm package is a launcher plus one prebuilt binary package per platform (`optionalDependencies`, no install scripts — bun and pnpm install it as-is). The PyPI wheels carry the same binary and no Python code. Prebuilt binaries for macOS (arm64, x64) and Linux (x64, arm64; static, any distribution), with sha256 sidecars, are attached to [the latest release](https://github.com/kgarg2468/tokenstash/releases/latest). From source: `cargo install --git https://github.com/kgarg2468/tokenstash tokenstash`.
 
-`init` picks a keychain backend, registers the MCP server with the agents it finds, and installs a skill file so agents reach for it unprompted. It trusts no folder: directories pair once.
+`init` picks a keychain backend and registers the MCP server with the agents it finds (Claude Code, Codex, Cursor, Gemini CLI); Claude Code also gets a skill file and Codex an `AGENTS.md` snippet, so those two reach for it unprompted. It trusts no folder: directories pair once. `tokenstash init --undo` takes every registration back out.
 
 - **You create every account.** tokenstash gets you to the right page with the right steps; it never signs up for you, never proxies an API, never reads another tool's credential store.
 - **Generated secrets belong to one project.** `JWT_SECRET` and friends are created by tokenstash, not pasted, and each directory gets its own — one application can never sign with another's key. If two directories must share one, paste it into both.
@@ -139,11 +139,31 @@ The npm package is a launcher plus one prebuilt binary package per platform (`op
 - **Local secrets are generated, not requested.** `AUTH_SECRET`, `JWT_SECRET`, `SESSION_SECRET` never involve a human.
 - **Verification is tunable.** `verify_every = "24h" | "1h" | "always" | "never"` in `config.toml`; `always` is still at most once a minute per key. Probes that would cost quota, or whose provider cannot distinguish a bad key from a bad request, are never run unattended.
 
+## Configuration
+
+`config.toml` lives in `~/.config/tokenstash/` (macOS: `~/Library/Application Support/tokenstash/`), or wherever `TOKENSTASH_HOME` points. Every key is optional.
+
+| key | default | |
+| --- | --- | --- |
+| `env_file` | `.env.local` | the file keys are written to, relative to the project root; one setting for every project |
+| `inbox_port` | `7433` | |
+| `task_ttl_hours` | `24` | how long a card stays open, and how long a denial is remembered |
+| `stash_backend` | `auto` | `keyring` (OS store), `keyutils` (Linux kernel keyring: survives logout, not reboot), `insecure-file` (plaintext, 0600, warns on every run; CI only). `TOKENSTASH_STASH` overrides it |
+| `notifications` | `true` | desktop notifications; they carry a full-scope inbox link |
+| `inbox_links` | `paste` | `full` makes the link agents print full-scope too — for a headless setup with no notification channel, at the cost of the guarantee above |
+| `verify_every` | `24h` | `<n>h`, `<n>m`, `always` (still at most once a minute per key), `never` |
+
+**The project is the git root.** `need` resolves the directory it runs in to the nearest git checkout you own and writes the env file there, so in a monorepo `apps/web` and `apps/api` share `repo/.env.local` — that is the file your framework must load. A directory that is not a checkout is its own project.
+
+**No browser, no desktop?** Over SSH the inbox link is on the remote's loopback: forward port 7433, or answer from the terminal with `tokenstash answer`. In a container with no keyring, set `TOKENSTASH_STASH=insecure-file` (plaintext) or run tokenstash on the host.
+
+**Uninstall:** `tokenstash init --undo` removes what `init` wrote outside its own directory; `tokenstash forget NAME` removes a key from the keychain; delete the config directory for the rest.
+
 ## Commands
 
 | | |
 |---|---|
-| `tokenstash need NAME… [--why] [--url] [--step …] [--blocking]` | exit `0` injected · `10` pending · `20` denied · `30` expired |
+| `tokenstash need NAME… [--why] [--url] [--step …] [--blocking]` | exit `0` injected · `10` pending · `20` denied · `30` expired · `1` error. `--force` re-asks after a denial and is for a person at a terminal |
 | `tokenstash ask "title" [--url] [--step …] [--expects confirm\|text]` | non-secret human task (DNS, dashboard toggle, OAuth consent) |
 | `tokenstash answer [id] [--stdin] [--allow] [--deny]` | answer from the terminal instead of the inbox |
 | `tokenstash tasks [--all] [--history]` · `tokenstash open` | what is waiting on you |
@@ -151,8 +171,8 @@ The npm package is a launcher plus one prebuilt binary package per platform (`op
 | `tokenstash check` · `report-bad NAME --status 401` | prove keys are live; tell tokenstash when a provider rejects one |
 | `tokenstash export` · `import` | passphrase-encrypted bundle, to move a stash between machines |
 | `tokenstash workspaces [list\|revoke DIR\|forget DIR]` | which directories are paired with which keys; take a directory's grants away (values already written stay). For a person at a terminal — agents cannot list it |
-| `tokenstash run -- npm run dev` | zero-config shim: dies on a missing key → asks → restarts. Every key a program's output asks for gets its own yes, each run — never a standing grant |
-| `tokenstash mcp` · `inbox` · `doctor` · `audit` · `registry` | |
+| `tokenstash run -- npm run dev` | zero-config shim: dies on a missing registry-known key → asks → restarts. Every key a program's output asks for gets its own yes, each run — never a standing grant |
+| `tokenstash init [--undo]` · `mcp` · `inbox` · `doctor` · `audit` · `registry` | |
 
 ## What It Is Not
 
