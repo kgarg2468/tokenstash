@@ -139,8 +139,8 @@ appeared once in the intermediate run. Re-run before release.
 - **Omitting the inbox link** (Codex, once): "the secure Tokenstash prompt you received".
 
 Harness bugs found and fixed along the way, all now guarded: the decline was seeded against
-the wrong project; `init`'s guessed trust roots (`~/projects`, …) let a `need` from the
-wrong cwd write the canary into a real project; `init` probed the real keyring before the
+the wrong project; `init`'s guessed trust roots (`~/projects`, …, retired in 0.2) let a `need`
+from the wrong cwd write the canary into a real project; `init` probed the real keyring before the
 stash backend was set; an empty `CLAUDECODE=` still reads as Claude; grading raw stream-JSON
 matched field names; print mode showed only the final message; leaked inboxes held ports
 and failed the ownership proof; whole-line negation filters hid real asks; the placeholder
