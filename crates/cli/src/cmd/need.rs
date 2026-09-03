@@ -182,7 +182,10 @@ pub fn ask(a: AskArgs) -> Result<i32> {
         HumanRequest { title: a.title.clone(), why: a.why.clone(), url: a.url.clone(), steps: a.steps.clone(), expects: a.expects.clone() },
     )?;
     let state = notify::ensure_inbox(&app.cfg);
-    notify::desktop(&app.cfg, &t.title, &format!("{} · {agent}", tokenstash_core::project::short(&project)), &util::inbox_notice(&app.cfg, Some(&t.id), state));
+    // The same title returns the same task; it must not return the same toast.
+    if app.db.mark_notified(&t.id).unwrap_or(true) {
+        notify::desktop(&app.cfg, &t.title, &format!("{} · {agent}", tokenstash_core::project::short(&project)), &util::inbox_notice(&app.cfg, Some(&t.id), state));
+    }
     let mut task = t;
     if a.blocking {
         let start = std::time::Instant::now();

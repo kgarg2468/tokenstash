@@ -21,12 +21,17 @@ const SERVICE: &str = "tokenstash";
 /// gets an empty stash there, not the real keys under a database it can approve against.
 /// The default home keeps the plain name, so existing entries are untouched.
 pub(crate) fn service() -> String {
+    // Both sides canonical: `TOKENSTASH_HOME` spelled through a symlink or a `..` is still
+    // the default home, and must not turn into an empty namespace whose index (per home)
+    // lists keys that every `need` then misses.
     let home = crate::config::config_dir();
-    if home == crate::config::default_config_dir() {
+    let canon = home.canonicalize().unwrap_or(home);
+    let default = crate::config::default_config_dir();
+    let default = default.canonicalize().unwrap_or(default);
+    if canon == default {
         return SERVICE.into();
     }
     use sha2::Digest;
-    let canon = home.canonicalize().unwrap_or(home);
     let d = sha2::Sha256::digest(canon.to_string_lossy().as_bytes());
     format!("{SERVICE}-{}", d[..4].iter().map(|b| format!("{b:02x}")).collect::<String>())
 }
