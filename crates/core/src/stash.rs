@@ -20,14 +20,30 @@ const SERVICE: &str = "tokenstash";
 /// is per `TOKENSTASH_HOME`. A process that re-homes tokenstash into a directory it controls
 /// gets an empty stash there, not the real keys under a database it can approve against.
 /// The default home keeps the plain name, so existing entries are untouched.
+/// A path in the form used to decide "same directory": canonical when the directory exists,
+/// otherwise with `.` and `..` resolved lexically (a fresh install has no config dir yet, and
+/// `canonicalize` fails on a path that does not exist).
+fn same_dir_key(p: PathBuf) -> PathBuf {
+    if let Ok(c) = p.canonicalize() {
+        return c;
+    }
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => { out.pop(); }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 pub(crate) fn service() -> String {
     // Both sides canonical: `TOKENSTASH_HOME` spelled through a symlink or a `..` is still
     // the default home, and must not turn into an empty namespace whose index (per home)
     // lists keys that every `need` then misses.
-    let home = crate::config::config_dir();
-    let canon = home.canonicalize().unwrap_or(home);
-    let default = crate::config::default_config_dir();
-    let default = default.canonicalize().unwrap_or(default);
+    let canon = same_dir_key(crate::config::config_dir());
+    let default = same_dir_key(crate::config::default_config_dir());
     if canon == default {
         return SERVICE.into();
     }
