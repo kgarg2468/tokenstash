@@ -155,3 +155,14 @@ fn malformed_frames_never_end_the_session() {
     c.send(serde_json::json!({ "jsonrpc": "2.0", "id": 6, "method": "ping" }));
     assert!(c.expect_id(6).get("result").is_some(), "the server survived a parse error");
 }
+
+/// `expects` is stored on the card and drives the inbox form; only the two documented values.
+#[test]
+fn human_request_refuses_an_unknown_expects() {
+    let home = home("expects");
+    let proj = tmp("proj-expects");
+    let mut c = Client::start(&home, &proj);
+    let r = c.call(2, "human_request", serde_json::json!({ "title": "pick one", "expects": "choice" })).to_string();
+    assert!(r.contains("expects must be"), "{r}");
+    assert!(!r.contains("task_id"), "no card was filed: {r}");
+}

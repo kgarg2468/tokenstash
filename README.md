@@ -74,7 +74,7 @@ flowchart LR
 | Layer | Stack | Role |
 | --- | --- | --- |
 | CLI | Rust 2021, clap 4 | `need`, `ask`, `report-bad`, `tasks` and `run` are the product surface an agent touches; everything else is for a person |
-| Stash | `keyring` 3, OS-native | macOS Keychain, Linux Secret Service, kernel-keyring fallback (Windows Credential Manager is supported by the library but no Windows binary ships yet); `insecure-file` is CI-only and warns |
+| Stash | `keyring` 3, OS-native | macOS Keychain, Linux Secret Service, kernel-keyring fallback (the crates build on macOS and Linux only; Windows is not supported yet); `insecure-file` is CI-only and warns |
 | Index | SQLite (`rusqlite`, bundled) | Names, identities, projects, grants, tasks, audit log — metadata only, never a value |
 | Inbox | `tiny_http` bound to `127.0.0.1` | Two-scope session tokens, `HttpOnly; SameSite=Strict` cookie, CSRF double-submit, empty 404 for anything unauthenticated (the one open route, `/verify`, answers an ownership challenge and nothing else) |
 | MCP | stdio JSON-RPC server | `secrets_request`, `secrets_list`, `secrets_report_invalid`, `human_request`, `task_check`, `task_list` |

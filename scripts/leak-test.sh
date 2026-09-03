@@ -302,6 +302,12 @@ curl -s -c "$PJAR" -b "$PJAR" -o "$WEB/paste-approve-try.html" --data "action=al
 human "$TS" tasks --all --json | ATID="$ATID" python3 -c "import json,sys,os;sys.exit(0 if [t for t in json.load(sys.stdin) if t['id']==os.environ['ATID'] and t['status']=='pending'] else 1)" \
   || { echo "FAIL: a paste-scope POST approved a trust gate"; exit 1; }
 grep -q "EVIL_TARGET_KEY=" "$UNTRUSTED/.env.local" 2>/dev/null && { echo "FAIL: a paste-scope approval attempt injected a key"; exit 1; }
+# ...nor close it: the paste session is not tied to a directory, so "deny" on an approval
+# card from it could cost another directory a day
+curl -s -c "$PJAR" -b "$PJAR" -o "$WEB/paste-deny-try.html" --data "action=deny&t=$PASTE" "http://127.0.0.1:$PORT/t/$ATID"
+human "$TS" tasks --all --json | ATID="$ATID" python3 -c "import json,sys,os;sys.exit(0 if [t for t in json.load(sys.stdin) if t['id']==os.environ['ATID'] and t['status']=='pending'] else 1)" \
+  || { echo "FAIL: a paste-scope POST denied an approval card"; exit 1; }
+grep -q "full inbox session" "$WEB/paste-deny-try.html" || { echo "FAIL: the paste-scope deny refusal does not explain how to get the full session"; exit 1; }
 # the full session approves it
 curl -fsS -c "$JAR" -b "$JAR" -L -o "$WEB/full-approved.html" --data "action=allow" --data-urlencode "t=$TOKEN" "http://127.0.0.1:$PORT/t/$ATID"
 grep -q "EVIL_TARGET_KEY=$GOOD" "$UNTRUSTED/.env.local" 2>/dev/null || { echo "FAIL: the full session could not approve"; echo "--- response:"; sed 's/<[^>]*>/ /g' "$WEB/full-approved.html" | tr -s ' \n' | head -c 400; echo; echo "--- tasks:"; human "$TS" tasks --all --history --json | python3 -c "import json,sys;[print(t['id'],t['kind'],t['status'],t.get('project')) for t in json.load(sys.stdin)]"; echo "--- audit:"; human "$TS" audit | head -5; echo "--- untrusted dir:"; ls -la "$UNTRUSTED"; exit 1; }
@@ -427,8 +433,15 @@ NEWCANARY="sk-ROTATEDCANARY-$(date +%s)-0123456789abcdef"
 echo "$NEWCANARY" | "$TS" answer "$RTID" --stdin --skip-check >"$OUT/rotate-answer-pipe.txt" 2>&1 && { echo "FAIL: an agent answered a Replace card"; fail=1; }
 grep -q "for a person at a terminal" "$OUT/rotate-answer-pipe.txt" || { echo "FAIL: the Replace refusal did not say why"; sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$OUT/rotate-answer-pipe.txt" | head -3; fail=1; }
 grep -q "$NEWCANARY" "$PROJ/.env.local" && { echo "FAIL: the refused Replace answer was written anyway"; fail=1; }
-# …and the person at the terminal answers the masked prompt.
-(sleep 2; printf '%s\n' "$NEWCANARY") | human "$TS" answer "$RTID" --skip-check >"$OUT/rotate-answer.txt" 2>&1 || true
+# …the agent's link is refused the same way (a Replace card rewrites every holder)…
+curl -s -c "$PJAR" -b "$PJAR" -o "$WEB/paste-replace-try.html" --data "value=$NEWCANARY&skip_check=1&t=$PASTE" "http://127.0.0.1:$PORT/t/$RTID"
+grep -q "$NEWCANARY" "$PROJ/.env.local" 2>/dev/null && { echo "FAIL: the paste-scope session answered a Replace card"; fail=1; }
+grep -q "other directories hold this key" "$WEB/paste-replace-try.html" || { echo "FAIL: the paste-scope Replace refusal did not explain"; fail=1; }
+# …and the person at the terminal answers the masked prompt. The pty echoes what is typed
+# before rpassword turns echo off, so this transcript lives with the browser-facing files,
+# which the leak grep does not read; the value's absence from every other output is what
+# the assertions below check.
+(sleep 2; printf '%s\n' "$NEWCANARY") | human "$TS" answer "$RTID" --skip-check >"$WEB/rotate-answer.txt" 2>&1 || true
 grep -q "OPENAI_API_KEY=$NEWCANARY" "$PROJ/.env.local" || { echo "FAIL: the rotated value did not land in the env file"; fail=1; }
 human "$TS" list | grep -q "OPENAI_API_KEY.*STALE" && { echo "FAIL: answering the rotation card did not clear stale"; fail=1; }
 OLDCANARY="$CANARY"; CANARY="$NEWCANARY"

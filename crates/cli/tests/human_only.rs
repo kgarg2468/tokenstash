@@ -11,6 +11,16 @@ fn tmp(name: &str) -> PathBuf {
     p
 }
 
+/// A scratch home: no notifications, an inbox port nobody else uses. Without this the child
+/// runs with `Config::default()` and a pending card spawns a real inbox on the developer's
+/// port 7433 that stays up for a day.
+fn home(name: &str) -> PathBuf {
+    let h = tmp(name);
+    let port = 30000 + (std::process::id() % 20000) as u16 + (name.len() as u16 % 50) + 7;
+    std::fs::write(h.join("config.toml"), format!("notifications = false\ninbox_port = {port}\nstash_backend = \"insecure-file\"\nverify_every = \"never\"\n")).unwrap();
+    h
+}
+
 fn run(home: &PathBuf, cwd: &PathBuf, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_tokenstash")).args(args).current_dir(cwd)
         .env("TOKENSTASH_HOME", home).env("TOKENSTASH_STASH", "insecure-file").env_remove("CLAUDECODE")
@@ -19,7 +29,7 @@ fn run(home: &PathBuf, cwd: &PathBuf, args: &[&str]) -> std::process::Output {
 
 #[test]
 fn widening_commands_refuse_a_pipe() {
-    let home = tmp("home");
+    let home = home("home");
     let proj = tmp("proj");
     for args in [
         vec!["open"],
@@ -42,7 +52,7 @@ fn widening_commands_refuse_a_pipe() {
 
 #[test]
 fn an_agent_cannot_answer_another_directorys_card() {
-    let home = tmp("home-x");
+    let home = home("home-x");
     let theirs = tmp("theirs");
     let mine = tmp("mine");
     let out = run(&home, &theirs, &["need", "OPENAI_API_KEY"]);
@@ -64,4 +74,23 @@ fn an_agent_cannot_answer_another_directorys_card() {
     let still = run(&home, &theirs, &["tasks", "--json"]);
     let v: serde_json::Value = serde_json::from_slice(&still.stdout).unwrap();
     assert_eq!(v.as_array().unwrap()[0]["status"], "pending", "nothing changed: {v}");
+}
+
+/// `init` sets up the stash and config for anyone, but registering this binary as every
+/// agent's MCP server is a person's decision: from a hostile checkout an agent could point
+/// every future session at a build that hands values to the model.
+#[test]
+fn init_registers_agents_only_for_a_person() {
+    let home = home("home-init");
+    let proj = tmp("proj-init");
+    let out = run(&home, &proj, &["init"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "init itself still succeeds: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("Agents were not registered"), "{stdout}");
+    assert!(stdout.contains("stash backend"), "the stash was still set up: {stdout}");
+    assert!(!stdout.contains("Files outside"), "nothing was written into agent config: {stdout}");
+    // ...and --no-agents, which scripts use, is quiet about it.
+    let out = run(&home, &proj, &["init", "--no-agents"]);
+    assert!(out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("Agents were not registered"));
 }

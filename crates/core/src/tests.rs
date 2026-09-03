@@ -2688,8 +2688,10 @@ fn fans_out_when_another_directory_holds_a_grant_or_the_card_is_a_replacement() 
     assert!(tasks::fans_out(&ctx, &held_elsewhere).unwrap(), "A holds a grant for it");
     let fresh = tasks::create_secret_task(&ctx, &proj_b, "agent", "RESEND_API_KEY", "default", &req).unwrap();
     assert!(!tasks::fans_out(&ctx, &fresh).unwrap(), "nobody else holds it");
+    // A's own grant for the key does not count: the card is A's, and A already holds it.
+    pair(&db, &proj_a, "GROQ_API_KEY");
     let own = tasks::create_secret_task(&ctx, &proj_a, "agent", "GROQ_API_KEY", "default", &req).unwrap();
-    assert!(!tasks::fans_out(&ctx, &own).unwrap());
+    assert!(!tasks::fans_out(&ctx, &own).unwrap(), "the card's own directory is not \"elsewhere\"");
     let replace = tasks::create_replacement_task(&ctx, &proj_b, "agent", "RESEND_API_KEY", "default", &req).unwrap();
     assert!(tasks::fans_out(&ctx, &replace).unwrap(), "a replacement rewrites every holder");
     std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
@@ -2720,6 +2722,14 @@ fn the_keyring_service_is_namespaced_by_a_non_default_home() {
     assert_eq!(s, again, "stable for the same home");
     std::env::set_var("TOKENSTASH_HOME", base_home());
     assert_ne!(stash::service(), s, "a different home is a different stash");
+    // The default home keeps the plain name — the half that protects every existing user's
+    // keys. `default_config_dir` is pure, so this is safe to assert without touching it.
+    std::env::remove_var("TOKENSTASH_HOME");
+    assert_eq!(stash::service(), "tokenstash");
+    let spelled_via_dotdot = config::default_config_dir().join("..").join("tokenstash");
+    std::env::set_var("TOKENSTASH_HOME", &spelled_via_dotdot);
+    assert_eq!(stash::service(), "tokenstash", "the same directory spelled with `..` is the same stash");
+    std::env::set_var("TOKENSTASH_HOME", base_home());
 }
 
 /// One notion of "this line defines NAME" for readers and the writer: an indented line used
@@ -2756,4 +2766,30 @@ fn a_deny_note_that_looks_like_a_secret_is_refused() {
     assert_eq!(db.get_task(&t.id).unwrap().unwrap().status, db::TaskStatus::Pending, "a refused note must not close the card");
     tasks::deny(&ctx, &t, Some("we use a different provider")).unwrap();
     std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+/// One toast per card: the claim is a compare-and-set, so two processes polling the same
+/// card cannot both win it.
+#[test]
+fn a_card_is_notified_once() {
+    let home = tmp("notify-once");
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let cfg = Config::default();
+    let st = stash::FileStash::new().unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: &st, probe: tasks::Probe::Off };
+    let t = tasks::create_secret_task(&ctx, &home, "agent", "OPENAI_API_KEY", "default", &Default::default()).unwrap();
+    assert!(db.mark_notified(&t.id).unwrap());
+    assert!(!db.mark_notified(&t.id).unwrap());
+    assert!(!db.mark_notified(&t.id).unwrap());
+    assert!(!db.mark_notified("t_nothere").unwrap(), "an unknown card is not a fresh one");
+}
+
+/// The `query:` probe puts the value in the URL; it must arrive encoded, not truncated at `&`.
+#[test]
+fn a_query_probe_sends_the_value_percent_encoded() {
+    let v = SecretString::from("AQ.key&with#specials".to_string());
+    let (url, rx, _h) = loopback("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+    assert_eq!(validate::liveness(&check_for(&url, "query:key"), &v, std::time::Duration::from_secs(1)), validate::Liveness::Ok);
+    let req = rx.recv().unwrap();
+    assert!(req.contains("/probe?key=AQ.key%26with%23specials "), "{req}");
 }
