@@ -93,7 +93,9 @@ if [ "${NPM_PUBLISH:-}" = 1 ]; then
   done
   name=tokenstash; same_package "$main" || { echo "tokenstash@$version is missing or not ours" >&2; exit 1; }
   # What the registry actually did with the tags, in the job log: the only place the
-  # "first publish takes latest" behaviour above is observable rather than assumed.
-  npm view tokenstash dist-tags --json
+  # "first publish takes latest" behaviour above is observable rather than assumed. Never
+  # fatal — every package is published and verified by this point, and a rate-limited
+  # diagnostic must not be what leaves the release sitting as a draft.
+  npm view tokenstash dist-tags --json || echo "dist-tag lookup failed; packages are published"
 fi
 echo "assembled in $out"; ls "$out"
