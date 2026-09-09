@@ -98,7 +98,10 @@ jobs:
     # Then configure a trusted publisher on all five packages (this repo, release.yml), set
     # the repo variable NPM_TRUSTED_PUBLISHING=true and delete NPM_TOKEN: OIDC with automatic
     # provenance from then on. Never unpublish a version: name@version can never be reused
-    # and the launcher pins exact versions; ship a patch release instead.
+    # and the launcher pins exact versions; ship a patch release instead. A pre-release tag
+    # publishes under the `next` dist-tag (npm requires one), but the registry still points
+    # `latest` at a new package's first publish whatever the tag says: an rc dry run IS what
+    # `npm install tokenstash` gets until the final tag moves it.
     needs: build
     runs-on: ubuntu-latest
     permissions: { contents: read, id-token: write }   # publishes; never writes to the repo
