@@ -7,10 +7,20 @@
 #   scripts/npm-package.sh <version> <dir-with-tokenstash-*.tar.gz> <out-dir>
 #   NPM_PUBLISH=1 scripts/npm-package.sh ...   # also `npm publish --access public --provenance` each one
 #
+# A pre-release publishes under the `next` dist-tag, and only a pre-release: npm refuses to
+# publish a prerelease under the default tag at all, and an explicit `--tag latest` on a
+# final would switch off npm's own guard against moving `latest` backwards (a 0.2.1 backport
+# published after 0.3.0 would silently become what everyone installs).
+# What `--tag next` does NOT buy: the registry assigns `latest` itself on a package's FIRST
+# publish, whatever --tag says. So the first release candidate of a brand-new name is what a
+# bare `npm install tokenstash` (and bun / pnpm / npx) resolves to until the final version
+# moves `latest`. Keep that window short; a dry run on an established name is free.
+#
 # Platform packages are published first; the launcher last, so a partially failed release
 # never leaves a launcher that resolves to a missing platform package.
 set -euo pipefail
 version="${1:?version}"; src="${2:?tarball dir}"; out="${3:?out dir}"
+tagopt=(); case "$version" in *-*) tagopt=(--tag next) ;; esac
 here="$(cd "$(dirname "$0")/.." && pwd)"
 # Skip a package already on the registry at this version so a re-run after a partial
 # failure finishes the set instead of dying on E403 — but only if what is there is OURS:
@@ -37,7 +47,7 @@ publish() { # <pkg dir>
   fi
   # --provenance on both paths: the OIDC path gets it automatically, the bootstrap token
   # path does not, and a first release nobody can verify is the one that matters most.
-  (cd "$1" && npm publish --access public --provenance)
+  (cd "$1" && npm publish --access public --provenance ${tagopt[@]+"${tagopt[@]}"})
 }
 rm -rf "$out"; mkdir -p "$out"
 for name in linux-x64 linux-arm64 darwin-arm64 darwin-x64; do
@@ -82,5 +92,8 @@ if [ "${NPM_PUBLISH:-}" = 1 ]; then
     name="tokenstash-$name"; same_package "$out/$name" || { echo "$name@$version is missing or not ours" >&2; exit 1; }
   done
   name=tokenstash; same_package "$main" || { echo "tokenstash@$version is missing or not ours" >&2; exit 1; }
+  # What the registry actually did with the tags, in the job log: the only place the
+  # "first publish takes latest" behaviour above is observable rather than assumed.
+  npm view tokenstash dist-tags --json
 fi
 echo "assembled in $out"; ls "$out"
