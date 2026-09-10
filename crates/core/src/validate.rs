@@ -103,7 +103,11 @@ pub fn liveness(check: &Check, value: &SecretString, timeout: Duration) -> Liven
                 Liveness::Ok
             }
         }
-        Err(e) => Liveness::Unknown(redact_err(&e.to_string(), v)),
+        // Transport Display strings include the request URL and may include peer-controlled
+        // protocol details. A query-auth URL carries the percent-encoded credential, which
+        // raw-value redaction cannot reliably recognize after URL normalization. ErrorKind
+        // is a static category, so it stays actionable without reflecting either surface.
+        Err(ureq::Error::Transport(e)) => Liveness::Unknown(format!("provider check failed: {}", e.kind())),
     }
 }
 
@@ -117,10 +121,6 @@ fn url_is_safe_for_a_secret(url: &str) -> bool {
     let Some(rest) = l.strip_prefix("http://") else { return false };
     let host = rest.split(['/', '?', '#']).next().unwrap_or("").rsplit_once(':').map(|(h, _)| h.to_string()).unwrap_or_else(|| rest.split(['/', '?', '#']).next().unwrap_or("").to_string());
     matches!(host.trim_start_matches('[').trim_end_matches(']'), "127.0.0.1" | "::1" | "localhost")
-}
-
-fn redact_err(msg: &str, v: &str) -> String {
-    crate::redact::Redactor::new().with(&SecretString::from(v.to_string())).redact(msg)
 }
 
 /// Heuristic used to refuse a free-text human answer that is actually a credential. Matches

@@ -76,7 +76,7 @@ flowchart LR
 | CLI | Rust 2021, clap 4 | `need`, `ask`, `report-bad`, `tasks` and `run` are the product surface an agent touches; everything else is for a person |
 | Stash | `keyring` 3, OS-native | macOS Keychain, Linux Secret Service, kernel-keyring fallback (the crates build on macOS and Linux only; Windows is not supported yet); `insecure-file` is CI-only and warns |
 | Index | SQLite (`rusqlite`, bundled) | Names, identities, projects, grants, tasks, audit log — metadata only, never a value |
-| Inbox | `tiny_http` bound to `127.0.0.1` | Two-scope session tokens, `HttpOnly; SameSite=Strict` cookie, CSRF double-submit, empty 404 for anything unauthenticated (the one open route, `/verify`, answers an ownership challenge and nothing else) |
+| Inbox | bounded loopback HTTP listener on `127.0.0.1` | Two-scope session tokens, `HttpOnly; SameSite=Strict` cookie, CSRF double-submit, empty 404 for anything unauthenticated (the one open route, `/verify`, answers an ownership challenge and nothing else) |
 | MCP | stdio JSON-RPC server | `secrets_request`, `secrets_list`, `secrets_report_invalid`, `human_request`, `task_check`, `task_list` |
 | Registry | `crates/core/registry/providers.json` | 79 providers: signup URL, ordered steps, key pattern, optional liveness check |
 | Validation | `validate.rs` over `ureq` | Prefix check at paste time, cheap liveness call, `reject_status` for providers that do not spell auth failure `401` |
@@ -129,7 +129,7 @@ uv tool install tokenstash     # or: pipx install tokenstash
 tokenstash init                # macOS and Linux; Windows is not supported yet
 ```
 
-The npm package is a launcher plus one prebuilt binary package per platform (`optionalDependencies`, no install scripts — bun and pnpm install it as-is). The PyPI wheels carry the same binary and no Python code. Prebuilt binaries for macOS (arm64, x64) and Linux (x64, arm64; static, any distribution), with sha256 sidecars, are attached to [the latest release](https://github.com/kgarg2468/tokenstash/releases/latest). From source: `cargo install --git https://github.com/kgarg2468/tokenstash tokenstash`.
+The npm package is a launcher plus one prebuilt binary package per platform (`optionalDependencies`, no install scripts — bun and pnpm install it as-is). The PyPI wheels carry the same binary and no Python code. Prebuilt binaries for macOS (arm64, x64) and Linux (x64, arm64; static, any distribution), with sha256 sidecars, are attached to [the latest release](https://github.com/kgarg2468/tokenstash/releases/latest). From source: `cargo install --locked --git https://github.com/kgarg2468/tokenstash tokenstash`.
 
 `init` picks a keychain backend and registers the MCP server with the agents it finds (Claude Code, Codex, Cursor, Gemini CLI); Claude Code also gets a skill file and Codex an `AGENTS.md` snippet, so those two reach for it unprompted. It trusts no folder: directories pair once. `tokenstash init --undo` takes every registration back out.
 

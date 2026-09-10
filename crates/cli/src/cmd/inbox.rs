@@ -5,6 +5,41 @@
 //! except `/verify` requires the session token: presented as `?t=` on the first visit, then
 //! held as an `HttpOnly; SameSite=Strict` cookie. POSTs additionally carry it in a hidden form
 //! field (double submit), so a cross-site form post cannot ride the cookie into an answer.
+//!
+//! # One request at a time, so nobody may hold the line
+//!
+//! Requests are handled one after another on the main thread, which is what the database and
+//! the stash want. That makes "a client that never finishes its request" the thing to design
+//! against: any process on the machine, or a page in the browser, can open a POST, send the
+//! headers and then nothing. If the handler waited for that body, every later request — a
+//! human's paste, the CLI's `/verify` ownership probe — would wait behind it for as long as
+//! the socket stayed open.
+//!
+//! So the main thread never reads from a socket. A fixed pool of [`READERS`] threads takes
+//! connections off the listener and reads each request in full under a deadline that starts
+//! the moment a reader takes the connection: [`REQUEST_DEADLINE`] for the whole request,
+//! [`IO_TIMEOUT`] for any single wait for bytes, [`MAX_HEAD`] for the header block, and
+//! [`MAX_BODY`] applied to the *declared* length before a byte of body is read. Whatever has
+//! not arrived whole in time gets a `408` and the socket closed; a client that trickles a byte
+//! per wait is cut off by the whole-request deadline all the same. Only a complete request
+//! reaches [`handle`], so a truncated form can neither authenticate with the CSRF field at its
+//! front nor hand a half-copied key to `answer_secret`. Writing is bounded the same way: a
+//! whole response — status line, headers and body, error replies included — must be taken
+//! within [`RESPONSE_DEADLINE`], and every partial write is given only the time that is left,
+//! so the main thread spends at most that long on any one client however slowly it reads.
+//!
+//! What this bounds is resources and each individual read or write, not fairness. Time spent
+//! in the kernel's listen backlog, in the acceptor's hand waiting for a free reader, or as a
+//! complete request queued for the main thread is outside every deadline; a sustained flood of
+//! clients can keep all the readers busy and starve a legitimate one, and this server does not
+//! try to defeat that. What a flood cannot do is make anything here grow without bound, or
+//! make any single wait unbounded.
+//!
+//! The server is a small HTTP/1.1 listener over `std::net`, not a framework: a framework that
+//! owns the socket offers no way to put a deadline on it (and `tiny_http`, used before, drains
+//! the declared body on whichever thread drops a request — the very stall being closed). One
+//! request per connection, `Connection: close` on every response: a form page on loopback
+//! needs nothing more, and keep-alive would be one more way to hold a reader.
 
 use crate::inbox_auth;
 use crate::util::App;
@@ -12,9 +47,11 @@ use anyhow::Result;
 use clap::Args;
 use secrecy::SecretString;
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{ErrorKind, Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tiny_http::{Header, Request, Response, Server};
 use tokenstash_core::db::{Task, TaskKind, TaskStatus};
 use tokenstash_core::tasks::{self, AnswerResult};
 
@@ -29,8 +66,25 @@ pub struct InboxArgs {
 
 const IDLE_EXIT: Duration = Duration::from_secs(30 * 60);
 
-/// Cap on a form post. Answers are pasted API keys, not uploads.
+/// Cap on a form post. Answers are pasted API keys, not uploads. Judged on the declared
+/// `Content-Length` before any of the body is read.
 const MAX_BODY: u64 = 64 * 1024;
+/// Cap on the request line plus headers. A browser sends a couple of kilobytes; the session
+/// cookie is 64 bytes.
+const MAX_HEAD: usize = 16 * 1024;
+/// Cap on the number of header lines.
+const MAX_HEADERS: usize = 100;
+/// A request — request line, headers and body — must have arrived in full this long after
+/// a reader took its connection. On loopback a browser delivers a form post in one write.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
+/// A response — status line, headers and body — must have been taken in full this long after
+/// the handler started writing it. The most the main thread spends on any one client.
+const RESPONSE_DEADLINE: Duration = Duration::from_secs(10);
+/// No single wait for bytes from a client, or for a client to take a response, lasts longer.
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// Reader threads, each reading one connection at a time. A browser opens at most six
+/// connections to one origin, so a single hostile page leaves readers free.
+const READERS: usize = 8;
 
 pub fn serve(a: InboxArgs) -> Result<i32> {
     let app = App::open()?;
@@ -38,11 +92,11 @@ pub fn serve(a: InboxArgs) -> Result<i32> {
     // Minted here on the first ever start and reused afterwards, so a notification the human
     // has not clicked yet still opens after the inbox has idled out and been respawned.
     let tokens = inbox_auth::Tokens::ensure()?;
-    let server = match Server::http(format!("127.0.0.1:{port}")) {
-        Ok(s) => s,
+    let listener = match TcpListener::bind(("127.0.0.1", port)) {
+        Ok(l) => l,
         Err(e) => {
             // Two `ensure_inbox` racing is normal and quiet; anything else is not.
-            if e.downcast_ref::<std::io::Error>().map(|io| io.kind() == std::io::ErrorKind::AddrInUse).unwrap_or(false) {
+            if e.kind() == ErrorKind::AddrInUse {
                 eprintln!("inbox already running on {port}");
                 return Ok(0);
             }
@@ -50,17 +104,19 @@ pub fn serve(a: InboxArgs) -> Result<i32> {
             return Ok(tokenstash_core::exit::ERROR);
         }
     };
+    let port = listener.local_addr().map(|l| l.port()).unwrap_or(port);
     eprintln!("tokenstash inbox → http://127.0.0.1:{port}/");
+    let requests = spawn_readers(listener);
     let mut last_activity = Instant::now();
     loop {
-        match server.recv_timeout(Duration::from_secs(1)) {
-            Ok(Some(req)) => {
+        match requests.recv_timeout(Duration::from_secs(1)) {
+            Ok(req) => {
                 last_activity = Instant::now();
                 if let Err(e) = handle(&app, req, &tokens) {
                     eprintln!("inbox: {e:#}");
                 }
             }
-            Ok(None) => {
+            Err(RecvTimeoutError::Timeout) => {
                 if !a.keep && last_activity.elapsed() > IDLE_EXIT {
                     let _ = app.db.expire_overdue();
                     if app.db.list_tasks(None, true).map(|v| v.is_empty()).unwrap_or(true) {
@@ -69,21 +125,21 @@ pub fn serve(a: InboxArgs) -> Result<i32> {
                     last_activity = Instant::now();
                 }
             }
-            Err(e) => { eprintln!("inbox: {e}"); return Ok(1); }
+            Err(RecvTimeoutError::Disconnected) => { eprintln!("inbox: the listener stopped"); return Ok(1); }
         }
     }
 }
 
-fn handle(app: &App, mut req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
+fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
     use inbox_auth::Scope;
     let token = &tokens.full;
-    let url = req.url().to_string();
+    let url = req.url.clone();
     let (path, query) = match url.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
         None => (url.clone(), String::new()),
     };
     let q = parse_form(&query);
-    let method = req.method().as_str().to_string();
+    let method = req.method.clone();
 
     // The one unauthenticated route, and deliberately ahead of every other check: it is how a
     // CLI that has not yet decided to trust this listener asks "are you the tokenstash inbox
@@ -109,17 +165,17 @@ fn handle(app: &App, mut req: Request, tokens: &inbox_auth::Tokens) -> Result<()
     let session = cookie(&req, inbox_auth::COOKIE);
     let scope = session.as_deref().and_then(|c| tokens.scope_of(c));
     let cookie_ok = scope.is_some();
-    // Read one byte past the limit so "exactly at the limit" and "too long" are
-    // distinguishable. Truncating instead would be worse than refusing: the CSRF field sits at
-    // the front of the body, so a cut-off form still authenticates, and parse_form would hand
-    // a half-copied API key or note to answer_secret as though the human had typed it.
-    let mut raw = Vec::new();
-    if method == "POST" {
-        req.as_reader().take(MAX_BODY + 1).read_to_end(&mut raw)?;
+    // A body declared over the cap was refused by the reader before a byte of it was read, so
+    // there is no form to authenticate with and nothing that could have been stored in part.
+    // A session holder is told why; anyone else gets the same bare 404 as everything else.
+    // Refusing whole rather than truncating matters: the CSRF field sits at the front of the
+    // body, so a cut-off form would still authenticate and parse_form would hand a
+    // half-copied API key or note to answer_secret as though the human had typed it.
+    if req.oversized {
+        return if cookie_ok { respond(req, 413, "text/plain", "answer too large; nothing was stored".into()) } else { not_found(req) };
     }
-    let oversized = raw.len() as u64 > MAX_BODY;
-    let body = String::from_utf8_lossy(&raw);
-    let form = if method == "POST" { parse_form(&body) } else { HashMap::new() };
+    // Complete by construction: the reader delivers exactly the declared length or nothing.
+    let form = if method == "POST" { parse_form(&String::from_utf8_lossy(&req.body)) } else { HashMap::new() };
 
     // GET: the cookie alone (SameSite=Strict stops a foreign page from making the browser
     // send it). POST: the cookie AND a matching hidden field — double submit, so even a
@@ -136,8 +192,17 @@ fn handle(app: &App, mut req: Request, tokens: &inbox_auth::Tokens) -> Result<()
     if method == "GET" {
         if let Some(t) = q.get("t") {
             if let Some(presented) = tokens.scope_of(t) {
-                let rest: Vec<&str> = query.split('&').filter(|kv| !kv.is_empty() && !kv.starts_with("t=")).collect();
-                let dest = if rest.is_empty() { path.clone() } else { format!("{path}?{}", rest.join("&")) };
+                // The credential is dropped by its DECODED name — `t=`, `%74=`, repeated — so
+                // no spelling parse_form reads as `t` survives into the Location header; the
+                // rest of the query goes back exactly as it came, nothing re-encoded.
+                let rest = strip_auth_params(&query);
+                let dest = if rest.is_empty() { path.clone() } else { format!("{path}?{rest}") };
+                // A network-path target (`//host`, `/\host`) was refused at parse time; this
+                // is the one place a Location is built from the request, so it is checked
+                // again here rather than trusted from there.
+                if !same_origin_path(&dest) {
+                    return not_found(req);
+                }
                 return match (scope, presented) {
                     (Some(Scope::Full), _) => redirect(req, &dest),
                     _ => redirect_authed(req, &dest, tokens.for_scope(presented)),
@@ -152,12 +217,6 @@ fn handle(app: &App, mut req: Request, tokens: &inbox_auth::Tokens) -> Result<()
     // The CSRF hidden field carries the session's own token, so a paste-scope page never
     // learns the full token.
     let session_token = tokens.for_scope(scope);
-
-    // Checked after authentication so an unauthenticated caller still learns nothing (it gets
-    // the same bare 404 as everything else), and before any task lookup so nothing is stored.
-    if oversized {
-        return respond(req, 413, "text/plain", "answer too large; nothing was stored".into());
-    }
 
     app.db.expire_overdue()?;
 
@@ -245,15 +304,11 @@ fn handle(app: &App, mut req: Request, tokens: &inbox_auth::Tokens) -> Result<()
 /// A local process or a foreign page probing the port learns neither that an inbox is here nor
 /// that a given task id exists.
 fn not_found(req: Request) -> Result<()> {
-    let r = Response::from_string("")
-        .with_status_code(404)
-        .with_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
-    req.respond(r)?;
-    Ok(())
+    req.respond(Reply::new(404, String::new()).with("Cache-Control", "no-store"))
 }
 
-fn header<'a>(req: &'a Request, name: &'static str) -> Option<&'a str> {
-    req.headers().iter().find(|h| h.field.equiv(name)).map(|h| h.value.as_str())
+fn header<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
+    req.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
 }
 
 fn cookie(req: &Request, name: &'static str) -> Option<String> {
@@ -273,19 +328,15 @@ fn host_is_loopback(req: &Request) -> bool {
 }
 
 fn respond(req: Request, code: u16, ctype: &str, body: String) -> Result<()> {
-    let r = Response::from_string(body)
-        .with_status_code(code)
-        .with_header(Header::from_bytes("Content-Type", ctype).unwrap())
-        .with_header(Header::from_bytes("Cache-Control", "no-store").unwrap())
-        .with_header(Header::from_bytes("X-Frame-Options", "DENY").unwrap())
+    req.respond(Reply::new(code, body)
+        .with("Content-Type", ctype)
+        .with("Cache-Control", "no-store")
+        .with("X-Frame-Options", "DENY")
         // The pages are self-contained: one inline <style>, no script, no image, no fetch.
         // Saying so stops a link or a field that got past the escaping upstream from
         // running anything in this origin — the origin whose session approves grants.
-        .with_header(Header::from_bytes("Content-Security-Policy",
-            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'").unwrap())
-        .with_header(Header::from_bytes("Referrer-Policy", "no-referrer").unwrap());
-    req.respond(r)?;
-    Ok(())
+        .with("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+        .with("Referrer-Policy", "no-referrer"))
 }
 
 /// 303 that also installs the session cookie. No `Secure` attribute: this is plain HTTP on the
@@ -293,29 +344,355 @@ fn respond(req: Request, code: u16, ctype: &str, body: String) -> Result<()> {
 /// `Max-Age` either — it dies with the browser session.
 fn redirect_authed(req: Request, to: &str, token: &str) -> Result<()> {
     let set_cookie = format!("{}={token}; Path=/; HttpOnly; SameSite=Strict", inbox_auth::COOKIE);
-    let r = Response::from_string("")
-        .with_status_code(303)
-        .with_header(Header::from_bytes("Location", to).unwrap())
-        .with_header(Header::from_bytes("Set-Cookie", set_cookie.as_str()).unwrap())
-        .with_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
-    req.respond(r)?;
-    Ok(())
+    req.respond(Reply::new(303, String::new()).with("Location", local(to)).with("Set-Cookie", set_cookie).with("Cache-Control", "no-store"))
 }
 
 fn redirect(req: Request, to: &str) -> Result<()> {
-    let r = Response::from_string("").with_status_code(303).with_header(Header::from_bytes("Location", to).unwrap());
-    req.respond(r)?;
+    req.respond(Reply::new(303, String::new()).with("Location", local(to)))
+}
+
+/// `to` if it is a path on this origin, else `/`: the last check before a Location header is
+/// written, whoever built the target.
+fn local(to: &str) -> &str {
+    if same_origin_path(to) { to } else { "/" }
+}
+
+/// An absolute path on this origin: not a network-path reference (`//host`, or `/\host`, which
+/// browsers read the same way) and no backslash anywhere for a browser to turn into a slash.
+fn same_origin_path(p: &str) -> bool {
+    p.starts_with('/') && !p.starts_with("//") && !p.contains('\\')
+}
+
+/// The query without any parameter whose decoded name is `t` — the session credential in any
+/// spelling parse_form would accept, every occurrence — the remaining pairs verbatim.
+fn strip_auth_params(query: &str) -> String {
+    query.split('&')
+        .filter(|kv| !kv.is_empty() && form_decode(kv.split('=').next().unwrap_or_default()) != "t")
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+// ---- the server ----------------------------------------------------------------------------
+
+/// A complete request, as a reader thread delivers it to the main thread. Answered exactly
+/// once with [`Request::respond`]; dropped unanswered (a handler error) it sends a bare 500 so
+/// the browser is not left waiting.
+struct Request {
+    method: String,
+    /// Path and query exactly as sent, e.g. `/t/abc?m=x`.
+    url: String,
+    headers: Vec<(String, String)>,
+    /// The whole body: exactly `Content-Length` bytes, or empty.
+    body: Vec<u8>,
+    /// The declared `Content-Length` was over [`MAX_BODY`]; none of the body was read.
+    oversized: bool,
+    stream: Option<TcpStream>,
+}
+
+/// A response: status, our headers, body. `Content-Length` and `Connection: close` are added
+/// when it is written.
+struct Reply {
+    code: u16,
+    headers: Vec<(&'static str, String)>,
+    body: String,
+}
+
+impl Reply {
+    fn new(code: u16, body: String) -> Self {
+        Reply { code, headers: Vec::new(), body }
+    }
+    fn with(mut self, name: &'static str, value: impl Into<String>) -> Self {
+        self.headers.push((name, value.into()));
+        self
+    }
+}
+
+impl Request {
+    fn respond(mut self, reply: Reply) -> Result<()> {
+        let mut stream = self.stream.take().expect("a request is answered once");
+        let head_only = self.method == "HEAD";
+        let written = write_reply(&mut stream, &reply, head_only, Instant::now() + RESPONSE_DEADLINE);
+        let _ = stream.shutdown(Shutdown::Both);
+        match written {
+            // The client went away first: nothing to do and nothing worth logging.
+            Err(e) if matches!(e.kind(), ErrorKind::BrokenPipe | ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset) => Ok(()),
+            Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => anyhow::bail!("a client did not take its response within {RESPONSE_DEADLINE:?}; dropped it"),
+            other => Ok(other?),
+        }
+    }
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        if let Some(mut stream) = self.stream.take() {
+            let _ = write_reply(&mut stream, &Reply::new(500, String::new()), false, Instant::now() + IO_TIMEOUT);
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+/// Writes `reply` whole — status line, headers and body — before `deadline`, or fails.
+fn write_reply(stream: &mut TcpStream, reply: &Reply, head_only: bool, deadline: Instant) -> std::io::Result<()> {
+    let mut out = format!("HTTP/1.1 {} {}\r\n", reply.code, reason(reply.code));
+    for (name, value) in &reply.headers {
+        out.push_str(&format!("{name}: {value}\r\n"));
+    }
+    out.push_str(&format!("Content-Length: {}\r\nConnection: close\r\n\r\n", reply.body.len()));
+    let mut out = out.into_bytes();
+    if !head_only {
+        out.extend_from_slice(reply.body.as_bytes());
+    }
+    write_bounded(stream, &out, deadline)
+}
+
+/// `write_all` with one deadline for the whole of it. Each partial write is given only the
+/// time that is left, so a client that takes a page a few bytes at a time cannot restart the
+/// clock with every write and hold the writing thread for as long as it cares to keep reading.
+/// (`TcpStream` buffers nothing, so there is nothing to flush.)
+fn write_bounded(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(ErrorKind::TimedOut, "the deadline for writing passed"));
+        }
+        stream.set_write_timeout(Some(left))?;
+        match stream.write(bytes) {
+            Ok(0) => return Err(std::io::Error::new(ErrorKind::WriteZero, "the client stopped taking the response")),
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
     Ok(())
+}
+
+fn reason(code: u16) -> &'static str {
+    match code {
+        200 => "OK", 303 => "See Other", 400 => "Bad Request", 404 => "Not Found", 408 => "Request Timeout",
+        411 => "Length Required", 413 => "Content Too Large", 417 => "Expectation Failed",
+        431 => "Request Header Fields Too Large", 500 => "Internal Server Error", _ => "",
+    }
+}
+
+/// Accept connections and read complete requests off them on threads of their own, so the
+/// main thread only ever sees whole requests. Returns the receiving end of that hand-off.
+fn spawn_readers(listener: TcpListener) -> Receiver<Request> {
+    // A rendezvous: the acceptor hands a connection over only when a reader is free to take
+    // it; until then new connections wait in the kernel's listen backlog. No queue of our
+    // own, so nothing here grows with the number of clients.
+    let (conn_tx, conn_rx) = mpsc::sync_channel::<TcpStream>(0);
+    let conn_rx = Arc::new(Mutex::new(conn_rx));
+    let (req_tx, req_rx) = mpsc::sync_channel::<Request>(READERS);
+    for _ in 0..READERS {
+        let conn_rx = Arc::clone(&conn_rx);
+        let req_tx = req_tx.clone();
+        std::thread::spawn(move || loop {
+            let next = conn_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+            let Ok(stream) = next else { return };
+            if let Some(req) = read_request(stream) {
+                if req_tx.send(req).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+    std::thread::spawn(move || loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if conn_tx.send(stream).is_err() {
+                    return;
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            // Out of descriptors, or a connection that reset before we got to it: keep listening.
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    });
+    req_rx
+}
+
+/// Why a request did not arrive.
+enum Incomplete {
+    /// The client hung up, or the socket failed.
+    Eof,
+    /// A wait ran past [`IO_TIMEOUT`], or the whole request past [`REQUEST_DEADLINE`].
+    Timeout,
+}
+
+/// Reads one complete request, or says why there will not be one and closes the socket.
+///
+/// Every wait for bytes is bounded by [`IO_TIMEOUT`] (the socket's read timeout) and checked
+/// against the whole-request deadline before the next, so a client that drips one byte per
+/// wait is cut off within `REQUEST_DEADLINE + IO_TIMEOUT`, like one that goes silent.
+fn read_request(mut stream: TcpStream) -> Option<Request> {
+    // A socket that cannot take a timeout is not one to read from.
+    if stream.set_read_timeout(Some(IO_TIMEOUT)).is_err() || stream.set_write_timeout(Some(IO_TIMEOUT)).is_err() {
+        return None;
+    }
+    let deadline = Instant::now() + REQUEST_DEADLINE;
+    let mut buf: Vec<u8> = Vec::new();
+    let head_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i;
+        }
+        if buf.len() >= MAX_HEAD {
+            return reject(stream, 431);
+        }
+        let room = MAX_HEAD - buf.len();
+        match read_some(&mut stream, &mut buf, room, deadline) {
+            Ok(()) => {}
+            // A client that hung up mid-request (a browser's speculative preconnect does this
+            // routinely) is not owed an answer.
+            Err(Incomplete::Eof) => return None,
+            Err(Incomplete::Timeout) => return reject(stream, 408),
+        }
+    };
+    let head = match parse_head(&buf[..head_end]) {
+        Ok(h) => h,
+        Err(code) => return reject(stream, code),
+    };
+    let mut body = buf.split_off(head_end + 4);
+    let oversized = head.content_length > MAX_BODY;
+    if oversized {
+        // Refused on the declaration alone: not a byte of it is read, so it can neither hold
+        // this reader nor be stored in part.
+        body.clear();
+    } else {
+        let want = head.content_length as usize;
+        body.truncate(want);
+        if body.len() < want && head.expects_continue {
+            let _ = write_bounded(&mut stream, b"HTTP/1.1 100 Continue\r\n\r\n", deadline);
+        }
+        while body.len() < want {
+            let missing = want - body.len();
+            match read_some(&mut stream, &mut body, missing, deadline) {
+                Ok(()) => {}
+                Err(Incomplete::Eof) => return None,
+                Err(Incomplete::Timeout) => return reject(stream, 408),
+            }
+        }
+    }
+    Some(Request { method: head.method, url: head.url, headers: head.headers, body, oversized, stream: Some(stream) })
+}
+
+/// One read of up to `max` bytes appended to `buf`, or why there was none. Returns within
+/// [`IO_TIMEOUT`] of being called, and refuses to start once `deadline` has passed.
+fn read_some(stream: &mut TcpStream, buf: &mut Vec<u8>, max: usize, deadline: Instant) -> std::result::Result<(), Incomplete> {
+    let mut chunk = [0u8; 4096];
+    let take = max.min(chunk.len());
+    loop {
+        if Instant::now() >= deadline {
+            return Err(Incomplete::Timeout);
+        }
+        match stream.read(&mut chunk[..take]) {
+            Ok(0) => return Err(Incomplete::Eof),
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                return Ok(());
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => return Err(Incomplete::Timeout),
+            Err(_) => return Err(Incomplete::Eof),
+        }
+    }
+}
+
+/// A bare status and the socket closed. Says nothing about what is listening here. Written
+/// under its own short deadline: the request's may already have passed, and a client that will
+/// not take even this gets nothing more of the reader's time.
+fn reject(mut stream: TcpStream, code: u16) -> Option<Request> {
+    let _ = write_reply(&mut stream, &Reply::new(code, String::new()), false, Instant::now() + IO_TIMEOUT);
+    let _ = stream.shutdown(Shutdown::Both);
+    None
+}
+
+struct Head {
+    method: String,
+    url: String,
+    headers: Vec<(String, String)>,
+    content_length: u64,
+    expects_continue: bool,
+}
+
+/// The request line and headers (without the blank line), or the status to refuse them with.
+/// Strict on purpose: what is not exactly HTTP/1.x from a browser or the CLI is a bad request;
+/// nothing that could be echoed into a response header (a redirect is built from the path)
+/// may carry a control character or name another host; and a header whose meaning we act on
+/// (`Host`, `Expect`, `Content-Length`) may not be ambiguous.
+fn parse_head(raw: &[u8]) -> std::result::Result<Head, u16> {
+    let text = std::str::from_utf8(raw).map_err(|_| 400u16)?;
+    let mut lines = text.split("\r\n");
+    let line = lines.next().ok_or(400u16)?;
+    if line.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(400);
+    }
+    let mut parts = line.split(' ');
+    let (method, url, version) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
+    if parts.next().is_some() || method.is_empty() || !method.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(400);
+    }
+    if !same_origin_path(url) || !matches!(version, "HTTP/1.1" | "HTTP/1.0") {
+        return Err(400);
+    }
+    let mut headers = Vec::new();
+    for l in lines {
+        if headers.len() >= MAX_HEADERS {
+            return Err(431);
+        }
+        if l.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f) {
+            return Err(400);
+        }
+        let (name, value) = l.split_once(':').ok_or(400u16)?;
+        // A name with whitespace in it, or none at all (obsolete line folding), is not a header.
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(400);
+        }
+        headers.push((name.to_string(), value.trim().to_string()));
+    }
+    for single in ["Host", "Expect"] {
+        if headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case(single)).count() > 1 {
+            return Err(400);
+        }
+    }
+    let mut content_length: Option<u64> = None;
+    for (name, value) in &headers {
+        // Browsers and the CLI never chunk a request to us, and a body of unknown length has
+        // no place under a declared-length cap.
+        if name.eq_ignore_ascii_case("Transfer-Encoding") {
+            return Err(411);
+        }
+        if name.eq_ignore_ascii_case("Content-Length") {
+            // Digits only, and two declarations must agree.
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(400);
+            }
+            let n: u64 = value.parse().map_err(|_| 400u16)?;
+            if content_length.is_some_and(|seen| seen != n) {
+                return Err(400);
+            }
+            content_length = Some(n);
+        }
+    }
+    let expects_continue = match headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("Expect")) {
+        None => false,
+        Some((_, v)) if v.eq_ignore_ascii_case("100-continue") => true,
+        Some(_) => return Err(417),
+    };
+    Ok(Head { method: method.to_string(), url: url.to_string(), headers, content_length: content_length.unwrap_or(0), expects_continue })
 }
 
 fn parse_form(s: &str) -> HashMap<String, String> {
     s.split('&')
         .filter_map(|kv| {
             let (k, v) = kv.split_once('=')?;
-            let dec = |x: &str| urlencoding::decode(&x.replace('+', " ")).map(|c| c.into_owned()).unwrap_or_default();
-            Some((dec(k), dec(v)))
+            Some((form_decode(k), form_decode(v)))
         })
         .collect()
+}
+
+/// One form-urlencoded token: `+` is a space, then percent-decoding.
+fn form_decode(x: &str) -> String {
+    urlencoding::decode(&x.replace('+', " ")).map(|c| c.into_owned()).unwrap_or_default()
 }
 
 fn esc(s: &str) -> String {
@@ -490,5 +867,199 @@ mod tests {
         assert_eq!(f.get("value").map(String::as_str), Some("sk-abc"));
         // A body with no token at all authenticates nothing.
         assert!(!parse_form("value=sk-abc").contains_key("t"));
+    }
+
+    fn head(s: &str) -> std::result::Result<Head, u16> {
+        parse_head(s.as_bytes())
+    }
+
+    #[test]
+    fn a_browser_form_post_head_parses() {
+        let h = head("POST /t/abc?x=1 HTTP/1.1\r\nHost: 127.0.0.1:7433\r\ncookie: tokenstash_inbox=deadbeef\r\nContent-Length:  12 \r\nExpect: 100-continue").unwrap();
+        assert_eq!(h.method, "POST");
+        assert_eq!(h.url, "/t/abc?x=1");
+        assert_eq!(h.content_length, 12);
+        assert!(h.expects_continue);
+        assert_eq!(h.headers.iter().find(|(n, _)| n.eq_ignore_ascii_case("Cookie")).map(|(_, v)| v.as_str()), Some("tokenstash_inbox=deadbeef"));
+        let h = head("GET / HTTP/1.0").unwrap();
+        assert_eq!(h.content_length, 0);
+        assert!(h.headers.is_empty() && !h.expects_continue);
+        // Two agreeing declarations are one declaration.
+        assert_eq!(head("POST / HTTP/1.1\r\nContent-Length: 7\r\ncontent-length: 7").unwrap().content_length, 7);
+    }
+
+    #[test]
+    fn malformed_heads_are_refused_with_a_status_not_parsed_loosely() {
+        for (raw, code) in [
+            ("GET / HTTP/2.0", 400), ("GET /", 400), ("GET  / HTTP/1.1", 400), ("GET / HTTP/1.1 extra", 400), ("GET nope HTTP/1.1", 400), ("", 400),
+            // A bare LF or another control character in the target must never reach a Location header.
+            ("GET /a\nb HTTP/1.1", 400), ("GET /\x01 HTTP/1.1", 400), ("GET /\x7f HTTP/1.1", 400),
+            ("GET / HTTP/1.1\r\nnocolon", 400), ("GET / HTTP/1.1\r\n folded: value", 400), ("GET / HTTP/1.1\r\nBad Name: v", 400), ("GET / HTTP/1.1\r\nX: a\rb", 400),
+            ("POST / HTTP/1.1\r\nContent-Length: 12\r\nContent-Length: 13", 400), ("POST / HTTP/1.1\r\nContent-Length: +5", 400),
+            ("POST / HTTP/1.1\r\nContent-Length: abc", 400), ("POST / HTTP/1.1\r\nContent-Length:", 400), ("POST / HTTP/1.1\r\nContent-Length: 99999999999999999999999", 400),
+            ("POST / HTTP/1.1\r\nTransfer-Encoding: chunked", 411), ("POST / HTTP/1.1\r\nExpect: something-else", 417),
+            // Ambiguity in a header we act on is refused, not resolved.
+            ("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nHost: evil.example", 400), ("POST / HTTP/1.1\r\nExpect: 100-continue\r\nExpect: 100-continue", 400),
+            // A target naming another host, in either spelling browsers accept, never becomes a Location.
+            ("GET //evil.example/ HTTP/1.1", 400), ("GET /\\evil.example HTTP/1.1", 400), ("GET /t/x\\y HTTP/1.1", 400),
+        ] {
+            assert_eq!(head(raw).err(), Some(code), "{raw:?}");
+        }
+        let many = format!("GET / HTTP/1.1{}", "\r\nX: y".repeat(MAX_HEADERS + 1));
+        assert_eq!(head(&many).err(), Some(431));
+        assert!(parse_head(b"GET /\xff HTTP/1.1").is_err());
+    }
+
+    fn pair() -> (TcpStream, TcpStream) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (server, _) = l.accept().unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        (client, server)
+    }
+
+    /// Over a real socket: a body that arrives in pieces is delivered whole; one declared over
+    /// the cap is refused at once without waiting for it; one exactly at the cap is a body.
+    #[test]
+    fn the_reader_delivers_whole_bodies_and_refuses_oversized_ones_unread() {
+        let (mut c, s) = pair();
+        c.write_all(b"POST /t/x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n\r\nhello").unwrap();
+        let reader = std::thread::spawn(move || read_request(s));
+        std::thread::sleep(Duration::from_millis(100));
+        c.write_all(b" world").unwrap();
+        let req = reader.join().unwrap().expect("a request");
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.url, "/t/x");
+        assert_eq!(req.body, b"hello world");
+        assert!(!req.oversized);
+        assert_eq!(header(&req, "host"), Some("localhost"));
+        req.respond(Reply::new(200, "ok".into()).with("Cache-Control", "no-store")).unwrap();
+        let mut out = String::new();
+        c.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "HTTP/1.1 200 OK\r\nCache-Control: no-store\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+
+        let (mut c, s) = pair();
+        c.write_all(format!("POST /t/x HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n", MAX_BODY + 1).as_bytes()).unwrap();
+        let started = Instant::now();
+        let req = read_request(s).expect("the head is fine; the body is refused, not awaited");
+        assert!(req.oversized && req.body.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(1), "waited for a body it must not read: {:?}", started.elapsed());
+
+        let (mut c, s) = pair();
+        let writer = std::thread::spawn(move || {
+            c.write_all(format!("POST / HTTP/1.1\r\nContent-Length: {MAX_BODY}\r\n\r\n").as_bytes()).unwrap();
+            c.write_all(&vec![b'a'; MAX_BODY as usize]).unwrap();
+            c
+        });
+        let req = read_request(s).unwrap();
+        assert_eq!(req.body.len(), MAX_BODY as usize);
+        assert!(!req.oversized);
+        drop(writer.join().unwrap());
+    }
+
+    /// A request the handler failed on still gets an answer, not a hanging browser tab.
+    #[test]
+    fn a_request_dropped_unanswered_gets_a_bare_500() {
+        let (mut c, s) = pair();
+        c.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        drop(read_request(s).unwrap());
+        let mut out = String::new();
+        c.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    }
+
+    /// A client that hangs up before finishing is simply forgotten; a malformed one is told so.
+    #[test]
+    fn a_hung_up_or_malformed_client_does_not_become_a_request() {
+        let (mut c, s) = pair();
+        c.write_all(b"GET / HTTP/1.1\r\nHost: lo").unwrap();
+        drop(c);
+        assert!(read_request(s).is_none());
+        let (mut c, s) = pair();
+        c.write_all(b"PRI * HTTP/2.0\r\n\r\n").unwrap();
+        assert!(read_request(s).is_none());
+        let mut out = String::new();
+        c.read_to_string(&mut out).unwrap();
+        assert!(out.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{out}");
+    }
+
+    /// A client that takes a large page a few bytes at a time used to hold the main thread for
+    /// as long as it cared to keep reading: every partial write restarted the per-write timeout.
+    /// The whole response now has one deadline, and the writer gives up at it.
+    #[test]
+    fn a_slowly_read_response_is_abandoned_at_the_deadline_not_per_write() {
+        let (mut c, mut s) = pair();
+        // Far more than loopback socket buffers absorb, so the writer must wait on the reader.
+        let reply = Reply::new(200, "x".repeat(64 << 20));
+        // Slow only while the writer is at work; afterwards drain at full speed so the test
+        // does not spend a minute emptying socket buffers.
+        let slow = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let pace = Arc::clone(&slow);
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            let mut got = 0usize;
+            loop {
+                match c.read(&mut buf) {
+                    Ok(0) | Err(_) => return got,
+                    Ok(n) => got += n,
+                }
+                if pace.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        });
+        let started = Instant::now();
+        let res = write_reply(&mut s, &reply, false, started + Duration::from_millis(400));
+        let took = started.elapsed();
+        slow.store(false, std::sync::atomic::Ordering::Relaxed);
+        drop(s);
+        let got = reader.join().unwrap();
+        let err = res.expect_err("a reader this slow cannot be served within the deadline");
+        assert!(matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock), "{err:?}");
+        assert!(took < Duration::from_secs(2), "gave up only after {took:?}");
+        assert!(got < reply.body.len(), "the reader took {got} bytes; the whole page cannot have fit");
+
+        // A reader that keeps up gets a large page whole, well within the deadline.
+        let (mut c, mut s) = pair();
+        let reply = Reply::new(200, "y".repeat(4 << 20));
+        let reader = std::thread::spawn(move || { let mut out = Vec::new(); c.read_to_end(&mut out).unwrap(); out });
+        write_reply(&mut s, &reply, false, Instant::now() + Duration::from_secs(5)).unwrap();
+        drop(s);
+        let out = reader.join().unwrap();
+        assert!(out.ends_with(reply.body.as_bytes()) && out.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    }
+
+    /// The `?t=` login redirect drops the credential in every spelling parse_form would accept,
+    /// re-emits nothing, and never points off this origin — the request target was refused for
+    /// that at the door, and the redirect helpers refuse it again.
+    #[test]
+    fn the_login_redirect_drops_the_credential_in_any_spelling_and_stays_on_this_origin() {
+        assert_eq!(strip_auth_params("t=PLACEHOLDER"), "");
+        assert_eq!(strip_auth_params("m=hi&t=PLACEHOLDER&%74=PLACEHOLDER&t&T=keep&tt=keep&t%3Dx=keep&"), "m=hi&T=keep&tt=keep&t%3Dx=keep");
+        assert_eq!(strip_auth_params("t=ONE&t=TWO"), "");
+        assert_eq!(strip_auth_params(""), "");
+        // The same decoding parse_form uses, so what one drops is exactly what the other would read.
+        assert_eq!(parse_form("%74=v").get("t").map(String::as_str), Some("v"));
+        assert!(!parse_form(&strip_auth_params("%74=v&x=1")).contains_key("t"));
+        for bad in ["//evil.example/x", "/\\evil.example", "/x\\y", "http://evil.example", "relative", ""] {
+            assert!(!same_origin_path(bad), "{bad:?}");
+            assert_eq!(local(bad), "/");
+        }
+        for ok in ["/", "/t/abc", "/t/abc?m=x&y=%2F%2F"] {
+            assert!(same_origin_path(ok), "{ok:?}");
+            assert_eq!(local(ok), ok);
+        }
+        // On the wire: a foreign target becomes `/`, a same-origin one is kept, the cookie is set.
+        for (to, location) in [("//evil.example/", "/"), ("/t/abc?m=x", "/t/abc?m=x")] {
+            let (mut c, s) = pair();
+            c.write_all(b"GET /x HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+            redirect_authed(read_request(s).unwrap(), to, "PLACEHOLDER").unwrap();
+            let mut out = String::new();
+            c.read_to_string(&mut out).unwrap();
+            assert!(out.starts_with("HTTP/1.1 303 See Other\r\n"), "{out}");
+            assert!(out.contains(&format!("\r\nLocation: {location}\r\n")), "{out}");
+            assert!(out.contains("\r\nSet-Cookie: tokenstash_inbox=PLACEHOLDER; Path=/; HttpOnly; SameSite=Strict\r\n"), "{out}");
+            assert!(!out.contains("evil"), "{out}");
+        }
     }
 }

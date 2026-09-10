@@ -20,7 +20,6 @@ serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 clap = { version = "4", features = ["derive"] }
-tiny_http = "0.12"
 notify-rust = "4"
 rpassword = "7"
 open = "5"
