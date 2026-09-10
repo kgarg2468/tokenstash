@@ -24,8 +24,10 @@ pub struct Config {
     /// Whether to show desktop notifications.
     #[serde(default = "default_true")]
     pub notifications: bool,
-    /// Which inbox session agent-facing links carry: "paste" (default: the link can answer
-    /// missing-key cards but not approve) or "full" (the link can do everything).
+    /// Legacy. Agent-facing inbox links always carry a capability scoped to the one card the
+    /// link is for; "full" used to make them carry the browser session and is now accepted
+    /// (so an old config still loads) but ignored with a warning — the full inbox is
+    /// `tokenstash open` or the desktop notification.
     #[serde(default = "default_links")]
     pub inbox_links: String,
     /// How often a key with a registry probe is re-checked with its provider before an agent

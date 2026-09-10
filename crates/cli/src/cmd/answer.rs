@@ -4,7 +4,7 @@ use clap::Args;
 use secrecy::SecretString;
 use std::io::Read;
 use tokenstash_core::db::TaskKind;
-use tokenstash_core::tasks::{self, AnswerResult};
+use tokenstash_core::tasks::{self, Actor, AnswerResult};
 
 #[derive(Args)]
 pub struct AnswerArgs {
@@ -26,7 +26,8 @@ pub struct AnswerArgs {
     /// Deny / decline any task.
     #[arg(long)]
     pub deny: bool,
-    /// Note for human tasks, or a reason when denying.
+    /// Note for human tasks, or a reason when denying. Returned to the agent word for word:
+    /// an answer or a reason, never a secret.
     #[arg(long)]
     pub note: Option<String>,
 }
@@ -47,6 +48,9 @@ pub fn answer(a: AnswerArgs) -> Result<i32> {
         util::require_human("answer", "this card belongs to another directory")?;
     }
     let ctx = app.ctx();
+    // What the terminal can tell about who is typing. The refusals below explain themselves
+    // before the core check runs; the core check is the one that holds either way.
+    let actor = if util::looks_human() { Actor::Human } else { Actor::Requester };
 
     if a.deny {
         tasks::deny(&ctx, &task, a.note.as_deref())?;
@@ -76,7 +80,7 @@ pub fn answer(a: AnswerArgs) -> Result<i32> {
             if raw.is_empty() {
                 bail!("empty value; nothing stored");
             }
-            match tasks::answer_secret(&ctx, &task, SecretString::from(raw), a.skip_check)? {
+            match tasks::answer_secret_by(&ctx, actor, &task, SecretString::from(raw), a.skip_check)? {
                 AnswerResult::Stored { injected_to, sensitive, liveness, rotation } => {
                     if let Some(r) = &rotation {
                         for p in &r.rewritten { println!("  also updated → {}", tokenstash_core::project::short(std::path::Path::new(p))); }
@@ -127,6 +131,8 @@ pub fn answer(a: AnswerArgs) -> Result<i32> {
                 (Some(n), _) => Some(n.clone()),
                 (None, "text") => {
                     let mut s = String::new();
+                    // Said before anything is typed: the answer goes to the agent as typed.
+                    println!("Your answer is returned to the agent word for word. Do not put a password, a key, or anything private in it; the agent should request secrets with `tokenstash need`.");
                     println!("Enter your answer, then Ctrl-D:");
                     std::io::stdin().read_to_string(&mut s)?;
                     Some(s.trim().to_string())

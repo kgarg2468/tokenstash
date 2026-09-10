@@ -321,10 +321,14 @@ pub fn from_env(a: FromEnvArgs) -> Result<i32> {
         };
         ticked.push(default_on);
         differs.push(matches!((&cand.confidence, &existing), (_, Some(v)) if v.expose_secret() != cand.value.expose_secret()));
+        // The row is identified by its number, its name and where it was found — never by any
+        // part of the value. A first-and-last-characters preview is still a piece of the key,
+        // and this table is printed to a terminal an agent may be driving through a pty.
         let srcs: Vec<String> = cand.sources.iter().take(3).map(|p| short(p)).collect();
         let more = if cand.sources.len() > 3 { format!(" +{} more", cand.sources.len() - 3) } else { String::new() };
+        let which = if ambiguous { format!(" (value #{} of the {} found under this name)", identity_index(&c.candidates, i), c.candidates.iter().filter(|x| x.name == cand.name).count()) } else { String::new() };
         let alias = if cand.aliases.is_empty() { String::new() } else { format!(" (also as {})", cand.aliases.join(", ")) };
-        println!("{:>3}. [{}] {}  {}{}{}  {}", i + 1, if default_on { "x" } else { " " }, cand.name, tokenstash_core::redact::mask(&cand.value), alias, if cand.sensitive { "  SENSITIVE (asks once per project)" } else { "" }, note);
+        println!("{:>3}. [{}] {}{}{}{}  {}", i + 1, if default_on { "x" } else { " " }, cand.name, which, alias, if cand.sensitive { "  SENSITIVE (asks once per project)" } else { "" }, note);
         println!("       in {}{}", srcs.join(", "), more);
     }
     let on: Vec<String> = ticked.iter().enumerate().filter(|(_, t)| **t).map(|(i, _)| (i + 1).to_string()).collect();
@@ -423,4 +427,11 @@ pub fn from_env(a: FromEnvArgs) -> Result<i32> {
         crate::cmd::admin::sweep_pairs(&app, &pairs, true)?;
     }
     Ok(0)
+}
+
+/// 1-based position of row `idx` among the rows that share its name, for telling several
+/// values under one name apart without showing any of them.
+fn identity_index(candidates: &[tokenstash_core::envcrawl::Candidate], idx: usize) -> usize {
+    let name = &candidates[idx].name;
+    (0..=idx).filter(|&i| &candidates[i].name == name).count()
 }

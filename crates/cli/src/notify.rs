@@ -11,8 +11,10 @@ use tokenstash_core::Config;
 /// "Something accepted a TCP connection" is not the same as "our inbox is running", and the
 /// difference matters: we are about to tell a human to paste an API key into whatever is
 /// there. `Ours` is only ever returned after the listener answers a fresh challenge with
-/// `HMAC(token, nonce)` — a proof it already holds this `TOKENSTASH_HOME`'s token. The token
-/// itself is never sent, so a squatter on the port learns nothing from being probed.
+/// `HMAC(proof key, nonce)` — a proof it already holds this `TOKENSTASH_HOME`'s proof key.
+/// The key itself is never sent, so a squatter on the port learns nothing from being probed;
+/// and because the key is never in a URL either, a squatter that collected a stale link
+/// cannot answer with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Inbox {
     /// Verified: this is our inbox for this TOKENSTASH_HOME.
@@ -33,15 +35,15 @@ fn addr(cfg: &Config) -> SocketAddr {
 }
 
 pub fn inbox_state(cfg: &Config) -> Inbox {
-    let Ok(token) = inbox_auth::ensure_token() else { return Inbox::Down };
-    probe(&addr(cfg), &token)
+    let Ok(proof) = inbox_auth::ensure_proof_key() else { return Inbox::Down };
+    probe(&addr(cfg), &proof)
 }
 
-fn probe(addr: &SocketAddr, token: &str) -> Inbox {
+fn probe(addr: &SocketAddr, proof: &str) -> Inbox {
     let Ok(mut s) = TcpStream::connect_timeout(addr, CONNECT_TIMEOUT) else { return Inbox::Down };
     let nonce = inbox_auth::challenge();
     match challenge(&mut s, addr, &nonce) {
-        Some(body) if inbox_auth::ct_eq(body.trim(), &inbox_auth::verify_response(token, &nonce)) => Inbox::Ours,
+        Some(body) if inbox_auth::ct_eq(body.trim(), &inbox_auth::verify_response(proof, &nonce)) => Inbox::Ours,
         _ => Inbox::Foreign,
     }
 }
@@ -63,9 +65,9 @@ fn challenge(s: &mut TcpStream, addr: &SocketAddr, nonce: &str) -> Option<String
 /// Spawn `tokenstash inbox` detached unless our own, verified inbox is already up.
 ///
 /// Returns what is on the port when we are done, and callers must act on it: this is the
-/// single point where the rest of the CLI learns whether it may hand out a tokened URL.
+/// single point where the rest of the CLI learns whether it may hand out a credentialed URL.
 /// Warning and carrying on is not enough — a caller that then prints `?t=` has given the
-/// squatter the session token, and the human a link straight to it.
+/// squatter the session, and the human a link straight to it.
 #[must_use]
 pub fn ensure_inbox(cfg: &Config) -> Inbox {
     match inbox_state(cfg) {
@@ -117,7 +119,7 @@ pub fn describe(state: Inbox) -> &'static str {
     }
 }
 
-/// `where_to` is whatever `util::inbox_notice` produced: a tokened URL when we proved the
+/// `where_to` is whatever `util::inbox_notice` produced: a session URL when we proved the
 /// inbox is ours, or a sentence explaining why there is no link. Never build it here.
 pub fn desktop(cfg: &Config, title: &str, body: &str, where_to: &str) {
     if !cfg.notifications {

@@ -46,7 +46,7 @@ pub fn tasks(a: TasksArgs) -> Result<i32> {
     }
     // Printed to stdout, so the TTY check must be stdout's.
     let state = crate::notify::inbox_state(&app.cfg);
-    println!("\ninbox: {}", util::inbox_url_tty(&app.cfg, None, state, util::Stream::Stdout));
+    println!("\ninbox: {}", util::inbox_url_tty(&app.cfg, Some(&app.db), None, state, util::Stream::Stdout));
     if let Some(why) = util::inbox_unavailable(&app.cfg, state) {
         println!("       {why}");
     }
@@ -301,7 +301,7 @@ pub fn rotate(a: RotateArgs) -> Result<i32> {
     let t = tokenstash_core::tasks::rotate(&app.ctx(), &project, &agent, &a.name, &identity)?;
     let state = crate::notify::ensure_inbox(&app.cfg);
     crate::notify::desktop(&app.cfg, &format!("Replace {}", a.name), "you asked to rotate it", &util::inbox_notice(&app.cfg, Some(&t.id), state));
-    println!("⏳ {}@{identity} marked for rotation — task {} → {}", a.name, t.id, util::inbox_url_tty(&app.cfg, Some(&t.id), state, util::Stream::Stdout));
+    println!("⏳ {}@{identity} marked for rotation — task {} → {}", a.name, t.id, util::inbox_url_tty(&app.cfg, Some(&app.db), Some(&t.id), state, util::Stream::Stdout));
     println!("  paste the NEW key first; revoke the old one in the dashboard after it says stored");
     Ok(tokenstash_core::exit::PENDING)
 }

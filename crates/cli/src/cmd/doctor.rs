@@ -43,8 +43,9 @@ pub fn doctor() -> Result<i32> {
     ok &= check(
         "inbox",
         inbox != notify::Inbox::Foreign,
-        // `check` prints to stdout, so the TTY check is stdout's.
-        format!("{}  {}", crate::util::inbox_url_tty(&cfg, None, inbox, crate::util::Stream::Stdout), notify::describe(inbox)),
+        // `check` prints to stdout, so the TTY check is stdout's. No card is named, so no
+        // database is needed to sign a link.
+        format!("{}  {}", crate::util::inbox_url_tty(&cfg, None, None, inbox, crate::util::Stream::Stdout), notify::describe(inbox)),
     );
 
     let home = dirs::home_dir().unwrap_or_default();

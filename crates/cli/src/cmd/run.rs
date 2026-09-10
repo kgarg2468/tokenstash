@@ -70,7 +70,7 @@ pub fn run(a: RunArgs) -> Result<i32> {
             // routinely used with stdout redirected and stderr on the terminal, and the
             // reverse.
             let state = crate::notify::inbox_state(&app.cfg);
-            eprintln!("tokenstash: waiting for you → {}", util::inbox_url_tty(&app.cfg, None, state, util::Stream::Stderr));
+            eprintln!("tokenstash: waiting for you → {}", util::inbox_url_tty(&app.cfg, Some(&app.db), None, state, util::Stream::Stderr));
             // wait on the approval task just filed; calling need again would file another
             need::wait(&app.ctx(), &project, &mut outcomes, opts.timeout)?;
         }

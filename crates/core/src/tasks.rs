@@ -378,23 +378,63 @@ pub enum AnswerResult {
     Done,
 }
 
+/// Who is answering, as far as the caller can tell. It decides how far an answer may reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Actor {
+    /// A person: the full inbox session, or a terminal that passed the human-only check.
+    /// May answer anything, including a paste that other directories receive.
+    Human,
+    /// The card's own requester: an agent at a shell in the card's directory, or a browser
+    /// holding that one card's link. May answer this card for this directory and nothing
+    /// that reaches beyond it.
+    Requester,
+}
+
 /// Would answering this card reach beyond the card's own directory? A replacement card
 /// rewrites every project holding the old value, and a standing grant elsewhere delivers the
 /// new value there on its next `need`. Either way the paste decides for other directories, so
 /// it is not one the agent's own link (or an agent at a shell) may make: without this, a
 /// hostile repo's agent runs `report-bad` → `need` → `answer --stdin` and points every project
 /// of the user at its own database.
+///
+/// "A standing grant elsewhere" is an exact grant for the name, or a broad grant that the
+/// gate would open for it. The value is not known yet, so whether it would be tagged
+/// sensitive at paste time (`sensitive_pattern`) is not either; sensitivity is judged on the
+/// name alone, which is the stricter reading — a value the pattern later tags is refused
+/// broad delivery by the gate anyway. Grants outlive the value (`forget` keeps them), so a
+/// re-paste after `forget` fans out exactly like the first paste did. A directory whose
+/// record no longer matches it (re-created) still counts: a record is a record.
+///
+/// Called under the index write lock by [`answer_secret_by`], so what it reads is what the
+/// store that follows will act on: a grant committed in another directory a moment earlier
+/// is seen, and one a moment later waits for the store to finish. It says nothing about
+/// grants given afterwards — a directory paired broadly next week receives whatever value
+/// is stored under a registry name then, whoever pasted it.
 pub fn fans_out(ctx: &Ctx, task: &Task) -> Result<bool> {
     if task.expects == EXPECTS_REPLACE {
         return Ok(true);
     }
     let Some(name) = task.name.as_deref() else { return Ok(false) };
-    let granted = ctx.db.workspaces_granted(name, &task.identity, false)?;
+    let p = registry::lookup(name);
+    let broad = crate::trust::broad_applies(p.map(|p| p.sensitive).unwrap_or(false), p.is_some());
+    let granted = ctx.db.workspaces_granted(name, &task.identity, broad)?;
     Ok(granted.iter().any(|w| w.root != task.project))
 }
 
-/// Store a secret value for a task: pattern → liveness → stash → index → inject → audit.
+/// Store a secret value for a task, as a person: pattern → liveness → stash → index →
+/// inject → audit. Agent-facing callers use [`answer_secret_by`] with the actor they have.
 pub fn answer_secret(ctx: &Ctx, task: &Task, value: SecretString, skip_liveness: bool) -> Result<AnswerResult> {
+    answer_secret_by(ctx, Actor::Human, task, value, skip_liveness)
+}
+
+/// [`answer_secret`] with the answering actor named. A [`Actor::Requester`] may not make a
+/// paste that [`fans_out`]; that is checked at the operation, not only where a button is
+/// hidden, so every surface that lets a requester answer gets the same refusal with nothing
+/// stored. The shape and provider checks run first (a slow probe must not run under the
+/// lock); then the card and the grants are re-read under the index write lock, the gate is
+/// applied to what is there *now*, and the claim, the stash write and the record follow
+/// under the same lock — see [`store_and_inject`].
+pub fn answer_secret_by(ctx: &Ctx, actor: Actor, task: &Task, value: SecretString, skip_liveness: bool) -> Result<AnswerResult> {
     if task.kind != TaskKind::Secret {
         bail!("task {} is not a secret task", task.id);
     }
@@ -429,7 +469,7 @@ pub fn answer_secret(ctx: &Ctx, task: &Task, value: SecretString, skip_liveness:
     // still holding it can be rewritten below. An ordinary paste that happens to differ from
     // a stored value (two projects with their own pending cards) is not a rotation.
     let is_replacement = task.expects == EXPECTS_REPLACE;
-    let injected_to = store_and_inject(
+    let injected_to = store_and_inject_gated(
         ctx, &name, &task.identity, &value, provider.map(|p| p.provider.clone()), task.url.clone(), sensitive,
         Path::new(&task.project), &task.agent, Some(&task.id),
         match liveness {
@@ -439,6 +479,19 @@ pub fn answer_secret(ctx: &Ctx, task: &Task, value: SecretString, skip_liveness:
             _ => Verified::Unknown,
         },
         crate::db::GRANT_PASTE,
+        |fresh| {
+            // The card as it is under the lock, not as it was read. Promotion to Replace
+            // while validation ran changes the meaning of the answer for either actor, so
+            // this attempt must stop before claiming the card or touching the stash.
+            let fresh = fresh.ok_or_else(|| anyhow!("task {} is gone", task.id))?;
+            if fresh.expects != task.expects {
+                bail!("this card changed since you read it; reload it and try again");
+            }
+            if actor == Actor::Requester && fans_out(ctx, fresh)? {
+                bail!("other directories hold this key, so the paste would reach them too: open this card from the desktop notification or run `tokenstash open`");
+            }
+            Ok(())
+        },
     )?;
     // A replacement card's answer reaches every project that was ever given this key and
     // does not already hold the new value — whichever old value it holds (the stash may
@@ -447,13 +500,7 @@ pub fn answer_secret(ctx: &Ctx, task: &Task, value: SecretString, skip_liveness:
     Ok(AnswerResult::Stored { injected_to, sensitive, liveness, rotation })
 }
 
-/// Shared by `answer_secret` and auto-generated secrets.
-///
-/// Order matters: keychain first (the value's home), then ONE transaction that records the
-/// index entry, the project approval, the audit row, and — when answering a task — the
-/// task's answered status. Injection into the env file happens last; if it fails the task
-/// is already answered and the value already stored, so a re-run of `need` hits and
-/// injects rather than asking the human again.
+/// Shared by `answer_secret` and auto-generated secrets. See [`store_and_inject_gated`].
 #[allow(clippy::too_many_arguments)]
 pub fn store_and_inject(
     ctx: &Ctx,
@@ -469,32 +516,71 @@ pub fn store_and_inject(
     verified: Verified,
     grant_source: &str,
 ) -> Result<Option<PathBuf>> {
-    // Claim the card before anything is written. Two answers racing (an inbox POST and a
-    // `tokenstash answer`, or two tabs) both read it as pending; whoever closes it first
-    // owns the answer, and the loser must not reach the stash — otherwise its value
-    // overwrites the winner's and the human is told nothing.
-    if let Some(tid) = answering_task {
-        if !ctx.db.close_task_if_open(tid, TaskStatus::Answered, None)? {
-            bail!("task {tid} was answered somewhere else while this was in flight; nothing was stored");
-        }
-    }
-    if let Err(e) = ctx.stash.set(&stash_key(name, identity), value) {
-        if let Some(tid) = answering_task {
-            let _ = ctx.db.reopen_task(tid);
-        }
-        return Err(e).context("storing the value");
-    }
+    store_and_inject_gated(ctx, name, identity, value, provider, source_url, sensitive, project, agent, answering_task, verified, grant_source, |_| Ok(()))
+}
+
+/// Store a value: ONE index write lock (`BEGIN IMMEDIATE`) held across re-reading the card,
+/// the caller's `gate`, the claim of the card, the keychain write, and the record of it
+/// (index entry, audit row, grant). Nothing another process commits can slip between the
+/// gate's reading and the store's effect, and two answers racing for one card (an inbox
+/// POST and a `tokenstash answer`, two tabs) serialise on the lock: whoever claims first
+/// owns the answer, the other is told so and stores nothing.
+///
+/// `gate` sees the card as it is under the lock (`None` when no card is being answered)
+/// and may refuse; a refusal rolls everything back with nothing written anywhere. A keychain
+/// write that fails rolls back too. The stash is an external side effect: when it accepts a
+/// value but an index statement or COMMIT later fails, the task, metadata and grants roll
+/// back but the value remains in the stash without an index row. The next `need` adopts it
+/// rather than asking again.
+///
+/// Injection into the env file happens last, outside the lock: if it fails the task is
+/// already answered and the value already stored, so a re-run of `need` hits and injects
+/// rather than asking the human again.
+#[allow(clippy::too_many_arguments)]
+fn store_and_inject_gated(
+    ctx: &Ctx,
+    name: &str,
+    identity: &str,
+    value: &SecretString,
+    provider: Option<String>,
+    source_url: Option<String>,
+    sensitive: bool,
+    project: &Path,
+    agent: &str,
+    answering_task: Option<&str>,
+    verified: Verified,
+    grant_source: &str,
+    gate: impl FnOnce(Option<&Task>) -> Result<()>,
+) -> Result<Option<PathBuf>> {
     let pid = project.to_string_lossy().to_string();
-    // The value is in the stash; the record of it is one transaction. If that fails, the
-    // card comes back like it does when the stash write fails: an answered card with no
-    // index row and no grant would make the next `need` ask the human a second time.
-    // Best effort — a database that just failed a transaction may refuse this too.
-    let recorded = record_stored(ctx, name, identity, provider, source_url, sensitive, project, agent, verified, grant_source, &pid);
-    if let Err(e) = recorded {
+    // Every caller reaches this in autocommit; a caller that already holds a transaction
+    // would be sharing its lock with the gate below, which is not the contract.
+    if !ctx.db.conn.is_autocommit() {
+        bail!("store_and_inject called inside a transaction");
+    }
+    ctx.db.conn.execute_batch("BEGIN IMMEDIATE").context("locking the index")?;
+    let stored = (|| -> Result<()> {
+        let fresh = match answering_task {
+            Some(tid) => Some(ctx.db.get_task(tid)?.filter(|t| t.status == TaskStatus::Pending).ok_or_else(|| anyhow!("task {tid} was answered somewhere else while this was in flight; nothing was stored"))?),
+            None => None,
+        };
+        gate(fresh.as_ref())?;
         if let Some(tid) = answering_task {
-            let _ = ctx.db.reopen_task(tid);
+            if !ctx.db.close_task_if_open(tid, TaskStatus::Answered, None)? {
+                bail!("task {tid} was answered somewhere else while this was in flight; nothing was stored");
+            }
         }
-        return Err(e);
+        ctx.stash.set(&stash_key(name, identity), value).context("storing the value")?;
+        record_stored(ctx, name, identity, provider, source_url, sensitive, project, agent, verified, grant_source, &pid)
+    })();
+    match stored {
+        Ok(()) => {
+            if let Err(e) = ctx.db.conn.execute_batch("COMMIT") {
+                let cause = anyhow!(e).context("recording the stored secret");
+                return Err(rollback_store(ctx, cause));
+            }
+        }
+        Err(e) => return Err(rollback_store(ctx, e)),
     }
     let injected_to = if project.is_dir() {
         let p = crate::envfile::write(project, &ctx.cfg.env_file, name, value)?;
@@ -506,11 +592,25 @@ pub fn store_and_inject(
     Ok(injected_to)
 }
 
-/// The index row, the audit line and the grant for a value that is now in the stash, as one
-/// transaction.
+/// Restore autocommit after any failure in the raw `BEGIN IMMEDIATE` transaction. SQLite
+/// leaves a transaction active after some COMMIT failures (notably deferred constraints),
+/// so the COMMIT error path must explicitly roll back just like a statement error does.
+fn rollback_store(ctx: &Ctx, cause: anyhow::Error) -> anyhow::Error {
+    if ctx.db.conn.is_autocommit() {
+        return cause;
+    }
+    match ctx.db.conn.execute_batch("ROLLBACK") {
+        Ok(()) if ctx.db.conn.is_autocommit() => cause,
+        Ok(()) => cause.context("rolling back the failed store left the index transaction active"),
+        Err(_) if ctx.db.conn.is_autocommit() => cause,
+        Err(e) => cause.context(format!("rolling back the failed store also failed: {e}")),
+    }
+}
+
+/// The index row, the audit line and the grant for a value that is now in the stash. Runs
+/// inside the caller's transaction.
 #[allow(clippy::too_many_arguments)]
 fn record_stored(ctx: &Ctx, name: &str, identity: &str, provider: Option<String>, source_url: Option<String>, sensitive: bool, project: &Path, agent: &str, verified: Verified, grant_source: &str, pid: &str) -> Result<()> {
-    let tx = ctx.db.conn.unchecked_transaction()?;
     ctx.db.upsert_secret(&crate::db::SecretMeta {
         name: name.into(),
         identity: identity.into(),
@@ -542,7 +642,7 @@ fn record_stored(ctx: &Ctx, name: &str, identity: &str, provider: Option<String>
             ctx.db.audit(Some(pid), Some(agent), "grant.skipped", Some(name), Some(identity), Some("directory re-created since it was paired; it will pair again on its next request"))?;
         }
     }
-    tx.commit().context("recording the stored secret")
+    Ok(())
 }
 
 /// `seen` is the list of names the human was shown; if the card grew since (an agent
