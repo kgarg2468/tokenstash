@@ -41,6 +41,30 @@ fn tmp(name: &str) -> PathBuf {
     p
 }
 
+fn git_output(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+    let environment: Vec<_> = std::env::vars_os()
+        .filter(|(key, _)| !key.to_string_lossy().starts_with("GIT_"))
+        .collect();
+    let mut command = std::process::Command::new("git");
+    command.env_clear().envs(environment)
+        .arg("-C").arg(dir).args(args)
+        .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+        .output().unwrap_or_else(|e| panic!("could not run git {args:?} in {}: {e}", dir.display()))
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let output = git_output(dir, args);
+    assert!(output.status.success(),
+        "git {args:?} failed in {} with {}\nstdout:\n{}\nstderr:\n{}",
+        dir.display(), output.status, String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr));
+}
+
+fn init_git(dir: &std::path::Path) {
+    git(dir, &["init", "-q", "."]);
+}
+
 #[test]
 fn registry_is_sane() {
     assert!(registry::count() >= 40);
@@ -92,7 +116,7 @@ fn envfile_upserts_and_quotes_and_restricts() {
 #[test]
 fn gitignore_is_enforced_in_repos() {
     let dir = tmp("gitignore");
-    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    init_git(&dir);
     std::fs::write(dir.join(".gitignore"), "node_modules\n").unwrap();
     let sub = dir.join("packages/app");
     std::fs::create_dir_all(&sub).unwrap();
@@ -485,27 +509,97 @@ fn same_name_different_identities_get_separate_tasks() {
 #[test]
 fn tracked_env_file_is_refused_until_untracked() {
     let dir = tmp("tracked-env");
-    let git = |args: &[&str]| {
-        let st = std::process::Command::new("git").arg("-C").arg(&dir).args(args)
-            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
-            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap();
-        assert!(st.success(), "git {args:?} failed");
-    };
-    git(&["init", "-q", "."]);
+    init_git(&dir);
     // the classic mistake: the env file was committed before anyone thought about it
     std::fs::write(dir.join(".env.local"), "OLD=1\n").unwrap();
-    git(&["add", ".env.local"]);
-    git(&["commit", "-q", "-m", "oops"]);
+    git(&dir, &["add", ".env.local"]);
+    git(&dir, &["commit", "-q", "-m", "oops"]);
     assert!(envfile::is_git_tracked(&dir, &dir.join(".env.local")));
     let err = envfile::write(&dir, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap_err();
     assert!(err.to_string().contains("git rm --cached"), "must tell the user how to fix it: {err}");
     assert_eq!(std::fs::read_to_string(dir.join(".env.local")).unwrap(), "OLD=1\n", "tracked file untouched");
     // after untracking, injection proceeds and the ignore rule is added
-    git(&["rm", "-q", "--cached", ".env.local"]);
+    git(&dir, &["rm", "-q", "--cached", ".env.local"]);
     assert!(!envfile::is_git_tracked(&dir, &dir.join(".env.local")));
     envfile::write(&dir, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap();
     assert!(envfile::has(&dir, ".env.local", "K"));
     assert!(std::fs::read_to_string(dir.join(".gitignore")).unwrap().lines().any(|l| l == ".env.local"));
+}
+
+#[test]
+fn git_trackedness_allows_a_standalone_directory() {
+    let dir = tmp("trackedness-standalone");
+    assert!(!envfile::git_trackedness(&dir, &dir.join(".env.local")).unwrap());
+    envfile::write(&dir, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap();
+    assert!(envfile::has(&dir, ".env.local", "K"));
+}
+
+#[test]
+fn tracked_env_filename_is_a_literal_not_a_git_pathspec() {
+    let dir = tmp("tracked-env-literal-pathspec");
+    init_git(&dir);
+    let env_file = "credentials[prod].env";
+    std::fs::write(dir.join(env_file), "OLD=1\n").unwrap();
+    git(&dir, &["--literal-pathspecs", "add", "-f", "--", env_file]);
+    std::fs::write(dir.join(".gitignore"), "*.env\n").unwrap();
+
+    assert!(envfile::git_trackedness(&dir, &dir.join(env_file)).unwrap(), "brackets in the configured filename must not be interpreted as a pathspec");
+    let err = envfile::write(&dir, env_file, "K", &SecretString::from("vvvvvvvv".to_string())).unwrap_err();
+    assert!(err.to_string().contains("tracked by git"), "{err}");
+    assert_eq!(std::fs::read_to_string(dir.join(env_file)).unwrap(), "OLD=1\n");
+}
+
+/// A nonzero git exit is "cannot prove untracked", not "untracked". This is especially
+/// important when an ignore rule already covers a file that was added to the index earlier:
+/// the ignore check will pass even though overwriting the file would update a committed secret.
+#[test]
+fn a_failing_git_tracked_check_cannot_overwrite_an_ignored_tracked_file() {
+    let dir = tmp("tracked-env-git-failure");
+    init_git(&dir);
+    std::fs::write(dir.join(".env.local"), "OLD=1\n").unwrap();
+    git(&dir, &["add", "-f", ".env.local"]);
+    std::fs::write(dir.join(".gitignore"), ".env.local\n").unwrap();
+    assert!(envfile::is_git_tracked(&dir, &dir.join(".env.local")));
+
+    // A corrupt index makes `git ls-files` exit unsuccessfully while `check-ignore
+    // --no-index` still reports the file ignored.
+    std::fs::write(dir.join(".git/index"), "not a git index\n").unwrap();
+    let output = git_output(&dir, &["ls-files", "--error-unmatch", "--", ".env.local"]);
+    assert!(!output.status.success(), "the fixture must exercise a failing git exit status");
+    assert!(envfile::git_trackedness(&dir, &dir.join(".env.local")).is_err());
+
+    let err = envfile::write(&dir, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap_err();
+    assert!(format!("{err:#}").contains("cannot ask git whether"), "{err:#}");
+    assert_eq!(std::fs::read_to_string(dir.join(".env.local")).unwrap(), "OLD=1\n", "indeterminate trackedness must leave the file untouched");
+}
+
+/// Exercise an unavailable git executable in a child process so changing PATH cannot race
+/// unrelated tests in this process.
+#[test]
+fn unavailable_git_cannot_overwrite_an_ignored_tracked_file() {
+    const CHILD_DIR: &str = "TOKENSTASH_TEST_NO_GIT_TRACKED_DIR";
+    if let Some(dir) = std::env::var_os(CHILD_DIR) {
+        let dir = PathBuf::from(dir);
+        assert!(envfile::git_trackedness(&dir, &dir.join(".env.local")).is_err());
+        let err = envfile::write(&dir, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap_err();
+        assert!(format!("{err:#}").contains("cannot run git"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(dir.join(".env.local")).unwrap(), "OLD=1\n");
+        return;
+    }
+
+    let dir = tmp("tracked-env-no-git");
+    init_git(&dir);
+    std::fs::write(dir.join(".env.local"), "OLD=1\n").unwrap();
+    git(&dir, &["add", "-f", ".env.local"]);
+    std::fs::write(dir.join(".gitignore"), ".env.local\n").unwrap();
+
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "tests::unavailable_git_cannot_overwrite_an_ignored_tracked_file"])
+        .env(CHILD_DIR, &dir)
+        .env("PATH", "")
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap();
+    assert!(status.success(), "child regression test failed");
+    assert_eq!(std::fs::read_to_string(dir.join(".env.local")).unwrap(), "OLD=1\n");
 }
 
 #[test]
@@ -526,7 +620,7 @@ fn gitignore_coverage_is_glob_matched_not_assumed() {
     assert!(c(".env.?ocal", ".env.local"));
     // end to end with a non-default name and a misleading existing rule
     let dir = tmp("gi-glob");
-    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    init_git(&dir);
     std::fs::write(dir.join(".gitignore"), ".env*\n").unwrap();
     envfile::write(&dir, "credentials.txt", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap();
     let gi = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
@@ -605,7 +699,7 @@ fn gitignore_last_match_wins() {
     assert!(g(".env.local   \n", ".env.local"), "trailing whitespace is ignored by git");
     // end to end: a negated file gets an explicit trailing rule, which wins
     let dir = tmp("gi-neg");
-    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    init_git(&dir);
     std::fs::write(dir.join(".gitignore"), ".env.local\n!.env.local\n").unwrap();
     envfile::write(&dir, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap();
     let gi = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
@@ -616,7 +710,7 @@ fn gitignore_last_match_wins() {
 #[test]
 fn secret_is_not_written_when_ignore_protection_fails() {
     let dir = tmp("gi-fail");
-    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    init_git(&dir);
     let target = dir.join("elsewhere.txt");
     std::fs::write(&target, "keep\n").unwrap();
     std::os::unix::fs::symlink(&target, dir.join(".gitignore")).unwrap();
@@ -718,12 +812,7 @@ fn wait_does_not_file_duplicate_program_approvals() {
 #[test]
 fn nested_gitignore_reinclude_is_handled_via_git() {
     let dir = tmp("gi-nested");
-    let git = |args: &[&str]| {
-        let st = std::process::Command::new("git").arg("-C").arg(&dir).args(args)
-            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap();
-        assert!(st.success(), "git {args:?}");
-    };
-    git(&["init", "-q", "."]);
+    init_git(&dir);
     let sub = dir.join("apps/web");
     std::fs::create_dir_all(&sub).unwrap();
     std::fs::write(dir.join(".gitignore"), ".env.local\n").unwrap();
@@ -784,16 +873,10 @@ fn tracked_env_file_is_still_refused_when_project_path_is_a_symlink() {
     let link = std::env::temp_dir().join(format!("tokenstash-test-tracked-env-symlink-link-{}", std::process::id()));
     let _ = std::fs::remove_file(&link);
     std::os::unix::fs::symlink(&real, &link).unwrap();
-    let git = |args: &[&str]| {
-        let st = std::process::Command::new("git").arg("-C").arg(&real).args(args)
-            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
-            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap();
-        assert!(st.success(), "git {args:?} failed");
-    };
-    git(&["init", "-q", "."]);
+    init_git(&real);
     std::fs::write(real.join(".env.local"), "OLD=1\n").unwrap();
-    git(&["add", ".env.local"]);
-    git(&["commit", "-q", "-m", "oops"]);
+    git(&real, &["add", ".env.local"]);
+    git(&real, &["commit", "-q", "-m", "oops"]);
     let err = envfile::write(&link, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap_err();
     assert!(err.to_string().contains("git rm --cached"), "tracked file must be refused through a symlinked project path: {err}");
     assert_eq!(std::fs::read_to_string(real.join(".env.local")).unwrap(), "OLD=1\n");
@@ -803,7 +886,7 @@ fn tracked_env_file_is_still_refused_when_project_path_is_a_symlink() {
 #[test]
 fn env_file_with_leading_dot_slash_is_accepted() {
     let dir = tmp("envfile-curdir");
-    std::process::Command::new("git").arg("-C").arg(&dir).args(["init", "-q", "."]).status().unwrap();
+    init_git(&dir);
     let p = envfile::write(&dir, "./.env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap();
     assert!(p.starts_with(&dir));
     assert!(envfile::has(&dir, "./.env.local", "K"));
@@ -812,9 +895,9 @@ fn env_file_with_leading_dot_slash_is_accepted() {
 
 #[test]
 fn a_git_dir_in_a_shared_ancestor_never_becomes_the_project_root() {
-    // /tmp-like: sticky, world-writable. A stray .git there must not capture children.
+    // /tmp-like: sticky, world-writable. A repo there must not become the write root.
     let shared = tmp("shared-ancestor");
-    std::fs::create_dir_all(shared.join(".git")).unwrap();
+    init_git(&shared);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -843,10 +926,9 @@ fn a_git_dir_in_a_shared_ancestor_never_becomes_the_project_root() {
     assert_eq!(envfile::owned_git_root(&sub).unwrap(), Some(repo.clone()));
     // a tracked env file is still refused inside the shared ancestor: detection is not
     // suppressed, only adoption as a write root
-    let _ = std::process::Command::new("git").arg("-C").arg(&shared).args(["init", "-q", "."]).status();
     std::fs::write(shared.join("proj/.env.local"), "OLD=1\n").unwrap();
     // -f: the project's own .gitignore now covers it, and this test needs it tracked anyway
-    let _ = std::process::Command::new("git").arg("-C").arg(&shared).args(["add", "-f", "proj/.env.local"]).env("GIT_AUTHOR_NAME","t").env("GIT_AUTHOR_EMAIL","t@t").status();
+    git(&shared, &["add", "-f", "proj/.env.local"]);
     assert!(envfile::is_git_tracked(&proj, &proj.join(".env.local")));
     assert!(envfile::write(&proj, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).is_err());
 }
@@ -1093,8 +1175,9 @@ fn rotation_reports_projects_it_could_not_rewrite() {
     pair(&db, &proj_b, "GROQ_API_KEY");
     need::need(&ctx, &proj_b, "test", &["GROQ_API_KEY".to_string()], &Default::default()).unwrap();
     // B commits its env file (the classic mistake) → the rewrite must refuse and say so
-    let git = |args: &[&str]| { std::process::Command::new("git").arg("-C").arg(&proj_b).args(args).env("GIT_AUTHOR_NAME","t").env("GIT_AUTHOR_EMAIL","t@t").env("GIT_COMMITTER_NAME","t").env("GIT_COMMITTER_EMAIL","t@t").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap(); };
-    git(&["init", "-q", "."]); git(&["add", "-f", ".env.local"]); git(&["commit", "-q", "-m", "oops"]);
+    init_git(&proj_b);
+    git(&proj_b, &["add", "-f", ".env.local"]);
+    git(&proj_b, &["commit", "-q", "-m", "oops"]);
     let card = tasks::rotate(&ctx, &proj_a, "human", "GROQ_API_KEY", "default").unwrap();
     let r = tasks::answer_secret(&ctx, &card, SecretString::from("gsk_new_bbbbbbbbbbbbbbbb".to_string()), true).unwrap();
     let tasks::AnswerResult::Stored { rotation: Some(rep), .. } = r else { panic!("expected a rotation report") };
@@ -2230,53 +2313,80 @@ fn a_card_never_carries_agent_chosen_markup_or_links() {
 /// of either one.
 #[test]
 fn git_environment_variables_cannot_disable_the_tracked_check() {
+    const CHILD_DIR: &str = "TOKENSTASH_TEST_GIT_ENV_DIR";
+    if let Some(dir) = std::env::var_os(CHILD_DIR) {
+        let dir = PathBuf::from(dir);
+        let parallel_fixture = tmp("git-env-parallel-fixture");
+        init_git(&parallel_fixture);
+        let tracked = envfile::is_git_tracked(&dir, &dir.join(".env.local"));
+        let write = envfile::write(&dir, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string()));
+
+        assert!(tracked, "a poisoned GIT_DIR must not turn a tracked file into an untracked one");
+        assert!(write.is_err(), "and the write is still refused");
+        assert!(parallel_fixture.join(".git").is_dir(), "test git fixtures must ignore process-global GIT_* overrides");
+        assert_eq!(std::fs::read_to_string(dir.join(".env.local")).unwrap(), "OLD=1\n");
+        return;
+    }
+
     let _g = env_lock();
     let dir = tmp("git-env").canonicalize().unwrap();
-    let git = |args: &[&str]| {
-        std::process::Command::new("git").arg("-C").arg(&dir).args(args)
-            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
-            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap()
-    };
-    git(&["init", "-q", "."]);
+    init_git(&dir);
     std::fs::write(dir.join(".env.local"), "OLD=1\n").unwrap();
-    git(&["add", "-f", ".env.local"]);
-    git(&["commit", "-q", "-m", "oops"]);
+    git(&dir, &["add", "-f", ".env.local"]);
+    git(&dir, &["commit", "-q", "-m", "oops"]);
     assert!(envfile::is_git_tracked(&dir, &dir.join(".env.local")));
 
-    std::env::set_var("GIT_DIR", "/nonexistent-git-dir");
-    std::env::set_var("GIT_WORK_TREE", "/nonexistent-work-tree");
-    let tracked = envfile::is_git_tracked(&dir, &dir.join(".env.local"));
-    let write = envfile::write(&dir, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string()));
-    std::env::remove_var("GIT_DIR");
-    std::env::remove_var("GIT_WORK_TREE");
-
-    assert!(tracked, "a poisoned GIT_DIR must not turn a tracked file into an untracked one");
-    assert!(write.is_err(), "and the write is still refused");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "tests::git_environment_variables_cannot_disable_the_tracked_check"])
+        .env(CHILD_DIR, &dir)
+        .env("GIT_DIR", "/nonexistent-git-dir")
+        .env("GIT_WORK_TREE", "/nonexistent-work-tree")
+        .output().unwrap();
+    assert!(output.status.success(),
+        "poisoned-Git child failed with {}\nstdout:\n{}\nstderr:\n{}",
+        output.status, String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr));
     assert_eq!(std::fs::read_to_string(dir.join(".env.local")).unwrap(), "OLD=1\n");
 }
 
-/// Inside a repo, "git could not answer" is not "ignored". Our own evaluator settles it only
-/// when the rule we wrote is the only ignore file that can apply.
+/// Inside a repo, "git could not answer" is not "ignored", even when our limited evaluator
+/// sees a matching hand-written glob.
 #[test]
 fn an_unverifiable_ignore_rule_refuses_the_write() {
-    let _g = env_lock();
-    // A repo git itself cannot read: `check-ignore` fails, so only our own evaluation is
-    // left, and it is complete only when no other ignore file can apply.
+    const CHILD_ROOT: &str = "TOKENSTASH_TEST_UNVERIFIABLE_IGNORE_ROOT";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        let deeper = PathBuf::from(root).join("svc/web");
+        let e = envfile::write(&deeper, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap_err();
+        let message = format!("{e:#}");
+        assert!(message.contains("cannot ask git whether") && message.contains("is ignored"), "{message}");
+        assert!(!message.as_bytes().windows(2).any(|w| w == b"  "), "user-facing git error contains repeated spacing: {message:?}");
+        assert!(!deeper.join(".env.local").exists(), "nothing written");
+        return;
+    }
+
+    // The child-local git proves `ls-files` has no match, then fails `check-ignore`.
     let root = tmp("unverifiable").canonicalize().unwrap();
     std::fs::create_dir_all(root.join(".git")).unwrap();
-    let proj = root.join("app");
-    std::fs::create_dir_all(&proj).unwrap();
-    envfile::write(&proj, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap();
-    assert!(envfile::gitignore_covers(&std::fs::read_to_string(root.join(".gitignore")).unwrap(), ".env.local"));
-
-    // Now put an ignore file between a project and the repo root. It can re-include what a
-    // higher rule ignored, and only git can say — which is exactly what we cannot ask.
+    std::fs::write(root.join(".gitignore"), "*.local\n").unwrap();
     let deeper = root.join("svc/web");
     std::fs::create_dir_all(&deeper).unwrap();
-    std::fs::write(root.join("svc/.gitignore"), "!.env.local\n").unwrap();
-    let e = envfile::write(&deeper, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap_err();
-    assert!(format!("{e:#}").contains("cannot ask git"), "{e:#}");
+    let bin = root.join("test-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake_git = bin.join("git");
+    std::fs::write(&fake_git, "#!/bin/sh\ncase \"$*\" in\n  *ls-files*) exit 1 ;;\n  *check-ignore*) exit 2 ;;\n  *) exit 2 ;;\nesac\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "tests::an_unverifiable_ignore_rule_refuses_the_write"])
+        .env(CHILD_ROOT, &root)
+        .env("PATH", &bin)
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap();
+    assert!(status.success(), "child regression test failed");
     assert!(!deeper.join(".env.local").exists(), "nothing written");
+    assert_eq!(std::fs::read_to_string(root.join(".gitignore")).unwrap(), "*.local\n", "the conclusive-looking local rule is not treated as git's verdict");
 }
 
 /// A card is closed once. Two answers racing must not let the loser overwrite the winner —
@@ -2750,6 +2860,7 @@ fn an_indented_definition_is_seen_and_replaced_not_duplicated() {
 fn a_query_auth_value_is_percent_encoded() {
     assert_eq!(validate::percent_encode("a&b#c d~z"), "a%26b%23c%20d~z");
     assert_eq!(validate::percent_encode("AQ.plain-Key_0"), "AQ.plain-Key_0");
+    assert_eq!(validate::percent_encode("/? ключ"), "%2F%3F%20%D0%BA%D0%BB%D1%8E%D1%87");
 }
 
 /// A deny note goes back to the agent as the reason; a credential must not ride along.
@@ -2792,4 +2903,26 @@ fn a_query_probe_sends_the_value_percent_encoded() {
     assert_eq!(validate::liveness(&check_for(&url, "query:key"), &v, std::time::Duration::from_secs(1)), validate::Liveness::Ok);
     let req = rx.recv().unwrap();
     assert!(req.contains("/probe?key=AQ.key%26with%23specials "), "{req}");
+}
+
+/// Transport errors include their URL in ureq's Display output. For query authentication
+/// that URL contains the credential percent-encoded, which raw-value redaction does not see.
+#[test]
+fn a_query_probe_transport_error_contains_no_credential_or_url() {
+    let raw = "AQ key/?#&%ключ";
+    let encoded = validate::percent_encode(raw);
+    let normalized_encoded = encoded.replace("%2F", "%2f").replace("%3F", "%3f");
+    let v = SecretString::from(raw.to_string());
+    let (url, _rx, _h) = loopback("attacker-controlled malformed response\r\n\r\n");
+    match validate::liveness(&check_for(&url, "query:key"), &v, std::time::Duration::from_secs(1)) {
+        validate::Liveness::Unknown(message) => {
+            assert!(message.starts_with("provider check failed: "), "failure category must remain actionable: {message}");
+            assert!(!message.contains("attacker-controlled"), "transport details must not be reflected: {message}");
+            assert!(!message.contains("://"), "credential-bearing URL must not be reflected: {message}");
+            assert!(!message.contains(raw), "raw credential leaked: {message}");
+            assert!(!message.contains(&encoded), "percent-encoded credential leaked: {message}");
+            assert!(!message.contains(&normalized_encoded), "normalized percent-encoded credential leaked: {message}");
+        }
+        other => panic!("expected transport failure, got {other:?}"),
+    }
 }

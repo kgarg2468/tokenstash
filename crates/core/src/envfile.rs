@@ -82,7 +82,7 @@ fn upsert(project: &Path, env_file: &str, name: &str, value: &SecretString, path
     if fs::symlink_metadata(&path).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
         anyhow::bail!("{} is a symlink; refusing to write a secret through it", path.display());
     }
-    if is_git_tracked(project, &path) {
+    if git_trackedness(project, &path)? {
         anyhow::bail!(
             "{} is tracked by git, so .gitignore cannot keep it out of the next commit. Run `git rm --cached {}` (keeps the local file) and re-run.",
             path.display(), env_file
@@ -295,20 +295,41 @@ fn glob_match(pat: &str, s: &str) -> bool {
 }
 
 /// Is this path in the git index? An ignore rule does nothing for a file that is already
-/// tracked. Best effort: if git cannot be run, assume not tracked (the .gitignore path
-/// still applies).
-pub fn is_git_tracked(project: &Path, path: &Path) -> bool {
+/// tracked. Outside a repo the answer is definitively false; inside one, git must prove
+/// true or false. An unavailable git or any exit other than the documented no-match status
+/// is indeterminate and therefore an error, never permission to overwrite the file.
+pub fn git_trackedness(project: &Path, path: &Path) -> Result<bool> {
     // Detection, not policy: a tracked file is refused wherever the repo lives.
-    let Some(root) = git_root(project) else { return false };
-    let Ok(rel) = path.strip_prefix(&root) else { return false };
-    git_cmd(&root)
+    let Some(root) = git_root(project) else { return Ok(false) };
+    let rel = path.strip_prefix(&root)
+        .with_context(|| format!("checking whether {} is tracked in {}", path.display(), root.display()))?;
+    let status = git_cmd(&root)
+        .arg("--literal-pathspecs")
         .args(["ls-files", "--error-unmatch", "--"])
         .arg(rel)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|st| st.success())
-        .unwrap_or(false)
+        .with_context(|| format!("cannot run git to determine whether {} is tracked; refusing to write a secret that might be committed", path.display()))?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        Some(code) => anyhow::bail!(
+            "cannot ask git whether {} is tracked: `git ls-files` exited with status {code}; fix the repo and re-run; refusing to write a secret that might be committed",
+            path.display()
+        ),
+        None => anyhow::bail!(
+            "cannot ask git whether {} is tracked: `git ls-files` was terminated; fix the repo and re-run; refusing to write a secret that might be committed",
+            path.display()
+        ),
+    }
+}
+
+/// Conservative predicate for read-only callers: an indeterminate answer inside a repo is
+/// treated like a tracked file so it is skipped. Writers use [`git_trackedness`] directly
+/// to retain the actionable error.
+pub fn is_git_tracked(project: &Path, path: &Path) -> bool {
+    git_trackedness(project, path).unwrap_or(true)
 }
 
 /// Walk up to find a git repo root.
@@ -411,7 +432,7 @@ pub fn ensure_gitignore(project: &Path, env_file: &str) -> Result<bool> {
     let target = project.join(env_file);
     match git_check_ignore(&root, &target) {
         Some(true) => Ok(changed),
-        None => unverified(&root, &ignore_dir, project, env_file, changed),
+        None => unverified(&target),
         Some(false) => {
             // a closer .gitignore re-includes it; the project's own file is closest
             let local = project.join(".gitignore");
@@ -427,7 +448,7 @@ pub fn ensure_gitignore(project: &Path, env_file: &str) -> Result<bool> {
             match git_check_ignore(&root, &target) {
                 Some(true) => Ok(changed),
                 Some(false) => anyhow::bail!("git still does not ignore {} after updating .gitignore (a nested rule re-includes it); refusing to write a secret there", target.display()),
-                None => unverified(&root, &ignore_dir, project, env_file, changed),
+                None => unverified(&target),
             }
         }
     }
@@ -435,36 +456,15 @@ pub fn ensure_gitignore(project: &Path, env_file: &str) -> Result<bool> {
 
 /// git could not answer (not installed, or it ran and failed — a broken `.git`, a repo it
 /// refuses as unsafe). We are inside a repo, so "cannot tell" is not "ignored".
-///
-/// Our own evaluator is allowed to settle it in the one case where it is complete: the rule
-/// we just wrote is the only `.gitignore` between the project and the repo root, so there is
-/// no nested file that could re-include the env file behind our back. Anything else refuses
-/// — an unverifiable ignore rule is exactly how a secret reaches a commit.
-fn unverified(root: &Path, ignore_dir: &Path, project: &Path, env_file: &str, changed: bool) -> Result<bool> {
-    let gi = ignore_dir.join(".gitignore");
-    let covered = gitignore_covers(&read_regular_file(&gi).unwrap_or_default(), env_file);
-    if covered && !has_nested_ignore(root, project, &gi) {
-        return Ok(changed);
-    }
+/// Our evaluator decides whether to append a rule, but it cannot replace git's effective
+/// answer: repository excludes and other ignore sources are outside that local model.
+fn unverified(target: &Path) -> Result<bool> {
     anyhow::bail!(
-        "cannot ask git whether {} is ignored (git is not runnable here, or this repo is in a state it refuses),          and the rule in {} is not conclusive on its own. Install git, or fix the repo, and re-run;          refusing to write a secret that might be committed.",
-        project.join(env_file).display(), gi.display()
+        "cannot ask git whether {} is ignored (git is not runnable here, or this repo is in a state it refuses), \
+so the ignore rule cannot be verified. Install git, or fix the repo, and re-run; \
+refusing to write a secret that might be committed.",
+        target.display()
     )
-}
-
-/// Any `.gitignore` between `project` and `root` (inclusive, excluding the one we wrote).
-/// Those are the files that can re-include what a higher rule ignored.
-fn has_nested_ignore(root: &Path, project: &Path, ours: &Path) -> bool {
-    let mut p = project.to_path_buf();
-    loop {
-        let gi = p.join(".gitignore");
-        if gi != ours && gi.exists() {
-            return true;
-        }
-        if p == root || !p.pop() {
-            return false;
-        }
-    }
 }
 
 /// `git`, with every `GIT_*` variable dropped from its environment.
