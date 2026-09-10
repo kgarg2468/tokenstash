@@ -1,11 +1,11 @@
 # tokenstash
 
-Your agent asks you for a key once. Never again — in any project, in any agent.
+Paste a key once. Approve each directory. Keep secrets out of status output.
 
-A local-first CLI + MCP server: an agent runs `tokenstash need OPENAI_API_KEY`; a stash hit is written to the project's env file, a miss files a task you answer once in a localhost inbox. Secret values never enter model context.
+A local CLI + MCP server for coding agents: an agent runs `tokenstash need OPENAI_API_KEY`; a stash hit is written to the project's env file once you have approved that directory, a miss files a task you answer once in a localhost inbox. `need` returns an exit code and a status line without echoing the value. The value goes from your paste to the OS keychain to the env file, which any process in that directory (the agent included) can read.
 
 ```bash
-cargo install tokenstash
+cargo install --locked tokenstash
 tokenstash init
 ```
 

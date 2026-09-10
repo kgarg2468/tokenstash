@@ -13,7 +13,7 @@
 - Per-project approvals become grants for directories that still exist and were not re-created since the approval; bindings follow. Old tables are left in place, so a 0.1 binary can still open the database.
 - A project that was silent only because of a trust root shows one pairing card — unless its `.env.local` already holds the same value (non-sensitive registry keys; the file must be yours, untracked and not a symlink).
 
-**Hardening** (pre-release audit — 14 independent reviews of the code and the tests)
+**Hardening**
 - `tokenstash answer --allow` / `--allow-broad` now requires a person at a terminal, like `rotate`, `check`, `bind`, `workspaces`, `export` and `import`. An agent with a shell could otherwise read the card id from `tasks --json` and approve its own request. Denying is still open to anyone: it can only close the agent's own card.
 - A card's text and link are the agent's, so they are treated as untrusted input: control, bidi and zero-width characters are stripped, the text is capped, and a link is stored only if it is `http(s)` — a `javascript:` link would have run in the inbox's own origin when clicked. For a key the registry knows, the provider's link wins over the agent's, so a card cannot point "Open …" at a lookalike page. Inbox pages carry a restrictive `Content-Security-Policy` and `Referrer-Policy: no-referrer`.
 - **Generated secrets are per project.** `JWT_SECRET`, `AUTH_SECRET`, `SESSION_SECRET`, `NEXTAUTH_SECRET` and `ENCRYPTION_KEY` were stored once per identity and shared by every project that asked, so a directory with a broad grant could receive another application's signing key. Each directory now generates its own (identity `<dir>-<hash>`); values already stored are untouched.

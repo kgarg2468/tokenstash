@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Agent conformance suite (tokenstash.md §11).
+# Agent conformance suite: does an agent actually use tokenstash the way its skill file says?
 #
 # Humans mostly never type `tokenstash`; agents do. This runs each installed agent CLI
 # headless against a scratch tokenstash home + scratch project, five scripted prompts each,

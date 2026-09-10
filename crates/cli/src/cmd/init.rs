@@ -43,7 +43,7 @@ struct Manifest {
 /// place — the default config dir — no matter what `TOKENSTASH_HOME` a given shell has set.
 /// Otherwise an init run with a scratch home and an `--undo` run without it (or the other way
 /// round) never see each other's record, and undo reports "nothing to undo" over a fully
-/// wired machine. Seen in the desktop-app test.
+/// wired machine.
 fn manifest_path() -> PathBuf { tokenstash_core::config::default_config_dir().join("init.manifest.json") }
 
 impl Manifest {

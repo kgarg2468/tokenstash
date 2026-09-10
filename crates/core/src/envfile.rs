@@ -13,13 +13,6 @@ use secrecy::{ExposeSecret, SecretString};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-/// Resolve `<project>/<env_file>` for writing, refusing any value that lands the secret
-/// outside the project directory.
-///
-/// `env_file` is configuration, and every protection below (gitignore coverage, the
-/// tracked-file check) is anchored on the project, so a path that escapes it is a secret
-/// written with no protection at all. Three ways out, all closed here: an absolute path, a
-/// `..` component, and a parent directory that is a symlink pointing out of the project.
 /// Validate the configured `env_file` spelling and return it normalized (`./` components
 /// dropped) so the gitignore rule and the on-disk path agree. Refuses absolute paths,
 /// roots, and `..`.
@@ -42,6 +35,15 @@ pub fn normalize(env_file: &str) -> Result<String> {
     Ok(parts.join("/"))
 }
 
+/// Resolve `<project>/<env_file>` for writing, refusing a configured value that, at the
+/// moment of resolution, lands the secret outside the project directory.
+///
+/// `env_file` is configuration, and every protection below (gitignore coverage, the
+/// tracked-file check) is anchored on the project, so a path that escapes it is a secret
+/// written with no protection at all. Three ways out, all closed here: an absolute path, a
+/// `..` component, and a parent directory that is a symlink pointing out of the project.
+/// This is a containment check on the path as it is now; it does not defend against a
+/// component being replaced between resolution and the write.
 pub fn resolve(project: &Path, env_file: &str) -> Result<PathBuf> {
     let norm = normalize(env_file)?;
     let rel = Path::new(&norm);
@@ -155,9 +157,9 @@ pub fn has(project: &Path, env_file: &str, name: &str) -> bool {
     s.lines().any(|l| defines(l, name))
 }
 
-/// Does this line define NAME? One notion for every reader and the writer: `has`, `upsert`,
-/// `read_value` and the rotation rewrite used to disagree on leading whitespace, so a
-/// hand-written `  NAME=old` was invisible to `has` and got a second `NAME=` appended.
+/// Does this line define NAME? One notion for every reader and the writer (`has`, `upsert`,
+/// `read_value`, the rotation rewrite): if they disagreed on leading whitespace, a
+/// hand-written `  NAME=old` would be invisible to `has` and get a second `NAME=` appended.
 fn defines(line: &str, name: &str) -> bool {
     parse_line(line).map(|(k, _)| k == name).unwrap_or(false)
 }
@@ -332,7 +334,6 @@ pub fn is_git_tracked(project: &Path, path: &Path) -> bool {
     git_trackedness(project, path).unwrap_or(true)
 }
 
-/// Walk up to find a git repo root.
 /// Nearest ancestor (or `start` itself) that holds a `.git` — plain detection, no policy.
 /// Callers that decide where to WRITE use [`owned_git_root`].
 pub fn git_root(start: &Path) -> Option<PathBuf> {

@@ -1,7 +1,7 @@
 {
   "name": "tokenstash",
   "version": "0.2.0",
-  "description": "Your agent asks you for a key once. Never again — in any project, in any agent.",
+  "description": "Credential broker for coding agents: paste a key once, approve each directory, keep secrets out of status output.",
   "bin": { "tokenstash": "bin/tokenstash.js" },
   "files": ["bin", "README.md", "LICENSE"],
   "license": "MIT",

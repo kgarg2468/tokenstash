@@ -565,7 +565,7 @@ pub fn deliver(ctx: &Ctx, project: &Path, agent: &str, name: &str, identity: &st
     Ok(Delivery::Injected { path, unverified })
 }
 
-/// Re-check a stored key with its provider before delivering it, when due. See §14.7.
+/// Re-check a stored key with its provider before delivering it, when due.
 ///
 /// Due = the registry allows this probe unattended (`check.at_use`), the human has not
 /// turned it off for this key, `verify_every` says so, no backoff/lease is in force.
