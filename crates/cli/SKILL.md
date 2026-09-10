@@ -39,7 +39,7 @@ Request all keys for a feature in one call so the human gets one card, not five.
 tokenstash ask "Add TXT record for resend.dev" --url https://dash.cloudflare.com --step "DNS → Add record" --step "Type TXT, name @, value v=spf1…" --expects confirm
 ```
 
-Same exit codes. `--expects text` when you need an answer back (it arrives in the task note via `tokenstash tasks --history --json`). Text answers are for questions — a region, a project id, a yes/no with context — never for secrets; those go through `need`.
+Same exit codes. `--expects text` when you need an answer back (it arrives in the task note via `tokenstash tasks --history --json`). The user is warned before they type that the note comes back to you word for word — both a text answer and the reason for declining — so it is for questions (a region, a project id, a yes/no with context), never for secrets; those go through `need`.
 
 ## When a provider rejects a key
 

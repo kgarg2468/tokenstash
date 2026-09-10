@@ -1,13 +1,13 @@
 //! Minimal MCP server over stdio (newline-delimited JSON-RPC 2.0).
 //! Hand-rolled on purpose: six tools, no SDK version churn. Tool results never contain values.
 //!
-//! Nor do they contain the inbox session token. Everything written here lands in the model's
-//! context, and the token is the credential that lets its holder ANSWER a task — store a value
-//! under a real key name, approve a trust gate. Giving that to the model would let it answer
-//! its own requests and self-approve the gates that exist to ask a person. So every `inbox`
-//! field and every link in a `next` below uses `util::inbox_url_agent` — the paste-scope
-//! session, which can answer a missing-key card but cannot approve; the full session
-//! goes to the desktop notification and `tokenstash open`, which only a human reads. See
+//! Nor do they contain the inbox session. Everything written here lands in the model's
+//! context, and the session is the credential that lets its holder ANSWER any task — store a
+//! value under a real key name, approve a trust gate. Giving that to the model would let it
+//! answer its own requests and self-approve the gates that exist to ask a person. So every
+//! `inbox` field and every link in a `next` below uses `util::inbox_url_agent` — one card's
+//! capability, which opens and answers that card and cannot approve; the full session goes
+//! to the desktop notification and `tokenstash open`, which only a human reads. See
 //! `crate::inbox_auth`.
 
 use crate::cmd::need::notify_pending;
@@ -340,7 +340,7 @@ fn tools() -> Value {
         },
         {
             "name": "human_request",
-            "description": "Ask the user to do something only a human can do (add a DNS record, flip a dashboard setting, create an OAuth client, accept terms). Returns a task id; call task_check to see when it's done.",
+            "description": "Ask the user to do something only a human can do (add a DNS record, flip a dashboard setting, create an OAuth client, accept terms). Returns a task id; call task_check to see when it's done. Whatever the user types on the card — a text answer, or the reason for declining — comes back to you verbatim in `note`; it is for answers, never for secrets (those go through secrets_request).",
             "inputSchema": { "type": "object", "properties": {
                 "title": { "type": "string" }, "why": { "type": "string" }, "url": { "type": "string" },
                 "steps": { "type": "array", "items": { "type": "string" } },
@@ -449,7 +449,7 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
                     need::Outcome::Pending { name, task_id, .. } => {
                         // `url` on the outcome is where the key is created (the card shows
                         // it); the link the user needs is the card itself.
-                        let card = util::inbox_url_agent(&app.cfg, Some(task_id), state);
+                        let card = util::inbox_url_agent(&app.cfg, Some(&app.db), Some(task_id), state);
                         v["inbox"] = json!(card);
                         // Why it is pending: a missing key, a stored key waiting for the
                         // user's approval for this project, or a stored key the provider
@@ -486,7 +486,7 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
             let mut top = json!({
                 "results": results,
                 "env_file": env_file,
-                "inbox": util::inbox_url_agent(&app.cfg, None, state),
+                "inbox": util::inbox_url_agent(&app.cfg, Some(&app.db), None, state),
                 "next": if pending { "One or more keys are pending: follow each result's `next`. Show the user the link, keep working, call task_check later." } else { "Done — follow each result's `next`." }
             });
             if blocking { top["waited_s"] = json!(waited); top["timed_out"] = json!(pending); }
@@ -522,7 +522,7 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
                     task = app.db.get_task(&task.id)?.unwrap_or(task);
                 }
             }
-            let card = util::inbox_url_agent(&app.cfg, Some(&task.id), crate::notify::inbox_state(&app.cfg));
+            let card = util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&task.id), crate::notify::inbox_state(&app.cfg));
             let next = match task.status {
                 tokenstash_core::db::TaskStatus::Pending => format!("The user has been asked ({}). {} Keep working on what does not depend on it and call task_check(\"{}\") later; do not call human_request again for the same step — the same title returns this same task.",
                     task.id, if card.starts_with("http") { format!("Show the user this link: {card}.") } else { format!("The inbox is unavailable ({card}); tell the user to run `tokenstash open`.") }, task.id),
@@ -553,7 +553,7 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
                             let (n, identity) = tokenstash_core::tasks::split_identity(entry);
                             if let Some(rt) = app.db.open_secret_task(&pid, n, identity)? {
                                 if rt.expects == tokenstash_core::tasks::EXPECTS_REPLACE {
-                                    replacements.push(json!({ "name": n, "task_id": rt.id, "url": util::inbox_url_agent(&app.cfg, Some(&rt.id), crate::notify::inbox_state(&app.cfg)) }));
+                                    replacements.push(json!({ "name": n, "task_id": rt.id, "url": util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&rt.id), crate::notify::inbox_state(&app.cfg)) }));
                                     continue;
                                 }
                             }
@@ -593,7 +593,7 @@ fn call(params: &Value, agent: &str, bound: &std::path::Path) -> Result<(Value, 
             // Always this project only: `all` was a cross-project path oracle for the model.
             let pid = project.to_string_lossy().to_string();
             let list = app.db.list_tasks(Some(&pid), true)?;
-            Ok((json!({ "tasks": list, "inbox": util::inbox_url_agent(&app.cfg, None, crate::notify::inbox_state(&app.cfg)) }), false))
+            Ok((json!({ "tasks": list, "inbox": util::inbox_url_agent(&app.cfg, Some(&app.db), None, crate::notify::inbox_state(&app.cfg)) }), false))
         }
         "secrets_report_invalid" => {
             let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();

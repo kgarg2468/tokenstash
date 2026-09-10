@@ -5,8 +5,9 @@
 //! the CLI's `/verify` probe and a human's paste still go through.
 //!
 //! Every test here runs a real `tokenstash inbox` on a free loopback port under a scratch
-//! `TOKENSTASH_HOME` with the insecure file stash; the session token it mints there is a
-//! throwaway. The child is killed when the test's guard drops, including on a panic.
+//! `TOKENSTASH_HOME` with the insecure file stash; the browser session and proof key it
+//! mints there are throwaways. The child is killed when the test's guard drops, including
+//! on a panic.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -59,7 +60,8 @@ impl Inbox {
         let mut inbox = Inbox { child, home, port };
         let started = Instant::now();
         loop {
-            if TcpStream::connect_timeout(&inbox.addr(), Duration::from_millis(200)).is_ok() && inbox.home.join("inbox.token").exists() {
+            // The session is minted only after the bind, so its presence means the inbox is up.
+            if TcpStream::connect_timeout(&inbox.addr(), Duration::from_millis(200)).is_ok() && inbox.home.join("inbox.session").exists() {
                 break;
             }
             if let Some(status) = inbox.child.try_wait().unwrap() {
@@ -75,9 +77,15 @@ impl Inbox {
         ([127, 0, 0, 1], self.port).into()
     }
 
-    /// The full-scope session token the inbox minted in the scratch home.
+    /// The browser session the inbox minted in the scratch home: the full credential.
     fn token(&self) -> String {
-        std::fs::read_to_string(self.home.join("inbox.token")).unwrap().trim().to_string()
+        std::fs::read_to_string(self.home.join("inbox.session")).unwrap().trim().to_string()
+    }
+
+    /// The persistent ownership-proof key `/verify` answers with. Never sent; the test holds
+    /// it only to check the answer.
+    fn proof(&self) -> String {
+        std::fs::read_to_string(self.home.join("inbox.proof.key")).unwrap().trim().to_string()
     }
 
     /// A connection with client-side timeouts well past the bound, so a stalled server shows
@@ -110,10 +118,11 @@ impl Inbox {
         let (status, body) = self.request(&format!("GET /verify?c={nonce} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n", self.port));
         let took = started.elapsed();
         assert_eq!(status, 200, "{what}: /verify answered {status}");
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(self.token().as_bytes()).unwrap();
-        mac.update(nonce.as_bytes());
+        // HMAC-SHA256(proof key, domain tag || nonce), as `inbox_auth::verify_response` defines it.
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(self.proof().as_bytes()).unwrap();
+        mac.update(format!("tokenstash-inbox-verify-v1:{nonce}").as_bytes());
         let expected: String = mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(body.trim(), expected, "{what}: /verify did not prove the token");
+        assert_eq!(body.trim(), expected, "{what}: /verify did not prove the key");
         assert!(took < PROMPT, "{what}: /verify took {took:?}");
     }
 

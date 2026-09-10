@@ -21,9 +21,9 @@ export TOKENSTASH_HOME="$(mktemp -d)"
 export TOKENSTASH_STASH=insecure-file
 PROJ="$(mktemp -d)"; cd "$PROJ"; git init -q .
 OUT="$(mktemp -d)"
-# Browser-facing responses legitimately contain the inbox session token (the hidden CSRF
-# field), so every curl body lands in $WEB. $OUT is the agent/CLI-facing surface, and the
-# token must never appear there — see assertion (d).
+# Browser-facing responses legitimately contain the inbox session (the hidden CSRF field),
+# so every curl body lands in $WEB. $OUT is the agent/CLI-facing surface, and the session
+# must never appear there — see assertion (d).
 WEB="$(mktemp -d)"
 JAR="$(mktemp)"
 CANARY="sk-LEAKCANARY-$(date +%s)-0123456789abcdef"
@@ -73,8 +73,7 @@ grep -qE "stash backend +insecure-file" "$OUT/doctor-pre.txt" || {
 }
 "$TS" inbox --port "$PORT" --keep >"$OUT/inbox.txt" 2>&1 &
 INBOX_PID=$!
-# /health now needs the session token like every other route; /verify is the unauthenticated
-# ownership challenge, so it is also the readiness probe.
+# /verify is the unauthenticated ownership challenge, so it is also the readiness probe.
 for _ in $(seq 1 30); do curl -fs "http://127.0.0.1:$PORT/verify?c=ready" >/dev/null 2>&1 && break; sleep 0.1; done
 "$TS" need OPENAI_API_KEY AUTH_SECRET --agent ci --why "leak test" >"$OUT/need1.txt" 2>&1 || true
 TID=$("$TS" tasks --json | python3 -c "import json,sys;print([t for t in json.load(sys.stdin) if t.get('name')=='OPENAI_API_KEY'][0]['id'])")
@@ -167,17 +166,27 @@ grep -q "OPENAI_API_KEY=$CANARY" "$PROJ/.env.local"
 grep -q "^.env.local$" "$PROJ/.gitignore"
 
 # ── inbox authentication ──────────────────────────────────────────────────────
-TOKEN_FILE="$TOKENSTASH_HOME/inbox.token"
-[ -s "$TOKEN_FILE" ] || { echo "FAIL: no session token at $TOKEN_FILE — the inbox is unauthenticated"; exit 1; }
+# Three credentials, three files: the browser session (rotated by every inbox start), the
+# ownership-proof key (answers /verify, never in a URL) and the card capability key (signs
+# one link per card, never in a URL). All 0600. The legacy inbox.token / inbox.paste.token
+# are not created and, when present, authenticate nothing (checked below).
+TOKEN_FILE="$TOKENSTASH_HOME/inbox.session"
+PROOF_FILE="$TOKENSTASH_HOME/inbox.proof.key"
+CAP_FILE="$TOKENSTASH_HOME/inbox.cap.key"
+for f in "$TOKEN_FILE" "$PROOF_FILE" "$CAP_FILE"; do
+  [ -s "$f" ] || { echo "FAIL: no credential at $f — the inbox is unauthenticated"; exit 1; }
+  MODE="$(stat -c '%a' "$f" 2>/dev/null || stat -f '%Lp' "$f")"
+  [ "$MODE" = 600 ] || { echo "FAIL: $f is $MODE, expected 600"; exit 1; }
+done
+[ -e "$TOKENSTASH_HOME/inbox.token" ] && { echo "FAIL: a legacy inbox.token was written"; exit 1; }
+[ -e "$TOKENSTASH_HOME/inbox.paste.token" ] && { echo "FAIL: a legacy inbox.paste.token was written"; exit 1; }
 TOKEN="$(cat "$TOKEN_FILE")"
-MODE="$(stat -c '%a' "$TOKEN_FILE" 2>/dev/null || stat -f '%Lp' "$TOKEN_FILE")"
-[ "$MODE" = 600 ] || { echo "FAIL: $TOKEN_FILE is $MODE, expected 600"; exit 1; }
-PASTE_FILE="$TOKENSTASH_HOME/inbox.paste.token"
-[ -s "$PASTE_FILE" ] || { echo "FAIL: no paste-scope token at $PASTE_FILE"; exit 1; }
-PASTE="$(cat "$PASTE_FILE")"
-[ "$PASTE" != "$TOKEN" ] || { echo "FAIL: paste-scope and full-scope tokens are identical"; exit 1; }
-PMODE="$(stat -c '%a' "$PASTE_FILE" 2>/dev/null || stat -f '%Lp' "$PASTE_FILE")"
-[ "$PMODE" = 600 ] || { echo "FAIL: $PASTE_FILE is $PMODE, expected 600"; exit 1; }
+PROOF="$(cat "$PROOF_FILE")"
+CAPKEY="$(cat "$CAP_FILE")"
+[ "$TOKEN" != "$PROOF" ] && [ "$TOKEN" != "$CAPKEY" ] && [ "$PROOF" != "$CAPKEY" ] || { echo "FAIL: two inbox credentials are identical"; exit 1; }
+# Legacy credential files, as an upgrade would leave them: they must open nothing.
+LEGACY_FULL="$(printf '1%.0s' $(seq 1 64))"; LEGACY_PASTE="$(printf '2%.0s' $(seq 1 64))"
+printf '%s' "$LEGACY_FULL" >"$TOKENSTASH_HOME/inbox.token"; printf '%s' "$LEGACY_PASTE" >"$TOKENSTASH_HOME/inbox.paste.token"
 
 # (a) the live exploit: an unauthenticated POST from any local process — or a loopback
 # CSRF from any page the user visits — must not be able to store a value.
@@ -193,17 +202,24 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data "action=allow" "htt
 [ "$code" = 404 ] || { echo "FAIL: POST with a query token but no cookie/CSRF field returned $code, expected 404"; exit 1; }
 grep -q "sk-EVIL-INJECTED" "$PROJ/.env.local" && { echo "FAIL: a POST without the CSRF field stored a value"; exit 1; }
 
-# (c) /verify is a challenge-response ownership proof, not a token check: it is how the CLI
+# (c) /verify is a challenge-response ownership proof, not a credential check: it is how the CLI
 # learns the listener on the port is OUR inbox for THIS TOKENSTASH_HOME without sending the
-# token to a process it has not authenticated yet.
+# key to a process it has not authenticated yet. The answer is HMAC(proof key, tag || nonce);
+# the proof key is never in a URL, so nothing captured from a link can produce it.
 NONCE="nonce-$(date +%s)-$RANDOM"
 hmacof() { python3 -c "import hmac,hashlib,sys;print(hmac.new(sys.argv[1].encode(),sys.argv[2].encode(),hashlib.sha256).hexdigest())" "$1" "$2"; }
-EXPECT="$(hmacof "$TOKEN" "$NONCE")"
+VTAG="tokenstash-inbox-verify-v1:"
+EXPECT="$(hmacof "$PROOF" "$VTAG$NONCE")"
 GOT="$(curl -fsS "http://127.0.0.1:$PORT/verify?c=$NONCE")"
-[ "$GOT" = "$EXPECT" ] || { echo "FAIL: /verify answered '$GOT', expected HMAC-SHA256(token, nonce) = '$EXPECT'"; exit 1; }
-[ "$GOT" != "$TOKEN" ] || { echo "FAIL: /verify echoed the token itself"; exit 1; }
-# an impostor holding a different token cannot produce that answer — that is the proof
-[ "$GOT" != "$(hmacof "$(printf '0%.0s' $(seq 1 64))" "$NONCE")" ] || { echo "FAIL: /verify is not bound to the token"; exit 1; }
+[ "$GOT" = "$EXPECT" ] || { echo "FAIL: /verify answered '$GOT', expected HMAC-SHA256(proof, tag||nonce) = '$EXPECT'"; exit 1; }
+[ "$GOT" != "$PROOF" ] && [ "$GOT" != "$TOKEN" ] || { echo "FAIL: /verify echoed a credential itself"; exit 1; }
+# an impostor holding a different key cannot produce that answer — that is the proof
+[ "$GOT" != "$(hmacof "$(printf '0%.0s' $(seq 1 64))" "$VTAG$NONCE")" ] || { echo "FAIL: /verify is not bound to the proof key"; exit 1; }
+# ...nor can whoever captured the browser session, the card key, or a legacy token from a URL
+for k in "$TOKEN" "$CAPKEY" "$LEGACY_FULL" "$LEGACY_PASTE"; do
+  [ "$GOT" != "$(hmacof "$k" "$VTAG$NONCE")" ] || { echo "FAIL: a credential that travels in URLs can forge /verify"; exit 1; }
+done
+[ "$GOT" != "$(hmacof "$PROOF" "$NONCE")" ] || { echo "FAIL: /verify is not domain-separated"; exit 1; }
 # a replayed answer proves nothing about a later challenge
 [ "$GOT" != "$(curl -fsS "http://127.0.0.1:$PORT/verify?c=${NONCE}x")" ] || { echo "FAIL: /verify is not bound to the challenge"; exit 1; }
 # ...and /verify without a challenge is a bare 404 like every other unauthorised shape
@@ -213,12 +229,22 @@ code=$(curl -s -o "$WEB/verify-noc.txt" -w '%{http_code}' "http://127.0.0.1:$POR
 # the CLI uses the same proof before trusting the port (doctor ran while this inbox was up)
 grep -q "ownership verified" "$OUT/doctor.txt" || { echo "FAIL: doctor did not verify inbox ownership"; exit 1; }
 
-# (b) the tokened flow still works end to end: ?t= authenticates the first GET, the response
+# (b) the session flow still works end to end: ?t= authenticates the first GET, the response
 # installs the session cookie, and a POST carrying cookie + hidden field answers the task.
 curl -fsS -c "$JAR" -b "$JAR" -L -o "$WEB/task.html" "http://127.0.0.1:$PORT/t/$ETID?t=$TOKEN"
 grep -q "tokenstash_inbox" "$JAR" || { echo "FAIL: the tokened GET did not set the session cookie"; exit 1; }
 grep -q "name=t value=\"$TOKEN\"" "$WEB/task.html" || { echo "FAIL: the task form carries no CSRF field"; exit 1; }
 grep -q "EVIL_TARGET_KEY" "$WEB/task.html" || { echo "FAIL: the authenticated task page did not render"; exit 1; }
+# the persistent keys and the legacy tokens are not browser credentials
+for k in "$PROOF" "$CAPKEY" "$LEGACY_FULL" "$LEGACY_PASTE"; do
+  code=$(curl -s -o "$WEB/notcred.html" -w '%{http_code}' -c "$WEB/notcred.jar" "http://127.0.0.1:$PORT/t/$ETID?t=$k")
+  [ "$code" = 404 ] || { echo "FAIL: a non-session credential opened a full route ($code)"; exit 1; }
+  grep -q "no longer valid" "$WEB/notcred.html" || { echo "FAIL: a refused ?t= did not get the recovery page"; exit 1; }
+  grep -q "tokenstash_" "$WEB/notcred.jar" 2>/dev/null && { echo "FAIL: a refused ?t= set a cookie"; exit 1; }
+  code=$(curl -s -o /dev/null -w '%{http_code}' -b "tokenstash_inbox=$k" "http://127.0.0.1:$PORT/")
+  [ "$code" = 404 ] || { echo "FAIL: a non-session value in the cookie opened the index ($code)"; exit 1; }
+done
+rm -f "$TOKENSTASH_HOME/inbox.token" "$TOKENSTASH_HOME/inbox.paste.token"
 # the cookie alone is not enough: without the hidden field this is still a CSRF-shaped post
 code=$(curl -s -b "$JAR" -o /dev/null -w '%{http_code}' --data 'value=sk-EVIL2-INJECTED&skip_check=1' "http://127.0.0.1:$PORT/t/$ETID")
 [ "$code" = 404 ] || { echo "FAIL: POST with the cookie but no CSRF field returned $code, expected 404"; exit 1; }
@@ -257,24 +283,57 @@ GOOD="sk-GOODCANARY-$(date +%s)-0123456789abcdef"
 curl -fsS -c "$JAR" -b "$JAR" -L -o "$WEB/answered.html" \
   --data-urlencode "value=$GOOD" --data "skip_check=1" --data-urlencode "t=$TOKEN" "http://127.0.0.1:$PORT/t/$ETID"
 grep -q "EVIL_TARGET_KEY=$GOOD" "$PROJ/.env.local" || { echo "FAIL: the authenticated answer did not store the value"; exit 1; }
-# ── paste-scope session: the link the agent hands the human ─────────────────────
-# It must (1) open and answer a missing-key card straight from the chat, (2) never carry or
-# reveal the full token, (3) be unable to approve, and (4) never downgrade a full session.
+# ── the card link: what the agent hands the human ───────────────────────────────
+# It must (1) open and answer ITS missing-key card straight from the chat, (2) never carry or
+# reveal the session or a key, (3) open no other card, on no route, (4) be unable to approve,
+# and (5) never replace a full session. It lives on the scoped route /p/<id>; the session
+# lives on / and /t/<id>; neither cookie is read on the other's routes.
 PJAR="$WEB/paste.jar"; : >"$PJAR"
-"$TS" need PASTE_TARGET_KEY --agent ci --why "paste-scope test" >"$OUT/need-paste.txt" 2>&1 || true
-grep -q "t=$PASTE" "$OUT/need-paste.txt" || { echo "FAIL: the agent-facing need output does not carry the paste-scope link"; exit 1; }
+"$TS" need PASTE_TARGET_KEY --agent ci --why "card link test" >"$OUT/need-paste.txt" 2>&1 || true
 PTID=$("$TS" tasks --json | python3 -c "import json,sys;print([t for t in json.load(sys.stdin) if t.get('name')=='PASTE_TARGET_KEY'][0]['id'])")
-curl -fsS -c "$PJAR" -b "$PJAR" -L -o "$WEB/paste-task.html" "http://127.0.0.1:$PORT/t/$PTID?t=$PASTE"
-grep -q "tokenstash_inbox" "$PJAR" || { echo "FAIL: the paste-scope link did not open a session"; exit 1; }
-grep -q "$TOKEN" "$WEB/paste-task.html" && { echo "LEAK: the paste-scope page contains the full token"; exit 1; }
-grep -q "name=t value=\"$PASTE\"" "$WEB/paste-task.html" || { echo "FAIL: the paste-scope form carries no CSRF field of its own"; exit 1; }
+PLINK=$(grep -o "http://127.0.0.1:$PORT/p/$PTID?t=[A-Za-z0-9_.]*" "$OUT/need-paste.txt" | head -1)
+[ -n "$PLINK" ] || { echo "FAIL: the agent-facing need output does not carry the card link"; cat "$OUT/need-paste.txt"; exit 1; }
+PCAP="${PLINK#*?t=}"
+case "$PCAP" in "$PTID".*) ;; *) echo "FAIL: the card credential does not name its card: $PCAP"; exit 1;; esac
+PMAC="${PCAP#*.}"
+for k in "$TOKEN" "$PROOF" "$CAPKEY"; do grep -q "$k" "$OUT/need-paste.txt" && { echo "LEAK: need output carries a key or the session"; exit 1; }; done
+curl -fsS -c "$PJAR" -b "$PJAR" -L -o "$WEB/paste-task.html" "$PLINK"
+grep -q "tokenstash_card" "$PJAR" || { echo "FAIL: the card link did not open a card session"; exit 1; }
+grep -q "tokenstash_inbox" "$PJAR" && { echo "FAIL: the card link set the SESSION cookie"; exit 1; }
+grep -q "/p/$PTID" "$PJAR" || { echo "FAIL: the card cookie is not confined to its card's path"; cat "$PJAR"; exit 1; }
+grep -q "$TOKEN" "$WEB/paste-task.html" && { echo "LEAK: the card page contains the session"; exit 1; }
+grep -q "name=t value=\"$PCAP\"" "$WEB/paste-task.html" || { echo "FAIL: the card form carries no CSRF field of its own"; exit 1; }
+grep -q "$ETID\|$BTID" "$WEB/paste-task.html" && { echo "FAIL: the card page names another card"; exit 1; }
+# no other card, on no route: the sibling's scoped route, the full routes, a prefix, a
+# re-addressed or forged credential
+for target in "/p/$BTID" "/t/$PTID" "/" "/p/${PTID%?}"; do
+  code=$(curl -s -o "$WEB/foreign.txt" -w '%{http_code}' -b "$PJAR" "http://127.0.0.1:$PORT$target")
+  [ "$code" = 404 ] && [ ! -s "$WEB/foreign.txt" ] || { echo "FAIL: a card cookie opened $target ($code)"; exit 1; }
+done
+for bad in "/p/$BTID?t=$BTID.$PMAC" "/p/$BTID?t=$PCAP" "/p/$PTID?t=${PTID%?}.$PMAC" "/p/$PTID?t=$PTID.$(printf '0%.0s' $(seq 1 64))" "/p/$PTID?t=$CAPKEY" "/t/$PTID?t=$PCAP" "/?t=$PCAP"; do
+  code=$(curl -s -o "$WEB/forged.html" -w '%{http_code}' -c "$WEB/forged.jar" "http://127.0.0.1:$PORT$bad")
+  [ "$code" = 404 ] || { echo "FAIL: $bad authenticated ($code)"; exit 1; }
+  grep -q "tokenstash_" "$WEB/forged.jar" 2>/dev/null && { echo "FAIL: $bad set a cookie"; exit 1; }
+done
+# a POST from the card session against another card is refused with nothing changed
+code=$(curl -s -b "$PJAR" -o /dev/null -w '%{http_code}' --data "action=deny&t=$PCAP" "http://127.0.0.1:$PORT/p/$BTID")
+[ "$code" = 404 ] || { echo "FAIL: a card session denied another card ($code)"; exit 1; }
+code=$(curl -s -b "$PJAR" -o /dev/null -w '%{http_code}' --data "value=sk-EVIL5-INJECTED&skip_check=1&t=$PCAP" "http://127.0.0.1:$PORT/p/$BTID")
+[ "$code" = 404 ] || { echo "FAIL: a card session pasted into another card ($code)"; exit 1; }
+grep -q "sk-EVIL5-INJECTED" "$PROJ/.env.local" && { echo "FAIL: a card session stored a value under another card"; exit 1; }
+"$TS" tasks --json | python3 -c "import json,sys;sys.exit(0 if [t for t in json.load(sys.stdin) if t.get('name')=='BIG_TARGET_KEY' and t['status']=='pending'] else 1)" \
+  || { echo "FAIL: a card session changed another card's state"; exit 1; }
 PGOOD="sk-PASTECANARY-$(date +%s)-0123456789abcdef"
 curl -fsS -c "$PJAR" -b "$PJAR" -L -o "$WEB/paste-answered.html" \
-  --data-urlencode "value=$PGOOD" --data "skip_check=1" --data-urlencode "t=$PASTE" "http://127.0.0.1:$PORT/t/$PTID"
-grep -q "PASTE_TARGET_KEY=$PGOOD" "$PROJ/.env.local" || { echo "FAIL: the paste-scope session could not answer a missing-key card"; exit 1; }
-# a paste-scope CSRF field does not authenticate a full-scope cookie, and vice versa
-code=$(curl -s -b "$JAR" -o /dev/null -w '%{http_code}' --data "value=sk-EVIL4&skip_check=1&t=$PASTE" "http://127.0.0.1:$PORT/t/$BTID")
-[ "$code" = 404 ] || { echo "FAIL: a paste CSRF field with a full cookie returned $code, expected 404"; exit 1; }
+  --data-urlencode "value=$PGOOD" --data "skip_check=1" --data-urlencode "t=$PCAP" "http://127.0.0.1:$PORT/p/$PTID"
+grep -q "PASTE_TARGET_KEY=$PGOOD" "$PROJ/.env.local" || { echo "FAIL: the card link could not answer its own missing-key card"; exit 1; }
+grep -q "Stored PASTE_TARGET_KEY" "$WEB/paste-answered.html" || { echo "FAIL: the card session was not shown its result on its own route"; exit 1; }
+# a card CSRF field does not authenticate a session cookie, and vice versa
+code=$(curl -s -b "$JAR" -o /dev/null -w '%{http_code}' --data "value=sk-EVIL4&skip_check=1&t=$PCAP" "http://127.0.0.1:$PORT/t/$BTID")
+[ "$code" = 404 ] || { echo "FAIL: a card CSRF field with a session cookie returned $code, expected 404"; exit 1; }
+code=$(curl -s -b "$PJAR" -o /dev/null -w '%{http_code}' --data "value=sk-EVIL6&skip_check=1&t=$TOKEN" "http://127.0.0.1:$PORT/p/$PTID")
+[ "$code" = 404 ] || { echo "FAIL: the session as CSRF field with a card cookie returned $code, expected 404"; exit 1; }
+grep -q "sk-EVIL4\|sk-EVIL6" "$PROJ/.env.local" && { echo "FAIL: a mismatched CSRF field stored a value"; exit 1; }
 # an approval card: a stash hit in a directory that was never paired (and an unregistered key)
 # (a project dir that is NOT under $OUT: $OUT is the agent-facing surface and is grepped for
 # values, and the env file written here legitimately holds one)
@@ -295,30 +354,82 @@ human "$TS" tasks --all --json | ATID="$ATID" python3 -c "import json,sys,os;sys
   || { echo "FAIL: the refused approval changed the card"; exit 1; }
 grep -q "EVIL_TARGET_KEY=" "$UNTRUSTED/.env.local" 2>/dev/null && { echo "FAIL: a refused CLI approval injected a key"; exit 1; }
 
-curl -fsS -c "$PJAR" -b "$PJAR" -L -o "$WEB/paste-approval.html" "http://127.0.0.1:$PORT/t/$ATID"
-grep -q "value=allow" "$WEB/paste-approval.html" && { echo "FAIL: the paste-scope session was offered an Allow button"; exit 1; }
-grep -q "full inbox session" "$WEB/paste-approval.html" || { echo "FAIL: the paste-scope approval page does not explain how to get the full session"; exit 1; }
-curl -s -c "$PJAR" -b "$PJAR" -o "$WEB/paste-approve-try.html" --data "action=allow&t=$PASTE" "http://127.0.0.1:$PORT/t/$ATID"
+# The approval card's own link (what the agent in $UNTRUSTED printed) shows the card and can
+# neither approve nor close it.
+ALINK=$(grep -o "http://127.0.0.1:$PORT/p/$ATID?t=[A-Za-z0-9_.]*" "$OUT/need-untrusted.txt" | head -1)
+[ -n "$ALINK" ] || { echo "FAIL: the agent output for the approval card carries no card link"; cat "$OUT/need-untrusted.txt"; exit 1; }
+ACAP="${ALINK#*?t=}"; AJAR="$WEB/approval.jar"; : >"$AJAR"
+curl -fsS -c "$AJAR" -b "$AJAR" -L -o "$WEB/paste-approval.html" "$ALINK"
+grep -q "value=allow" "$WEB/paste-approval.html" && { echo "FAIL: the card session was offered an Allow button"; exit 1; }
+grep -q "full inbox session" "$WEB/paste-approval.html" || { echo "FAIL: the card approval page does not explain how to get the full session"; exit 1; }
+grep -q "$TOKEN" "$WEB/paste-approval.html" && { echo "LEAK: the approval card page carries the session"; exit 1; }
+curl -s -c "$AJAR" -b "$AJAR" -o "$WEB/paste-approve-try.html" --data "action=allow&t=$ACAP" "http://127.0.0.1:$PORT/p/$ATID"
 human "$TS" tasks --all --json | ATID="$ATID" python3 -c "import json,sys,os;sys.exit(0 if [t for t in json.load(sys.stdin) if t['id']==os.environ['ATID'] and t['status']=='pending'] else 1)" \
-  || { echo "FAIL: a paste-scope POST approved a trust gate"; exit 1; }
-grep -q "EVIL_TARGET_KEY=" "$UNTRUSTED/.env.local" 2>/dev/null && { echo "FAIL: a paste-scope approval attempt injected a key"; exit 1; }
-# ...nor close it: the paste session is not tied to a directory, so "deny" on an approval
-# card from it could cost another directory a day
-curl -s -c "$PJAR" -b "$PJAR" -o "$WEB/paste-deny-try.html" --data "action=deny&t=$PASTE" "http://127.0.0.1:$PORT/t/$ATID"
+  || { echo "FAIL: a card-session POST approved a trust gate"; exit 1; }
+grep -q "EVIL_TARGET_KEY=" "$UNTRUSTED/.env.local" 2>/dev/null && { echo "FAIL: a card-session approval attempt injected a key"; exit 1; }
+grep -q "full inbox session" "$WEB/paste-approve-try.html" || { echo "FAIL: the card-session approval refusal does not explain"; exit 1; }
+# ...nor close it: an approval card is the person's decision either way
+curl -s -c "$AJAR" -b "$AJAR" -o "$WEB/paste-deny-try.html" --data "action=deny&t=$ACAP" "http://127.0.0.1:$PORT/p/$ATID"
 human "$TS" tasks --all --json | ATID="$ATID" python3 -c "import json,sys,os;sys.exit(0 if [t for t in json.load(sys.stdin) if t['id']==os.environ['ATID'] and t['status']=='pending'] else 1)" \
-  || { echo "FAIL: a paste-scope POST denied an approval card"; exit 1; }
-grep -q "full inbox session" "$WEB/paste-deny-try.html" || { echo "FAIL: the paste-scope deny refusal does not explain how to get the full session"; exit 1; }
+  || { echo "FAIL: a card-session POST denied an approval card"; exit 1; }
+grep -q "full inbox session" "$WEB/paste-deny-try.html" || { echo "FAIL: the card-session deny refusal does not explain how to get the full session"; exit 1; }
+# A browser that holds BOTH the session and the card cookie, while the card is still pending:
+# the scoped page is not elevated, its CSRF field is the card credential (never the session),
+# a scoped approve/deny is still refused, and the full route for the same card approves.
+curl -fsS -c "$JAR" -b "$JAR" -L -o "$WEB/both-scoped.html" "$ALINK"
+grep -q "$TOKEN" "$JAR" || { echo "FAIL: following a card link replaced the session"; exit 1; }
+grep -q "tokenstash_card" "$JAR" || { echo "FAIL: following a card link with the session did not keep the card cookie"; exit 1; }
+grep -q "value=allow" "$WEB/both-scoped.html" && { echo "FAIL: the scoped page was elevated by the session held in the browser"; exit 1; }
+grep -q "name=t value=\"$TOKEN\"" "$WEB/both-scoped.html" && { echo "LEAK: the scoped page rendered the session as its CSRF field"; exit 1; }
+# (a pending approval card offers a scoped session no form at all, hence no CSRF field; any
+# CSRF field a scoped page ever carries is the card credential, checked on the paste card above)
+grep -q "name=t value=\"" "$WEB/both-scoped.html" && ! grep -q "name=t value=\"$ACAP\"" "$WEB/both-scoped.html" && { echo "FAIL: the scoped page carries a CSRF field that is not its own"; exit 1; }
+grep -q "select this card there" "$WEB/both-scoped.html" || { echo "FAIL: the scoped approval page does not send the person to the full inbox"; exit 1; }
+for act in allow allow_broad deny; do
+  code=$(curl -s -c "$JAR" -b "$JAR" -o "$WEB/both-try.html" -w '%{http_code}' --data "action=$act&t=$ACAP" "http://127.0.0.1:$PORT/p/$ATID")
+  [ "$code" = 200 ] && grep -q "full inbox" "$WEB/both-try.html" || { echo "FAIL: scoped $act with both cookies was not refused with an explanation ($code)"; exit 1; }
+  code=$(curl -s -c "$JAR" -b "$JAR" -o /dev/null -w '%{http_code}' --data "action=$act&t=$TOKEN" "http://127.0.0.1:$PORT/p/$ATID")
+  [ "$code" = 404 ] || { echo "FAIL: the session as CSRF field on the scoped route was accepted for $act ($code)"; exit 1; }
+  human "$TS" tasks --all --json | ATID="$ATID" python3 -c "import json,sys,os;sys.exit(0 if [t for t in json.load(sys.stdin) if t['id']==os.environ['ATID'] and t['status']=='pending'] else 1)" \
+    || { echo "FAIL: a scoped $act with both cookies changed the card"; exit 1; }
+done
+# a reload of the scoped page after a full login elsewhere is still scoped
+curl -fsS -c "$JAR" -b "$JAR" -L -o /dev/null "http://127.0.0.1:$PORT/?t=$TOKEN"
+curl -fsS -b "$JAR" -o "$WEB/both-reload.html" "http://127.0.0.1:$PORT/p/$ATID"
+grep -q "value=allow" "$WEB/both-reload.html" && { echo "FAIL: reloading the scoped page after login elevated it"; exit 1; }
+curl -fsS -b "$JAR" -o "$WEB/full-route.html" "http://127.0.0.1:$PORT/t/$ATID"
+grep -q "value=allow" "$WEB/full-route.html" || { echo "FAIL: the full route for the same card offers no Allow to the session"; exit 1; }
+grep -q "name=t value=\"$TOKEN\"" "$WEB/full-route.html" || { echo "FAIL: the full route form carries no session CSRF field"; exit 1; }
 # the full session approves it
 curl -fsS -c "$JAR" -b "$JAR" -L -o "$WEB/full-approved.html" --data "action=allow" --data-urlencode "t=$TOKEN" "http://127.0.0.1:$PORT/t/$ATID"
 grep -q "EVIL_TARGET_KEY=$GOOD" "$UNTRUSTED/.env.local" 2>/dev/null || { echo "FAIL: the full session could not approve"; echo "--- response:"; sed 's/<[^>]*>/ /g' "$WEB/full-approved.html" | tr -s ' \n' | head -c 400; echo; echo "--- tasks:"; human "$TS" tasks --all --history --json | python3 -c "import json,sys;[print(t['id'],t['kind'],t['status'],t.get('project')) for t in json.load(sys.stdin)]"; echo "--- audit:"; human "$TS" audit | head -5; echo "--- untrusted dir:"; ls -la "$UNTRUSTED"; exit 1; }
-# no downgrade: a full-scope browser that follows an agent (paste) link keeps full scope
-curl -fsS -c "$JAR" -b "$JAR" -L -o /dev/null "http://127.0.0.1:$PORT/?t=$PASTE"
-grep -q "$TOKEN" "$JAR" || { echo "FAIL: following a paste-scope link downgraded a full-scope session"; exit 1; }
-# a fresh browser that follows a paste link, then a full link, ends up full
+# after the approval the scoped page is still scoped, and the session still opens the index
+curl -fsS -b "$JAR" -o "$WEB/after-scoped.html" "http://127.0.0.1:$PORT/p/$ATID"
+grep -q "This task is answered" "$WEB/after-scoped.html" || { echo "FAIL: the scoped page does not show the answered card"; exit 1; }
+grep -q "name=t value=\"$TOKEN\"" "$WEB/after-scoped.html" && { echo "LEAK: the scoped page rendered the session after approval"; exit 1; }
+code=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" "http://127.0.0.1:$PORT/")
+[ "$code" = 200 ] || { echo "FAIL: the session stopped opening the index after a card link ($code)"; exit 1; }
+# an explicit credential that fails is refused even with the session in the browser
+code=$(curl -s -o "$WEB/bad-with-session.html" -w '%{http_code}' -b "$JAR" "http://127.0.0.1:$PORT/p/$BTID?t=$BTID.$PMAC")
+[ "$code" = 404 ] || { echo "FAIL: a bad card credential passed because the browser held the session ($code)"; exit 1; }
+grep -q "no longer valid" "$WEB/bad-with-session.html" || { echo "FAIL: the refused credential did not get the recovery page"; exit 1; }
+# a fresh browser that follows a card link, then a full link, holds both — and the card
+# route stays scoped after the login
 UJAR="$WEB/upgrade.jar"; : >"$UJAR"
-curl -fsS -c "$UJAR" -b "$UJAR" -L -o /dev/null "http://127.0.0.1:$PORT/?t=$PASTE"
+curl -fsS -c "$UJAR" -b "$UJAR" -L -o /dev/null "$ALINK"
 curl -fsS -c "$UJAR" -b "$UJAR" -L -o /dev/null "http://127.0.0.1:$PORT/?t=$TOKEN"
-grep -q "$TOKEN" "$UJAR" || { echo "FAIL: a full-scope link did not upgrade a paste-scope session"; exit 1; }
+grep -q "$TOKEN" "$UJAR" || { echo "FAIL: a session link did not log a card-only browser in"; exit 1; }
+grep -q "tokenstash_card" "$UJAR" || { echo "FAIL: logging in dropped the card cookie"; exit 1; }
+curl -fsS -b "$UJAR" -o "$WEB/upgrade-scoped.html" "http://127.0.0.1:$PORT/p/$ATID"
+grep -q "name=t value=\"$TOKEN\"" "$WEB/upgrade-scoped.html" && { echo "LEAK: the scoped page rendered the session after an upgrade"; exit 1; }
+# need --json: each pending result carries its own card link; the top-level inbox field is bare
+"$TS" need JSON_TARGET_KEY --agent ci --json >"$OUT/need-json.txt" 2>/dev/null || true
+JLINK=$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));r=[x for x in d['results'] if x.get('status')=='pending' or 'task_id' in x][0];print(r['inbox']);assert d['inbox'].endswith('/') and '?t=' not in d['inbox'], d['inbox']" "$OUT/need-json.txt") || { echo "FAIL: need --json has no per-result card link or a privileged top-level inbox"; cat "$OUT/need-json.txt"; exit 1; }
+case "$JLINK" in "http://127.0.0.1:$PORT/p/"*"?t="*) ;; *) echo "FAIL: need --json result link is not a scoped card link: $JLINK"; exit 1;; esac
+JJAR="$WEB/json.jar"; : >"$JJAR"
+curl -fsS -c "$JJAR" -b "$JJAR" -L -o "$WEB/json-card.html" "$JLINK"
+grep -q "JSON_TARGET_KEY" "$WEB/json-card.html" || { echo "FAIL: the need --json card link did not open its card"; exit 1; }
+grep -q "tokenstash_inbox" "$JJAR" && { echo "FAIL: the need --json link set a session cookie"; exit 1; }
 
 # once the cookie is held, the index needs no token in the URL at all
 curl -fsS -b "$JAR" -o "$WEB/index.html" "http://127.0.0.1:$PORT/"
@@ -337,12 +448,15 @@ fi
 fail=0
 if grep -rl "$CANARY" "$OUT"; then echo "LEAK: canary found in CLI/MCP output"; fail=1; fi
 if grep -q "$CANARY" "$TOKENSTASH_HOME/config.toml" 2>/dev/null; then echo "LEAK: canary in config"; fail=1; fi
-# (d) the inbox session token is a human credential: it must never reach a surface the
-# model reads — MCP tool results, the audit log, or any other CLI output.
+# (d) the inbox session is a human credential and the two keys never travel at all: none may
+# reach a surface the model reads — MCP tool results, the audit log, or any other CLI output.
 if grep -q "$TOKEN" "$OUT/mcp.txt"; then echo "LEAK: session token in MCP tool output"; fail=1; fi
 if grep -q "$TOKEN" "$OUT/audit.txt"; then echo "LEAK: session token in the audit log"; fail=1; fi
 if grep -rl "$TOKEN" "$OUT"; then echo "LEAK: session token found in agent-facing output"; fail=1; fi
+if grep -rl "$PROOF" "$OUT" "$WEB"; then echo "LEAK: the proof key left its file"; fail=1; fi
+if grep -rl "$CAPKEY" "$OUT" "$WEB"; then echo "LEAK: the capability key left its file"; fail=1; fi
 if strings "$TOKENSTASH_HOME/tokenstash.db"* | grep -q "$TOKEN"; then echo "LEAK: session token in database"; fail=1; fi
+if strings "$TOKENSTASH_HOME/tokenstash.db"* | grep -q "$PROOF\|$CAPKEY"; then echo "LEAK: an inbox key in the database"; fail=1; fi
 if strings "$TOKENSTASH_HOME/tokenstash.db"* | grep -q "$CANARY"; then echo "LEAK: canary in database"; fail=1; fi
 # env_file is configuration, not a trusted path: an absolute value would put the secret
 # outside the project, where neither .gitignore nor the tracked-file check can protect it.
@@ -433,10 +547,17 @@ NEWCANARY="sk-ROTATEDCANARY-$(date +%s)-0123456789abcdef"
 echo "$NEWCANARY" | "$TS" answer "$RTID" --stdin --skip-check >"$OUT/rotate-answer-pipe.txt" 2>&1 && { echo "FAIL: an agent answered a Replace card"; fail=1; }
 grep -q "for a person at a terminal" "$OUT/rotate-answer-pipe.txt" || { echo "FAIL: the Replace refusal did not say why"; sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$OUT/rotate-answer-pipe.txt" | head -3; fail=1; }
 grep -q "$NEWCANARY" "$PROJ/.env.local" && { echo "FAIL: the refused Replace answer was written anyway"; fail=1; }
-# …the agent's link is refused the same way (a Replace card rewrites every holder)…
-curl -s -c "$PJAR" -b "$PJAR" -o "$WEB/paste-replace-try.html" --data "value=$NEWCANARY&skip_check=1&t=$PASTE" "http://127.0.0.1:$PORT/t/$RTID"
-grep -q "$NEWCANARY" "$PROJ/.env.local" 2>/dev/null && { echo "FAIL: the paste-scope session answered a Replace card"; fail=1; }
-grep -q "other directories hold this key" "$WEB/paste-replace-try.html" || { echo "FAIL: the paste-scope Replace refusal did not explain"; fail=1; }
+# …the card's own link is refused the same way (a Replace card rewrites every holder)…
+"$TS" need OPENAI_API_KEY --agent ci >"$OUT/need-replace.txt" 2>&1 || true
+RLINK=$(grep -o "http://127.0.0.1:$PORT/p/$RTID?t=[A-Za-z0-9_.]*" "$OUT/need-replace.txt" | head -1)
+[ -n "$RLINK" ] || { echo "FAIL: no card link for the Replace card"; cat "$OUT/need-replace.txt"; fail=1; }
+RCAP="${RLINK#*?t=}"; RJAR="$WEB/replace.jar"; : >"$RJAR"
+curl -fsS -c "$RJAR" -b "$RJAR" -L -o /dev/null "$RLINK"
+curl -s -c "$RJAR" -b "$RJAR" -o "$WEB/paste-replace-try.html" --data "value=$NEWCANARY&skip_check=1&t=$RCAP" "http://127.0.0.1:$PORT/p/$RTID"
+grep -q "$NEWCANARY" "$PROJ/.env.local" 2>/dev/null && { echo "FAIL: the card session answered a Replace card"; fail=1; }
+grep -q "other directories hold this key" "$WEB/paste-replace-try.html" || { echo "FAIL: the card-session Replace refusal did not explain"; fail=1; }
+"$TS" tasks --json | RTID="$RTID" python3 -c "import json,sys,os;sys.exit(0 if [t for t in json.load(sys.stdin) if t['id']==os.environ['RTID'] and t['status']=='pending'] else 1)" \
+  || { echo "FAIL: the refused Replace paste changed the card"; fail=1; }
 # …and the person at the terminal answers the masked prompt. The pty echoes what is typed
 # before rpassword turns echo off, so this transcript lives with the browser-facing files,
 # which the leak grep does not read; the value's absence from every other output is what
@@ -528,17 +649,54 @@ if command -v keyctl >/dev/null 2>&1; then
   done
 fi
 
-# ── an unverified listener on the inbox port must never be handed the token ───────────────
+# ── restart: the session is retired, the proof key and card links survive ────────────────
+# A link captured before the restart (a notification left in the tray, a chat log) must not
+# open the inbox that runs now; the CLI must still recognise that inbox; a card link printed
+# before the restart must still open its card.
+kill "$INBOX_PID" 2>/dev/null || true
+wait "$INBOX_PID" 2>/dev/null || true
+OLDTOKEN="$TOKEN"
+"$TS" inbox --port "$PORT" --keep >"$OUT/inbox2.txt" 2>&1 &
+INBOX_PID=$!
+for _ in $(seq 1 30); do curl -fs "http://127.0.0.1:$PORT/verify?c=ready" >/dev/null 2>&1 && break; sleep 0.1; done
+TOKEN="$(cat "$TOKEN_FILE")"
+[ "$TOKEN" != "$OLDTOKEN" ] || { echo "FAIL: the session did not rotate on restart"; fail=1; }
+[ "$(cat "$PROOF_FILE")" = "$PROOF" ] || { echo "FAIL: the proof key changed on restart; the CLI would stop recognising its own inbox"; fail=1; }
+[ "$(cat "$CAP_FILE")" = "$CAPKEY" ] || { echo "FAIL: the capability key changed on restart; every card link printed would be dead"; fail=1; }
+code=$(curl -s -o "$WEB/stale.html" -w '%{http_code}' -c "$WEB/stale.jar" "http://127.0.0.1:$PORT/?t=$OLDTOKEN")
+[ "$code" = 404 ] || { echo "FAIL: a session from before the restart authenticated ($code)"; fail=1; }
+grep -q "tokenstash open" "$WEB/stale.html" || { echo "FAIL: the stale link did not say how to recover"; fail=1; }
+grep -q "tokenstash_" "$WEB/stale.jar" 2>/dev/null && { echo "FAIL: the stale link set a cookie"; fail=1; }
+code=$(curl -s -o "$WEB/stale-cookie.txt" -w '%{http_code}' -b "$JAR" "http://127.0.0.1:$PORT/")
+[ "$code" = 404 ] && [ ! -s "$WEB/stale-cookie.txt" ] || { echo "FAIL: a cookie from before the restart opened the index ($code)"; fail=1; }
+code=$(curl -s -b "$JAR" -o /dev/null -w '%{http_code}' --data "action=deny&t=$OLDTOKEN" "http://127.0.0.1:$PORT/t/$BTID")
+[ "$code" = 404 ] || { echo "FAIL: a stale session closed a card ($code)"; fail=1; }
+NONCE2="nonce2-$RANDOM"
+[ "$(curl -fsS "http://127.0.0.1:$PORT/verify?c=$NONCE2")" = "$(hmacof "$PROOF" "$VTAG$NONCE2")" ] || { echo "FAIL: /verify changed across the restart"; fail=1; }
+grep -q "ownership verified" <("$TS" doctor 2>&1) || { echo "FAIL: the CLI does not recognise the restarted inbox"; fail=1; }
+code=$(curl -s -o "$WEB/card-after-restart.html" -w '%{http_code}' -b "$RJAR" "http://127.0.0.1:$PORT/p/$RTID")
+[ "$code" = 200 ] && grep -q "OPENAI_API_KEY" "$WEB/card-after-restart.html" || { echo "FAIL: a card link from before the restart no longer opens its card ($code)"; fail=1; }
+: >"$JAR"
+curl -fsS -c "$JAR" -b "$JAR" -L -o "$WEB/index-after-restart.html" "http://127.0.0.1:$PORT/?t=$TOKEN"
+grep -q "tokenstash inbox" "$WEB/index-after-restart.html" || { echo "FAIL: the new session does not open the index"; fail=1; }
+# a second inbox that loses the bind must not retire the running one's session
+"$TS" inbox --port "$PORT" >"$OUT/inbox-loser.txt" 2>&1 || true
+grep -q "already running" "$OUT/inbox-loser.txt" || { echo "FAIL: the losing bind did not say so"; fail=1; }
+[ "$(cat "$TOKEN_FILE")" = "$TOKEN" ] || { echo "FAIL: a failed bind rotated the live session"; fail=1; }
+code=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" "http://127.0.0.1:$PORT/")
+[ "$code" = 200 ] || { echo "FAIL: the live session died after a losing bind ($code)"; fail=1; }
+
+# ── an unverified listener on the inbox port must never be handed the session ─────────────
 # Last, because it takes the inbox down for the rest of the run.
 # Ownership is proved with /verify before any surface emits ?t=. When a process squats the
-# port, every human-facing surface has to refuse: no token in a URL, no browser opened, no
+# port, every human-facing surface has to refuse: no session in a URL, no browser opened, no
 # notification pointing there. Warning and carrying on would hand the squatter the session
-# credential it needs to impersonate the inbox for the next paste.
+# it needs to impersonate the inbox for the next paste.
 kill "$INBOX_PID" 2>/dev/null || true
 wait "$INBOX_PID" 2>/dev/null || true
 cat > "$WEB/squat.py" <<'PY'
-# A plain HTTP listener that answers everything with 200 "hi". It does not know the token, so
-# it cannot answer /verify — which is exactly what the ownership proof is for.
+# A plain HTTP listener that answers everything with 200 "hi". It does not know the proof key,
+# so it cannot answer /verify — which is exactly what the ownership proof is for.
 import socket, sys, time
 s = socket.socket()
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -569,7 +727,7 @@ if script -qec true /dev/null >/dev/null 2>&1; then
   BROWSER=/bin/echo script -qec "$TS open" /dev/null >"$OUT/squat-open-pty.txt" 2>&1 || true
 fi
 for f in "$OUT"/squat-*.txt; do
-  if grep -q "$TOKEN" "$f"; then echo "LEAK: $(basename "$f") emitted the session token while another process held the port"; fail=1; fi
+  if grep -q "$TOKEN\|$OLDTOKEN" "$f"; then echo "LEAK: $(basename "$f") emitted the session while another process held the port"; fail=1; fi
   if grep -qE '\?t=' "$f"; then echo "LEAK: $(basename "$f") emitted a tokened URL for an unverified listener"; fail=1; fi
 done
 grep -q "held by another process" "$OUT/squat-open.txt" || { echo "FAIL: open did not say why it refused"; fail=1; }

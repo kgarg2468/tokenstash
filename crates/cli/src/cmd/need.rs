@@ -76,11 +76,20 @@ pub fn need(a: NeedArgs) -> Result<i32> {
     // Only probed when something is pending: a hit never needs the inbox.
     let state = if outcomes.iter().any(|o| o.is_pending()) { notify::inbox_state(&app.cfg) } else { notify::Inbox::Down };
     if a.json {
+        // Each pending result carries its own card link, as the MCP tool does; the
+        // top-level `inbox` is the bare index URL, and carries nothing.
+        let results: Vec<serde_json::Value> = outcomes.iter().map(|o| {
+            let mut v = serde_json::to_value(o).unwrap_or(serde_json::Value::Null);
+            if let Outcome::Pending { task_id, .. } = o {
+                v["inbox"] = serde_json::json!(util::inbox_url_agent(&app.cfg, Some(&app.db), Some(task_id), state));
+            }
+            v
+        }).collect();
         println!("{}", serde_json::to_string_pretty(&serde_json::json!({
             "project": project,
             "env_file": app.cfg.env_file,
-            "inbox": util::inbox_url_agent(&app.cfg, None, state),
-            "results": outcomes,
+            "inbox": util::inbox_url_agent(&app.cfg, Some(&app.db), None, state),
+            "results": results,
         }))?);
     } else {
         for o in &outcomes {
@@ -94,7 +103,7 @@ pub fn need(a: NeedArgs) -> Result<i32> {
                     }
                 }
                 Outcome::Pending { name, task_id, .. } => {
-                    println!("⏳ {name} pending — task {task_id} → {}", util::inbox_url_agent(&app.cfg, Some(task_id), state));
+                    println!("⏳ {name} pending — task {task_id} → {}", util::inbox_url_agent(&app.cfg, Some(&app.db), Some(task_id), state));
                 }
                 Outcome::Denied { name, .. } => println!("✗ {name} denied by the user — do not ask again, and do not supply a stand-in value by any route; make the feature optional or report it blocked"),
                 Outcome::Expired { name, .. } => println!("✗ {name} expired unanswered"),
@@ -197,9 +206,9 @@ pub fn ask(a: AskArgs) -> Result<i32> {
     }
     let state = notify::inbox_state(&app.cfg);
     if a.json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "task": task, "inbox": util::inbox_url_agent(&app.cfg, Some(&task.id), state) }))?);
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "task": task, "inbox": util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&task.id), state) }))?);
     } else {
-        println!("{} {} — task {} → {}", status_icon(&task.status), task.title, task.id, util::inbox_url_agent(&app.cfg, Some(&task.id), state));
+        println!("{} {} — task {} → {}", status_icon(&task.status), task.title, task.id, util::inbox_url_agent(&app.cfg, Some(&app.db), Some(&task.id), state));
         if let Some(n) = &task.note {
             println!("  note: {n}");
         }

@@ -1,5 +1,6 @@
 #![cfg(test)]
 use crate::*;
+use crate::stash::Stash;
 use secrecy::SecretString;
 use std::path::PathBuf;
 
@@ -45,6 +46,38 @@ fn init_git(dir: &std::path::Path) {
     let status = std::process::Command::new("git").arg("-C").arg(dir).args(["init", "-q", "."])
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap();
     assert!(status.success(), "git init failed for {}", dir.display());
+}
+
+/// An in-memory stash with a hook at the exact point `set` runs. Tests use the hook to
+/// attempt a write through a second SQLite connection while the store transaction is live.
+struct HookStash<F> {
+    values: std::cell::RefCell<std::collections::BTreeMap<String, String>>,
+    hook: F,
+    fail_set: bool,
+}
+
+impl<F> HookStash<F> {
+    fn new(hook: F, fail_set: bool) -> Self {
+        Self { values: std::cell::RefCell::new(Default::default()), hook, fail_set }
+    }
+}
+
+impl<F: Fn() -> anyhow::Result<()>> stash::Stash for HookStash<F> {
+    fn backend(&self) -> &'static str { "hook" }
+    fn get(&self, key: &str) -> anyhow::Result<Option<SecretString>> {
+        Ok(self.values.borrow().get(key).cloned().map(SecretString::from))
+    }
+    fn set(&self, key: &str, value: &SecretString) -> anyhow::Result<()> {
+        (self.hook)()?;
+        if self.fail_set {
+            anyhow::bail!("injected stash failure");
+        }
+        self.values.borrow_mut().insert(key.to_string(), secrecy::ExposeSecret::expose_secret(value).to_string());
+        Ok(())
+    }
+    fn delete(&self, key: &str) -> anyhow::Result<bool> {
+        Ok(self.values.borrow_mut().remove(key).is_some())
+    }
 }
 
 #[test]
@@ -2806,6 +2839,288 @@ fn fans_out_when_another_directory_holds_a_grant_or_the_card_is_a_replacement() 
     assert!(!tasks::fans_out(&ctx, &own).unwrap(), "the card's own directory is not \"elsewhere\"");
     let replace = tasks::create_replacement_task(&ctx, &proj_b, "agent", "RESEND_API_KEY", "default", &req).unwrap();
     assert!(tasks::fans_out(&ctx, &replace).unwrap(), "a replacement rewrites every holder");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+/// A broad grant in another directory delivers a registry key there on its next `need`, so a
+/// paste of that key elsewhere reaches it too. `forget` keeps grants, so the re-paste is
+/// the same decision. Sensitive and unregistered names are never covered by a broad grant.
+#[test]
+fn fans_out_through_a_broad_grant_elsewhere_and_after_forget() {
+    let _g = env_lock();
+    let (home, proj_a) = v2_world("fanout-broad-a");
+    let proj_b = tmp("fanout-broad-b").canonicalize().unwrap();
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    // A holds only a broad grant: no exact grant for any of the names below.
+    let ws_a = db.workspace_for(&proj_a).unwrap();
+    db.grant(&ws_a.id, "*", "default", db::GRANT_BROAD, db::GRANT_PAIRING).unwrap();
+    let req = tasks::SecretRequest::default();
+    let registry_key = tasks::create_secret_task(&ctx, &proj_b, "agent", "GROQ_API_KEY", "default", &req).unwrap();
+    assert!(tasks::fans_out(&ctx, &registry_key).unwrap(), "A's broad grant would deliver GROQ_API_KEY there");
+    let sensitive = tasks::create_secret_task(&ctx, &proj_b, "agent", "TWILIO_AUTH_TOKEN", "default", &req).unwrap();
+    assert!(!tasks::fans_out(&ctx, &sensitive).unwrap(), "a broad grant never covers a name the registry tags sensitive");
+    // Sensitive by value pattern only (Stripe live vs test): the value is not known when this
+    // is judged, so the name counts as one a broad grant could deliver — the strict side.
+    let by_pattern = tasks::create_secret_task(&ctx, &proj_b, "agent", "STRIPE_SECRET_KEY", "default", &req).unwrap();
+    assert!(tasks::fans_out(&ctx, &by_pattern).unwrap(), "a pattern-sensitive name is judged before the value exists");
+    let unregistered = tasks::create_secret_task(&ctx, &proj_b, "agent", "MY_INTERNAL_TOKEN", "default", &req).unwrap();
+    assert!(!tasks::fans_out(&ctx, &unregistered).unwrap(), "a broad grant never covers an unregistered name");
+    let other_identity = tasks::create_secret_task(&ctx, &proj_b, "agent", "RESEND_API_KEY", "work", &req).unwrap();
+    assert!(!tasks::fans_out(&ctx, &other_identity).unwrap(), "a broad grant is per identity");
+    // A's own broad grant does not make A's own card fan out.
+    let own = tasks::create_secret_task(&ctx, &proj_a, "agent", "RESEND_API_KEY", "default", &req).unwrap();
+    assert!(!tasks::fans_out(&ctx, &own).unwrap());
+    // Exact grant, value stored, then forgotten: the grant stays, so the next paste fans out.
+    pair(&db, &proj_a, "OPENAI_API_KEY");
+    let first = tasks::create_secret_task(&ctx, &proj_a, "agent", "OPENAI_API_KEY", "default", &req).unwrap();
+    tasks::answer_secret(&ctx, &first, SecretString::from("sk-firstfirstfirst1234".to_string()), true).unwrap();
+    stash.delete(&stash::stash_key("OPENAI_API_KEY", "default")).unwrap();
+    db.delete_secret("OPENAI_API_KEY", "default").unwrap();
+    let repaste = tasks::create_secret_task(&ctx, &proj_b, "agent", "OPENAI_API_KEY", "default", &req).unwrap();
+    assert!(tasks::fans_out(&ctx, &repaste).unwrap(), "after forget, A's grant still delivers the next value");
+    std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
+}
+
+/// Provider validation runs before the write transaction. If that interval promotes an
+/// ordinary card to a replacement, both a full-session human and the requester must reload:
+/// silently accepting either answer would apply semantics they did not originally see.
+#[test]
+fn a_card_promoted_during_validation_requires_both_actors_to_reload() {
+    let root = tmp("expects-race");
+    let db_path = root.join("index.db");
+    let db = Db::open(&db_path).unwrap();
+    let other = Db::open(&db_path).unwrap();
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    let ws = db.workspace_for(&project).unwrap();
+    let cfg = Config::default();
+    let stash = HookStash::new(|| -> anyhow::Result<()> { Ok(()) }, false);
+    let setup = tasks::Ctx { cfg: &cfg, db: &db, stash: &stash, probe: tasks::Probe::Off };
+
+    for (actor, identity) in [(tasks::Actor::Human, "human"), (tasks::Actor::Requester, "requester")] {
+        let card = tasks::create_secret_task(&setup, &project, "agent", "OPENAI_API_KEY", identity, &Default::default()).unwrap();
+        assert_ne!(card.expects, tasks::EXPECTS_REPLACE);
+        let promote = |_: &registry::Check| {
+            other.set_task_expects(&card.id, tasks::EXPECTS_REPLACE).unwrap();
+            validate::Liveness::Ok
+        };
+        let racing = tasks::Ctx { cfg: &cfg, db: &db, stash: &stash, probe: tasks::Probe::Stub(&promote) };
+        let err = tasks::answer_secret_by(&racing, actor, &card, SecretString::from("sk-raced-raced-raced-1234".to_string()), false).unwrap_err().to_string();
+        assert!(err.contains("card changed") && err.contains("reload"), "{actor:?}: {err}");
+        let fresh = db.get_task(&card.id).unwrap().unwrap();
+        assert_eq!(fresh.expects, tasks::EXPECTS_REPLACE);
+        assert_eq!(fresh.status, db::TaskStatus::Pending, "{actor:?} must not claim the changed task");
+        assert!(stash.get(&stash::stash_key("OPENAI_API_KEY", identity)).unwrap().is_none(), "{actor:?} must not touch the stash");
+        assert!(db.get_secret("OPENAI_API_KEY", identity).unwrap().is_none(), "{actor:?} must not write metadata");
+        assert!(db.grant_source(&ws.id, "OPENAI_API_KEY", identity).unwrap().is_none(), "{actor:?} must not grant");
+        assert!(db.conn.is_autocommit(), "{actor:?} must release the transaction");
+    }
+    assert!(!project.join(".env.local").exists(), "neither changed card delivers to the env file");
+}
+
+/// The index writer lock begins before `stash.set`: a competing process cannot add a grant
+/// or deny a sibling card in that callback. Success and stash failure both release the lock;
+/// the failure also rolls the claimed task back to pending.
+#[test]
+fn the_store_holds_one_writer_lock_through_stash_set_and_releases_it() {
+    let _g = env_lock();
+    for fail_set in [false, true] {
+        let tag = if fail_set { "failure" } else { "success" };
+        let root = tmp(&format!("store-lock-{tag}"));
+        let db_path = root.join("index.db");
+        let db = Db::open(&db_path).unwrap();
+        let other = Db::open(&db_path).unwrap();
+        other.conn.busy_timeout(std::time::Duration::from_millis(10)).unwrap();
+        let project = root.join("project");
+        let recipient = root.join("recipient");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&recipient).unwrap();
+        let project = project.canonicalize().unwrap();
+        let recipient = recipient.canonicalize().unwrap();
+        let recipient_ws = db.workspace_for(&recipient).unwrap();
+        let cfg = Config::default();
+        let setup_stash = HookStash::new(|| -> anyhow::Result<()> { Ok(()) }, false);
+        let setup = tasks::Ctx { cfg: &cfg, db: &db, stash: &setup_stash, probe: tasks::Probe::Off };
+        let card = tasks::create_secret_task(&setup, &project, "agent", "LOCKED_STORE_KEY", "default", &Default::default()).unwrap();
+        let sibling = tasks::create_secret_task(&setup, &project, "agent", "LOCKED_DENIAL_KEY", "default", &Default::default()).unwrap();
+        let grant_attempt = std::cell::RefCell::new(None::<String>);
+        let denial_attempt = std::cell::RefCell::new(None::<String>);
+        let hook = || -> anyhow::Result<()> {
+            let grant = other.grant(&recipient_ws.id, "LOCKED_STORE_KEY", "default", db::GRANT_KEY, db::GRANT_PAIRING);
+            *grant_attempt.borrow_mut() = Some(match grant { Ok(()) => "succeeded".into(), Err(e) => format!("{e:#}") });
+            let denial = other.close_task_if_open(&sibling.id, db::TaskStatus::Denied, None);
+            *denial_attempt.borrow_mut() = Some(match denial { Ok(v) => format!("succeeded:{v}"), Err(e) => format!("{e:#}") });
+            Ok(())
+        };
+        let stash = HookStash::new(hook, fail_set);
+        let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: &stash, probe: tasks::Probe::Off };
+        let result = tasks::answer_secret_by(&ctx, tasks::Actor::Human, &card, SecretString::from("locked-store-value-1234".to_string()), true);
+
+        assert!(grant_attempt.borrow().as_deref().is_some_and(|e| e.contains("locked")), "competing grant was not blocked: {:?}", *grant_attempt.borrow());
+        assert!(denial_attempt.borrow().as_deref().is_some_and(|e| e.contains("locked")), "competing denial was not blocked: {:?}", *denial_attempt.borrow());
+        assert!(db.conn.is_autocommit(), "{tag}: store must restore autocommit");
+        let stored = stash.get(&stash::stash_key("LOCKED_STORE_KEY", "default")).unwrap();
+        let status = db.get_task(&card.id).unwrap().unwrap().status;
+        if fail_set {
+            assert!(format!("{:#}", result.unwrap_err()).contains("injected stash failure"));
+            assert!(stored.is_none(), "a rejected stash write has no side effect");
+            assert_eq!(status, db::TaskStatus::Pending, "the failed store rolls back its claim");
+            assert!(!project.join(".env.local").exists());
+        } else {
+            result.unwrap();
+            assert!(stored.is_some());
+            assert_eq!(status, db::TaskStatus::Answered);
+            assert!(project.join(".env.local").exists());
+        }
+
+        // Both writes failed only because the first connection held its transaction. Once
+        // the operation returns — success or error — this connection can write immediately.
+        other.grant(&recipient_ws.id, "LOCKED_STORE_KEY", "default", db::GRANT_KEY, db::GRANT_PAIRING).unwrap();
+        assert!(other.close_task_if_open(&sibling.id, db::TaskStatus::Denied, None).unwrap());
+    }
+}
+
+/// A metadata statement can fail after the stash accepted the value. SQLite state rolls
+/// back and returns to autocommit; the external stash side effect remains and no env file is
+/// delivered because injection starts only after a successful commit.
+#[test]
+fn metadata_failure_rolls_back_the_task_and_index_but_not_the_stash() {
+    let root = tmp("store-metadata-failure");
+    let db_path = root.join("index.db");
+    let db = Db::open(&db_path).unwrap();
+    let other = Db::open(&db_path).unwrap();
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    let ws = db.workspace_for(&project).unwrap();
+    let cfg = Config::default();
+    let stash = HookStash::new(|| -> anyhow::Result<()> { Ok(()) }, false);
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: &stash, probe: tasks::Probe::Off };
+    let card = tasks::create_secret_task(&ctx, &project, "agent", "METADATA_FAILURE_KEY", "default", &Default::default()).unwrap();
+    db.conn.execute_batch(
+        "CREATE TRIGGER inject_metadata_failure BEFORE INSERT ON audit
+         WHEN NEW.action = 'store'
+         BEGIN SELECT RAISE(ABORT, 'injected metadata failure'); END;"
+    ).unwrap();
+
+    let err = tasks::answer_secret_by(&ctx, tasks::Actor::Human, &card, SecretString::from("metadata-failure-value-1234".to_string()), true).unwrap_err();
+    assert!(format!("{err:#}").contains("injected metadata failure"), "{err:#}");
+    assert!(db.conn.is_autocommit());
+    assert_eq!(db.get_task(&card.id).unwrap().unwrap().status, db::TaskStatus::Pending);
+    assert!(db.get_secret("METADATA_FAILURE_KEY", "default").unwrap().is_none());
+    assert!(db.grant_source(&ws.id, "METADATA_FAILURE_KEY", "default").unwrap().is_none());
+    assert!(stash.get(&stash::stash_key("METADATA_FAILURE_KEY", "default")).unwrap().is_some(), "the accepted external stash write cannot be rolled back");
+    assert!(!project.join(".env.local").exists());
+    other.audit(None, None, "metadata.failure.lock.released", None, None, None).unwrap();
+}
+
+/// Deferred constraints fail at COMMIT after every metadata statement, including the grant,
+/// succeeded. That failed COMMIT must be followed by ROLLBACK or the task remains answered
+/// and the connection keeps its writer lock indefinitely.
+#[test]
+fn commit_failure_rolls_back_task_and_grant_and_restores_autocommit() {
+    let root = tmp("store-commit-failure");
+    let db_path = root.join("index.db");
+    let db = Db::open(&db_path).unwrap();
+    let other = Db::open(&db_path).unwrap();
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    let ws = db.workspace_for(&project).unwrap();
+    let cfg = Config::default();
+    let stash = HookStash::new(|| -> anyhow::Result<()> { Ok(()) }, false);
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: &stash, probe: tasks::Probe::Off };
+    let card = tasks::create_secret_task(&ctx, &project, "agent", "COMMIT_FAILURE_KEY", "default", &Default::default()).unwrap();
+    db.conn.execute_batch(
+        "PRAGMA foreign_keys=ON;
+         CREATE TABLE deferred_commit_failure (
+             id INTEGER PRIMARY KEY,
+             workspace_id TEXT NOT NULL REFERENCES workspaces(id) DEFERRABLE INITIALLY DEFERRED
+         );
+         CREATE TRIGGER inject_commit_failure AFTER INSERT ON secrets
+         BEGIN INSERT INTO deferred_commit_failure (workspace_id) VALUES ('missing-workspace'); END;"
+    ).unwrap();
+
+    let err = tasks::answer_secret_by(&ctx, tasks::Actor::Human, &card, SecretString::from("commit-failure-value-1234".to_string()), true).unwrap_err();
+    assert!(format!("{err:#}").contains("recording the stored secret"), "{err:#}");
+    assert!(db.conn.is_autocommit(), "failed COMMIT must be followed by ROLLBACK");
+    assert_eq!(db.get_task(&card.id).unwrap().unwrap().status, db::TaskStatus::Pending, "task claim rolled back");
+    assert!(db.get_secret("COMMIT_FAILURE_KEY", "default").unwrap().is_none(), "secret metadata rolled back");
+    assert!(db.grant_source(&ws.id, "COMMIT_FAILURE_KEY", "default").unwrap().is_none(), "grant written before COMMIT rolled back");
+    let deferred_rows: i64 = db.conn.query_row("SELECT COUNT(*) FROM deferred_commit_failure", [], |r| r.get(0)).unwrap();
+    assert_eq!(deferred_rows, 0, "the deferred violation itself rolled back");
+    assert!(stash.get(&stash::stash_key("COMMIT_FAILURE_KEY", "default")).unwrap().is_some(), "SQLite cannot roll back an accepted stash write");
+    assert!(!project.join(".env.local").exists(), "delivery starts only after COMMIT");
+    other.audit(None, None, "commit.failure.lock.released", None, None, None).unwrap();
+}
+
+/// The requester's paste is refused at the operation, with nothing stored, nothing written
+/// and the card still open — whichever surface forgot to hide the button. The refusal is
+/// decided under the index write lock on the grants as they are then, so a grant given in
+/// another directory while the slow provider check ran is seen. A paste the shape or the
+/// provider refuses leaves the card and the stash as they were.
+#[test]
+fn a_requester_cannot_make_a_paste_that_fans_out() {
+    let _g = env_lock();
+    let (home, proj_a) = v2_world("requester-a");
+    let proj_b = tmp("requester-b").canonicalize().unwrap();
+    let cfg = Config::default();
+    let db = Db::open(&home.join("t.db")).unwrap();
+    let stash = stash::open(&cfg).unwrap();
+    let ctx = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Off };
+    pair(&db, &proj_a, "OPENAI_API_KEY");
+    let req = tasks::SecretRequest::default();
+    let card = tasks::create_secret_task(&ctx, &proj_b, "agent", "OPENAI_API_KEY", "default", &req).unwrap();
+    let value = SecretString::from("sk-attacker-chosen-value-1234".to_string());
+    let e = tasks::answer_secret_by(&ctx, tasks::Actor::Requester, &card, value.clone(), true).unwrap_err().to_string();
+    assert!(e.contains("other directories hold this key"), "{e}");
+    assert!(stash.get(&stash::stash_key("OPENAI_API_KEY", "default")).unwrap().is_none(), "nothing stored");
+    assert!(!proj_b.join(".env.local").exists(), "nothing written");
+    assert_eq!(db.get_task(&card.id).unwrap().unwrap().status, db::TaskStatus::Pending, "the card stays open for a person");
+    assert!(db.conn.is_autocommit(), "the lock is released on refusal");
+    // A card that reaches nobody else is the requester's to answer.
+    let own = tasks::create_secret_task(&ctx, &proj_b, "agent", "RESEND_API_KEY", "default", &req).unwrap();
+    tasks::answer_secret_by(&ctx, tasks::Actor::Requester, &own, SecretString::from("re_ownownownown1234".to_string()), true).unwrap();
+    assert!(proj_b.join(".env.local").exists());
+    // The concurrent case: when the requester's paste started, nobody else held
+    // GROQ_API_KEY; while the provider check ran, a person paired directory C with it. The
+    // gate re-reads the grants under the lock after the probe, so the paste is refused.
+    let proj_c = tmp("requester-c").canonicalize().unwrap();
+    let during_probe = Db::open(&home.join("t.db")).unwrap();
+    let ws_c = during_probe.workspace_for(&proj_c).unwrap();
+    let groq = tasks::create_secret_task(&ctx, &proj_b, "agent", "GROQ_API_KEY", "default", &req).unwrap();
+    assert!(!tasks::fans_out(&ctx, &groq).unwrap(), "nobody holds it yet");
+    let grant_during_probe = |_: &registry::Check| {
+        during_probe.grant(&ws_c.id, "GROQ_API_KEY", "default", db::GRANT_KEY, db::GRANT_PAIRING).unwrap();
+        validate::Liveness::Ok
+    };
+    let racing = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Stub(&grant_during_probe) };
+    let e = tasks::answer_secret_by(&racing, tasks::Actor::Requester, &groq, SecretString::from("gsk_racedracedraced1234".to_string()), false).unwrap_err().to_string();
+    assert!(e.contains("other directories hold this key"), "a grant given during the probe is seen: {e}");
+    assert!(stash.get(&stash::stash_key("GROQ_API_KEY", "default")).unwrap().is_none(), "nothing stored");
+    assert_eq!(db.get_task(&groq.id).unwrap().unwrap().status, db::TaskStatus::Pending);
+    // Failed validation, either kind, changes nothing: the card is open, the stash empty.
+    let e = tasks::answer_secret_by(&ctx, tasks::Actor::Requester, &groq, SecretString::from("not-a-groq-key-shape-at-all".to_string()), true).unwrap_err().to_string();
+    assert!(e.contains("does not match the expected pattern"), "{e}");
+    let rejecting = |_: &registry::Check| validate::Liveness::Rejected(401);
+    let rejected = tasks::Ctx { cfg: &cfg, db: &db, stash: stash.as_ref(), probe: tasks::Probe::Stub(&rejecting) };
+    let e = tasks::answer_secret_by(&rejected, tasks::Actor::Human, &groq, SecretString::from("gsk_rejectedrejected1234".to_string()), false).unwrap_err().to_string();
+    assert!(e.contains("rejected this key"), "{e}");
+    assert!(stash.get(&stash::stash_key("GROQ_API_KEY", "default")).unwrap().is_none(), "nothing stored after a refused validation");
+    assert_eq!(db.get_task(&groq.id).unwrap().unwrap().status, db::TaskStatus::Pending);
+    assert!(db.conn.is_autocommit());
+    // A person answers the fanning-out card.
+    tasks::answer_secret_by(&ctx, tasks::Actor::Human, &card, value, true).unwrap();
+    assert!(stash.get(&stash::stash_key("OPENAI_API_KEY", "default")).unwrap().is_some());
+    // ...and once it is answered, a second answer is told so and stores nothing over it.
+    // (The caller still holds the card as it read it, pending; the lock sees the truth.)
+    let e = tasks::answer_secret_by(&ctx, tasks::Actor::Human, &card, SecretString::from("sk-second-answer-value-1234".to_string()), true).unwrap_err().to_string();
+    assert!(e.contains("answered somewhere else"), "{e}");
+    assert_eq!(secrecy::ExposeSecret::expose_secret(&stash.get(&stash::stash_key("OPENAI_API_KEY", "default")).unwrap().unwrap()), "sk-attacker-chosen-value-1234", "the first answer stands");
     std::env::set_var("TOKENSTASH_HOME", base_home()); std::env::remove_var("TOKENSTASH_STASH");
 }
 
