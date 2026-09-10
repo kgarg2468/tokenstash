@@ -16,10 +16,6 @@ use std::path::PathBuf;
 
 const SERVICE: &str = "tokenstash";
 
-/// The keyring service name. The OS store is per user, while every grant and inbox token
-/// is per `TOKENSTASH_HOME`. A process that re-homes tokenstash into a directory it controls
-/// gets an empty stash there, not the real keys under a database it can approve against.
-/// The default home keeps the plain name, so existing entries are untouched.
 /// A path in the form used to decide "same directory": canonical when the directory exists,
 /// otherwise with `.` and `..` resolved lexically (a fresh install has no config dir yet, and
 /// `canonicalize` fails on a path that does not exist).
@@ -38,6 +34,10 @@ fn same_dir_key(p: PathBuf) -> PathBuf {
     out
 }
 
+/// The keyring service name. The OS store is per user, while every grant and inbox token
+/// is per `TOKENSTASH_HOME`. A process that re-homes tokenstash into a directory it controls
+/// gets an empty stash there, not the real keys under a database it can approve against.
+/// The default home keeps the plain name, so existing entries are untouched.
 pub(crate) fn service() -> String {
     // Both sides canonical: `TOKENSTASH_HOME` spelled through a symlink or a `..` is still
     // the default home, and must not turn into an empty namespace whose index (per home)

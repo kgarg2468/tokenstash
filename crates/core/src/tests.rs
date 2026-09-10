@@ -1298,7 +1298,7 @@ fn an_ordinary_card_answered_after_a_stale_mark_elsewhere_does_not_propagate() {
 
 
 // ---------------------------------------------------------------------------------------
-// verify-on-use (§14.7)
+// verify-on-use: a stored key is re-checked with its provider before delivery, when due
 
 fn verify_setup(tag: &str) -> (PathBuf, PathBuf) {
     let home = tmp(&format!("verify-{tag}-home"));
@@ -1750,7 +1750,7 @@ fn skipping_the_check_on_an_uncheckable_key_does_not_flag_it() {
 
 
 // ---------------------------------------------------------------------------------------
-// trust v2 (§13.1 / §13.5)
+// trust v2: nothing is trusted by folder; each directory pairs once, per key
 
 fn v2_world(tag: &str) -> (PathBuf, PathBuf) {
     let home = tmp(&format!("v2-{tag}-home"));
@@ -2181,8 +2181,8 @@ fn a_paste_into_a_re_created_directory_does_not_wipe_the_old_record() {
 }
 
 // ---------------------------------------------------------------------------
-// Pre-launch hardening. Each test below is a defect a reviewer found before the
-// first public release; the comment on each says what breaks without the fix.
+// Regressions. Each test below pins a defect fixed before the first public release;
+// the comment on each says what breaks without the fix.
 // ---------------------------------------------------------------------------
 
 /// A generated secret belongs to the project that generated it. Shared, one directory

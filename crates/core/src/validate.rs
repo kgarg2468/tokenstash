@@ -162,8 +162,8 @@ pub fn looks_like_secret(text: &str) -> bool {
     single_token && long(t) && !is_url_or_path
 }
 
-/// RFC 3986 unreserved characters pass; everything else is `%XX`. A key with `&` or `#`
-/// used to be sent truncated and reported "rejected" at paste time.
+/// RFC 3986 unreserved characters pass; everything else is `%XX`. Sent raw, a key with `&`
+/// or `#` would reach the provider truncated and be reported "rejected" at paste time.
 pub(crate) fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {

@@ -886,8 +886,9 @@ fn page_task(t: &Task, err: Option<&str>, flash: Option<&str>, token: &str, scop
             ));
         }
         TaskKind::Approval => {
-            // Rule 12: the card shows the canonical path, what kind of decision this is,
-            // the exact destination file, and every key with its identity and sensitivity.
+            // The human is approving a delivery, so the card must show everything that
+            // decision covers: the canonical path, what kind of decision this is, the
+            // exact destination file, and every key with its identity and sensitivity.
             let kind = match t.expects.as_str() { tasks::APPROVAL_PAIRING => "new directory — first stored keys", tasks::APPROVAL_SENSITIVE => "sensitive / unregistered keys — each its own decision", tasks::APPROVAL_ONCE => "chosen by a running program — this run only", _ => "approval" };
             b.push_str(&format!("<p class=mut>Directory: <code>{}</code><br>Decision: {}<br>Written to: <code>{}</code></p>", esc(&t.project), esc(kind), esc(&std::path::Path::new(&t.project).join(env_file).display().to_string())));
             let rows: Vec<String> = t.names.iter().filter(|n| n.as_str() != "*").map(|entry| {

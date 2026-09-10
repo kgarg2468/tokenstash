@@ -706,9 +706,6 @@ impl Db {
         Ok(rows)
     }
 
-    /// Open secret task for this project+name+identity, if any (avoid duplicate tasks).
-    /// Identity is part of the key: `OPENAI_API_KEY@work` and `@personal` are different
-    /// requests and must never share a task.
     /// The open human task with this title in this project, if any: a blocking caller that
     /// re-issues its request must not file a second card.
     pub fn open_human_tasks(&self, project: &str, title: &str, expects: &str) -> Result<Vec<Task>> {
@@ -718,6 +715,9 @@ impl Db {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Open secret task for this project+name+identity, if any (avoid duplicate tasks).
+    /// Identity is part of the key: `OPENAI_API_KEY@work` and `@personal` are different
+    /// requests and must never share a task.
     pub fn open_secret_task(&self, project: &str, name: &str, identity: &str) -> Result<Option<Task>> {
         let sql = format!(
             "SELECT {} FROM tasks WHERE kind='secret' AND status='pending' AND project=?1 AND name=?2 AND identity=?3 ORDER BY created DESC",
@@ -757,9 +757,6 @@ impl Db {
         Ok(n == 1)
     }
 
-    /// Undo a claim that could not be completed. The card is claimed before the value is
-    /// stored (so a racing answer cannot overwrite the winner); if storing then fails,
-    /// leaving the card "answered" would tell the human it is done when nothing was kept.
     /// Claim the one desktop notification a card gets: true the first time, false after. A
     /// polling agent re-runs `need` every few seconds and the card is reused; the human's
     /// attention is not.
@@ -767,6 +764,9 @@ impl Db {
         Ok(self.conn.execute("UPDATE tasks SET notified=?2 WHERE id=?1 AND notified IS NULL", params![id, crate::now()])? == 1)
     }
 
+    /// Undo a claim that could not be completed. The card is claimed before the value is
+    /// stored (so a racing answer cannot overwrite the winner); if storing then fails,
+    /// leaving the card "answered" would tell the human it is done when nothing was kept.
     pub fn reopen_task(&self, id: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE tasks SET status='pending', answered_at=NULL WHERE id=?1 AND status='answered'",

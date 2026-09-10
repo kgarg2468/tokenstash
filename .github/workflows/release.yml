@@ -32,7 +32,7 @@ jobs:
           cargo=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
           [ "$base" = "$cargo" ] || { echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo"; exit 1; }
           # The same pre-release grammar PyPI accepts (scripts/pypi-wheels.py): a suffix that
-          # passed here and failed there used to leave a half-published release.
+          # passes here and fails there would leave a half-published release.
           case "$tag" in
             *-*) echo "$tag" | grep -Eq -- '-(rc|a|b|alpha|beta)\.[0-9]+$' || { echo "pre-release tag must end in -rc.N, -a.N, -b.N, -alpha.N or -beta.N"; exit 1; } ;;
           esac

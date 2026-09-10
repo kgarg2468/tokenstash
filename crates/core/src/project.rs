@@ -19,7 +19,7 @@ pub fn current() -> PathBuf {
 pub fn detect_agent() -> String {
     if let Ok(a) = std::env::var("TOKENSTASH_AGENT") {
         // Every path that puts the name on a card or a notification must see the same
-        // filtered string; `run` and `report-bad` used to take it raw.
+        // filtered string, so the filter is applied here, at the one place the name is read.
         return crate::need::clean_agent(&a);
     }
     let has = |k: &str| std::env::var_os(k).is_some();

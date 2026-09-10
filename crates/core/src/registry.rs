@@ -45,8 +45,6 @@ pub struct Provider {
     /// Where to sign up / create the key.
     pub url: String,
     #[serde(default)]
-    pub dashboard: Option<String>,
-    #[serde(default)]
     pub steps: Vec<String>,
     /// Regex the value must match.
     #[serde(default)]
@@ -59,9 +57,6 @@ pub struct Provider {
     pub sensitive_pattern: Option<String>,
     #[serde(default)]
     pub check: Option<Check>,
-    /// Other env vars that usually travel with this one.
-    #[serde(default)]
-    pub companions: Vec<String>,
     /// Local secrets that need no human: "base64:32" | "hex:32".
     #[serde(default)]
     pub generate: Option<String>,
@@ -96,8 +91,7 @@ pub fn count() -> usize {
 
 /// Is this value sensitive for its provider: tagged as such, or matching the provider's
 /// `sensitive_pattern` (a live Stripe key beside a test one). One answer for the paste path,
-/// the index, the crawl and the bundle; four hand-rolled copies used to disagree on what a
-/// bad pattern meant.
+/// the index, the crawl and the bundle, so they cannot disagree on what a bad pattern means.
 pub fn is_sensitive(p: Option<&Provider>, value: &secrecy::SecretString) -> anyhow::Result<bool> {
     let Some(p) = p else { return Ok(false) };
     if p.sensitive {

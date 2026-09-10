@@ -51,10 +51,6 @@ pub fn write_atomic_private_bytes(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Cross-process mutual exclusion for read-modify-write of a private file, via an OS
-/// advisory lock on a sibling `<name>.lock`. The kernel releases it when the holder exits
-/// or dies, so there is no stale-lock heuristic and a live (even suspended) holder is
-/// never preempted — contenders simply wait.
 /// Serialise writers of a file we must not litter next to. `with_lock` puts the lock
 /// beside its target, which is right for tokenstash's own files but wrong for a file inside
 /// the user's project: `.env.lock` would show up in their working tree (and, unlike the env
@@ -73,6 +69,10 @@ pub fn with_lock_elsewhere<T>(target: &Path, f: impl FnOnce() -> Result<T>) -> R
     with_lock(&dir.join(format!("{:x}", digest)), f)
 }
 
+/// Cross-process mutual exclusion for read-modify-write of a private file, via an OS
+/// advisory lock on a sibling `<name>.lock`. The kernel releases it when the holder exits
+/// or dies, so there is no stale-lock heuristic and a live (even suspended) holder is
+/// never preempted — contenders simply wait.
 pub fn with_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
     let lock_path = path.with_extension("lock");
     let mut opts = fs::OpenOptions::new();

@@ -54,7 +54,7 @@ def metadata(version, readme):
         "Metadata-Version: 2.1\n"
         f"Name: {NAME}\n"
         f"Version: {version}\n"
-        "Summary: Your agent asks you for a key once. Never again - in any project, in any agent.\n"
+        "Summary: Credential broker for coding agents: paste a key once, approve each directory, keep secrets out of status output.\n"
         "Home-page: https://github.com/kgarg2468/tokenstash\n"
         "Author: Krish Garg\n"
         "License: MIT\n"

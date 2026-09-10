@@ -18,7 +18,7 @@ sum() { awk '{print $1}' "$tmp/tokenstash-$1.tar.gz.sha256"; }
 base="https://github.com/$repo/releases/download/$tag"
 cat <<RUBY
 class Tokenstash < Formula
-  desc "Your agent asks you for a key once. Never again - in any project, in any agent."
+  desc "Credential broker for coding agents: paste a key once, approve each directory, keep secrets out of status output"
   homepage "https://github.com/$repo"
   version "$version"
   license "MIT"

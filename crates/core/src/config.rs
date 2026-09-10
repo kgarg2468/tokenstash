@@ -142,7 +142,8 @@ pub fn default_config_dir() -> PathBuf {
 pub fn config_path() -> PathBuf { config_dir().join("config.toml") }
 
 /// Somewhere to keep state, or a clear error. Without `$HOME`, an XDG config dir or
-/// `TOKENSTASH_HOME` (a container, a bare systemd unit) every command used to panic.
+/// `TOKENSTASH_HOME` (a container, a bare systemd unit) there is nowhere to write, and
+/// every command must say so rather than panic.
 pub fn require_home() -> Result<()> {
     if std::env::var("TOKENSTASH_HOME").map(|v| !v.is_empty()).unwrap_or(false) || dirs::config_dir().is_some() || dirs::home_dir().is_some() {
         return Ok(());

@@ -10,7 +10,7 @@ concurrency:
 jobs:
   test:
     # Linux and macOS: the shipped platforms. The macOS-only code (apple-native keyring,
-    # birth-time fingerprints) used to be compiled for the first time by the release run.
+    # birth-time fingerprints) must compile on every PR, not for the first time in the release run.
     strategy:
       fail-fast: false
       matrix:

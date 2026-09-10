@@ -1,4 +1,4 @@
-//! tokenstash — Your agent asks you for a key once. Never again.
+//! tokenstash — Paste a key once. Approve each directory. Keep secrets out of status output.
 
 mod cmd;
 mod inbox_auth;
@@ -9,8 +9,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "tokenstash", version, about = "Your agent asks you for a key once. Never again — in any project, in any agent.")]
-#[command(long_about = "Agents run `tokenstash need NAME`. If the key is in your stash it is written to the project's env file instantly.\nIf not, a task is filed for you: you acquire the key yourself (own account, own signup), paste it once, and the agent resumes.\nSecret values are never printed, never returned to the agent, never logged.")]
+#[command(name = "tokenstash", version, about = "Paste a key once. Approve each directory. Keep secrets out of status output.")]
+#[command(long_about = "Agents run `tokenstash need NAME`. If the key is in your stash and this directory is approved for it, it is written to the project's env file.\nIf not, a task is filed for you: you acquire the key yourself (own account, own signup), paste it once, and the agent resumes.\nA normal delivery writes the value to the env file and returns status (exit code, key name, file) without echoing the value.\nNotes you type on a card are returned to the agent as text; they are not a place to paste a credential.")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -42,7 +42,8 @@ enum Cmd {
     Import(cmd::bundle::ImportArgs),
     /// Bind a secret name to an identity for this project (work vs personal).
     Bind(cmd::admin::BindArgs),
-    /// Retired in 0.2 (directories pair once instead); `trust rm` tidies old config.
+    /// Deprecated since 0.2 (directories pair once instead); kept so `trust rm` can tidy old config.
+    #[command(hide = true)]
     Trust(cmd::admin::TrustArgs),
     /// Paired directories and what each may receive; revoke or forget one. For a person at a terminal.
     Workspaces(cmd::admin::WorkspacesArgs),
