@@ -3,6 +3,7 @@
 //! from another. Malformed framing is answered, never fatal.
 
 use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver};
@@ -15,9 +16,15 @@ fn tmp(name: &str) -> PathBuf {
     p.canonicalize().unwrap()
 }
 
+/// A port nothing holds right now. Tests in one binary run in parallel, and two scratch homes
+/// on one port each see the other's inbox as foreign; the name-derived ports collided.
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
 fn home(name: &str) -> PathBuf {
     let h = tmp(name);
-    let port = 31000 + (std::process::id() % 15000) as u16 + (name.len() as u16 % 40);
+    let port = free_port();
     std::fs::write(h.join("config.toml"), format!("notifications = false\ninbox_port = {port}\nstash_backend = \"insecure-file\"\nverify_every = \"never\"\n")).unwrap();
     h
 }

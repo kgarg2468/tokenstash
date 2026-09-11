@@ -1,6 +1,7 @@
 //! The commands that widen an agent's reach refuse when they cannot see a person: stdout is
 //! a pipe here, which is what an agent's shell looks like.
 use std::io::Write;
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -14,9 +15,15 @@ fn tmp(name: &str) -> PathBuf {
 /// A scratch home: no notifications, an inbox port nobody else uses. Without this the child
 /// runs with `Config::default()` and a pending card spawns a real inbox on the developer's
 /// port 7433 that stays up for a day.
+/// A port nothing holds right now. Tests in one binary run in parallel, and two scratch homes
+/// on one port each see the other's inbox as foreign; the name-derived ports collided.
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
 fn home(name: &str) -> PathBuf {
     let h = tmp(name);
-    let port = 30000 + (std::process::id() % 20000) as u16 + (name.len() as u16 % 50) + 7;
+    let port = free_port();
     std::fs::write(h.join("config.toml"), format!("notifications = false\ninbox_port = {port}\nstash_backend = \"insecure-file\"\nverify_every = \"never\"\n")).unwrap();
     h
 }

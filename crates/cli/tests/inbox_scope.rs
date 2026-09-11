@@ -7,6 +7,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -16,6 +17,12 @@ fn tmp(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).unwrap();
     p
+}
+
+/// A port nothing holds right now. Tests in one binary run in parallel, and two scratch homes
+/// on one port each see the other's inbox as foreign; the name-derived ports collided.
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
 fn home(name: &str, port: u16) -> PathBuf {
@@ -117,7 +124,7 @@ fn env_has(project: &Path, line: &str) -> bool {
 
 #[test]
 fn a_card_link_opens_its_card_and_nothing_else() {
-    let port = 31000 + (std::process::id() % 15000) as u16 + 3;
+    let port = free_port();
     let home = home("scope-home", port);
     let proj_a = tmp("scope-a");
     let proj_b = tmp("scope-b");
