@@ -3,6 +3,8 @@
 use crate::registry::Check;
 use anyhow::Result;
 use secrecy::{ExposeSecret, SecretString};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::time::Duration;
 
 pub fn matches_pattern(pattern: &str, value: &SecretString) -> Result<bool> {
@@ -44,14 +46,57 @@ pub const TIMEOUT_AT_USE: Duration = Duration::from_secs(4);
 /// origin the 3xx names, and strips Authorization so a redirected bearer probe would 401 on
 /// a live key. A 3xx is therefore Unknown too.
 pub fn liveness(check: &Check, value: &SecretString, timeout: Duration) -> Liveness {
+    // `timeout` is a promise to the caller, and on the agent's hot path that caller is `need`.
+    // ureq cannot keep it alone: its connect timeout defaults to 30 seconds and wins over the
+    // request deadline, name resolution has no bound, and rustls finishes a handshake with
+    // socket timeouts set once, so a peer that trickles bytes holds it open. The request runs
+    // on a worker instead, and the caller stops waiting at the deadline whatever phase it is in.
+    if IN_FLIGHT.fetch_add(1, Ordering::SeqCst) >= MAX_IN_FLIGHT {
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        return Liveness::Unknown("too many provider checks already waiting".into());
+    }
+    let (tx, rx) = mpsc::channel();
+    let (check, value) = (check.clone(), SecretString::from(value.expose_secret().to_string()));
+    let spawned = std::thread::Builder::new().name("tokenstash-probe".into()).spawn(move || {
+        let _slot = Slot;
+        let _ = tx.send(probe_once(&check, &value, timeout));
+    });
+    if spawned.is_err() {
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        return Liveness::Unknown("could not start the provider check".into());
+    }
+    rx.recv_timeout(timeout).unwrap_or_else(|_| Liveness::Unknown("provider check timed out".into()))
+}
+
+/// Probes in flight in this process, counted until each worker actually exits. A worker whose
+/// request is stuck keeps its slot, so a network that never answers costs at most
+/// `MAX_IN_FLIGHT` threads; past that a probe is Unknown at once, and Unknown delivers the key
+/// unverified exactly as any other failed check does.
+static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+const MAX_IN_FLIGHT: usize = 8;
+
+struct Slot;
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The one request, on the worker `liveness` waits for.
+fn probe_once(check: &Check, value: &SecretString, timeout: Duration) -> Liveness {
     // The registry is compiled in and a test asserts every check URL is https, but this is
     // the line the secret actually crosses, so it asserts it too: a plain-http probe would
     // put the key on the wire in clear. Cheap, and it holds for whatever edits the file.
     if !url_is_safe_for_a_secret(&check.url) {
         return Liveness::Unknown("provider check URL is not https; refusing to send the key".into());
     }
+    // `timeout_connect` too: otherwise ureq's 30-second connect default wins over the request
+    // deadline, and a worker `liveness` has stopped waiting for would hold a socket, and its
+    // slot, for half a minute.
     let agent = ureq::AgentBuilder::new()
         .timeout(timeout)
+        .timeout_connect(timeout)
         .redirects(0)
         .user_agent(concat!("tokenstash-liveness/", env!("CARGO_PKG_VERSION")))
         .build();
