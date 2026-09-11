@@ -244,7 +244,12 @@ jobs:
             done
             if [ -z "$ok" ]; then echo "$url does not download anonymously; the tap is left as it was"; exit 1; fi
           done
-          auth="AUTHORIZATION: bearer $TAP_TOKEN"
+          # GitHub's git endpoint takes a token as basic auth (what actions/checkout sends). A bearer
+          # header is refused even for a valid token, and git then falls back to asking for a
+          # username: v0.2.0's tap push failed exactly there, after the release was live.
+          b64=$(printf 'x-access-token:%s' "$TAP_TOKEN" | base64 -w0)
+          echo "::add-mask::$b64"
+          auth="AUTHORIZATION: basic $b64"
           git -c http.extraheader="$auth" clone -q --depth 1 https://github.com/kgarg2468/homebrew-tokenstash.git /tmp/tap
           mkdir -p /tmp/tap/Formula && cp /tmp/formula/tokenstash.rb /tmp/tap/Formula/tokenstash.rb
           cd /tmp/tap && git add Formula/tokenstash.rb
