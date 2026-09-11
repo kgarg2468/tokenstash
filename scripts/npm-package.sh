@@ -42,11 +42,17 @@ same_package() { # <pkg dir>
 # different paths — so the final check gives each package up to two minutes to appear before
 # judging it. A package that is there and differs still fails; it just fails after the wait.
 settled() { # <pkg dir>
-  local i
+  local i url
   for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
     same_package "$1" && return 0
-    sleep 10
+    if [ "$i" -lt 12 ]; then sleep 10; fi
   done
+  # Two different failures read the same from here; say which one this was.
+  if url=$(npm view "$name@$version" dist.tarball 2>/dev/null) && [ -n "$url" ]; then
+    echo "$name@$version is on the registry ($url) but does not match what we built, or could not be compared" >&2
+  else
+    echo "$name@$version did not appear on the registry within two minutes" >&2
+  fi
   return 1
 }
 publish() { # <pkg dir>
