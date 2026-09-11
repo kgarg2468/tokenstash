@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 320" width="880" height="320" role="img" aria-labelledby="t d">
   <title id="t">Where your key goes, and what your agent gets</title>
-  <desc id="d">The key: you paste it on a page on localhost, it is stored in your OS keychain, written to your project's .env.local (mode 0600, gitignored), and your app reads it. What your agent gets: a status line such as OPENAI_API_KEY injected to .env.local and exit code 0, never the value, and nothing in the chat. It is not a sandbox: an agent with a shell in the folder can still read the file.</desc>
+  <desc id="d">The key: you paste it on a page on localhost, it is stored in your OS keychain, written to your project's .env.local (mode 0600, gitignored), and your app loads it. What your agent gets from delivery: a status line such as OPENAI_API_KEY injected to .env.local and exit code 0, with no key value in it. It is not a sandbox: an agent with a shell in the folder can still read the file.</desc>
   <defs>
     <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
   </defs>
@@ -55,7 +55,7 @@
 
   <rect class="box" x="676" y="44" width="180" height="64" rx="8"/>
   <text class="h" x="766" y="71" text-anchor="middle">Your app</text>
-  <text class="s" x="766" y="92" text-anchor="middle">reads it when it starts</text>
+  <text class="s" x="766" y="92" text-anchor="middle">loads it at runtime</text>
 
   <line class="div" x1="24" y1="148" x2="856" y2="148"/>
 
@@ -67,7 +67,7 @@
 
   <rect class="box" x="236" y="192" width="408" height="64" rx="8"/>
   <text class="h mono" x="256" y="219"><tspan class="okt">✓</tspan> OPENAI_API_KEY injected → .env.local</text>
-  <text class="s" x="256" y="240">exit 0 · a status line, never the value · nothing in the chat</text>
+  <text class="s" x="256" y="240">exit 0 · a status line with no key value in it</text>
 
   <rect class="note" x="676" y="192" width="180" height="64" rx="8"/>
   <text class="h" x="766" y="216" text-anchor="middle">Not a sandbox</text>
