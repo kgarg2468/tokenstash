@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 300" width="880" height="300" role="img" aria-labelledby="t d">
   <title id="t">One key, many folders</title>
-  <desc id="d">OPENAI_API_KEY is stored once in your OS keychain. The folder where you pasted it has it. Another folder asked once, you approved it on a page on localhost, and it is quiet from then on. A third folder has not asked yet and will get one approval when it does. Sensitive keys ask for each folder separately.</desc>
+  <desc id="d">OPENAI_API_KEY is stored once in your OS keychain. The folder where you pasted it has it. Another folder asked once, you approved it in the inbox on localhost, and it is quiet for this key from then on. A third folder has not asked yet and will get one approval when it does. Sensitive keys ask for each folder separately.</desc>
   <defs>
     <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
   </defs>
@@ -63,7 +63,7 @@
   <path class="fold" d="M352,130 h9 l3,4 h13 v18 h-25 z"/>
   <text class="h mono" x="390" y="135">~/code/landing-page</text>
   <circle class="ok" cx="398" cy="155" r="7"/><path d="M394.8,155.3 l2.2,2.2 l4.2,-4.6" fill="none" stroke="#FFFFFF" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
-  <text class="s" x="412" y="159"><tspan class="okt">approved once</tspan> · on a page on localhost, then quiet from then on</text>
+  <text class="s" x="412" y="159"><tspan class="okt">approved once</tspan> · in the inbox on localhost, then quiet for this key</text>
 
   <!-- folder 3 -->
   <rect class="box" x="334" y="186" width="522" height="64" rx="8"/>
@@ -72,5 +72,5 @@
   <g transform="translate(398,233)"><circle r="6.5" fill="none" class="wt" stroke-width="1.6"/><path d="M0,-3.4 V0 L2.6,1.6" fill="none" class="wt" stroke-width="1.4" stroke-linecap="round"/></g>
   <text class="s" x="412" y="237"><tspan class="wtt">not yet</tspan> · gets one approval the first time it asks</text>
 
-  <text class="s" x="440" y="280" text-anchor="middle">Sensitive keys (live Stripe, AWS, deploy and package-registry tokens) ask for each folder separately.</text>
+  <text class="s" x="440" y="280" text-anchor="middle">Sensitive keys (live Stripe secret keys, AWS, deploy and package-registry tokens) ask for each folder separately.</text>
 </svg>
