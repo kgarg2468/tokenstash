@@ -104,21 +104,18 @@ tokenstash doctor                               # check the setup
 
 ## Uninstall
 
-```bash
-tokenstash init --undo           # remove tokenstash from the agents init set up
-brew uninstall tokenstash        # or: npm uninstall -g tokenstash · uv tool uninstall tokenstash · pipx uninstall tokenstash
-```
-
-`init --undo` puts back the agent config files `init` changed, from the copies it saved at the time, and deletes the files it created. An edit you made to one of those files since `init` (another MCP server added to Cursor, say) is lost with it, so check them first.
+1. **Take tokenstash out of your agents:** `tokenstash init --undo`. It puts back the agent config files `init` changed, from the copies it saved at the time, and deletes the files it created. An edit you made to one of those files since `init` (another MCP server added to Cursor, say) is lost with it, so check them first.
+2. **Optionally, remove your stored keys and data**: expand the section below. Do this after step 1, since the data directory holds the copies `init --undo` restores from.
+3. **Remove the program:** `brew uninstall tokenstash`, or `npm uninstall -g tokenstash`, `uv tool uninstall tokenstash`, `pipx uninstall tokenstash`.
 
 <details>
-<summary><strong>Remove stored keys and all data too</strong></summary>
+<summary><strong>Remove stored keys and all data</strong></summary>
 
-Before uninstalling:
+Do this for the default data directory and for every `TOKENSTASH_HOME` you have used; each one has its own keychain entries.
 
-1. Run `tokenstash list`. It shows every stored key with its identity; generated secrets like `AUTH_SECRET` have one identity per folder. Remove each with `tokenstash forget NAME --identity IDENTITY`.
-2. Close your agent sessions. A background `tokenstash inbox` exits on its own once nothing is waiting.
-3. Delete the data directory: `~/.config/tokenstash` on Linux (`$XDG_CONFIG_HOME/tokenstash` if you set it), `~/Library/Application Support/tokenstash` on macOS. That is also where `init` keeps its backups (`init-backups/`). If you set `TOKENSTASH_HOME`, delete that directory as well.
+1. Run `tokenstash list` (with `TOKENSTASH_HOME` set, for a custom one). It shows every stored key with its identity; generated secrets like `AUTH_SECRET` have one identity per folder. Remove each with `tokenstash forget NAME --identity IDENTITY`.
+2. Close your agent sessions and stop any tokenstash still running, for example with `pkill -x tokenstash`. A background inbox only exits on its own after 30 idle minutes with nothing waiting, and never if it was started with `--keep`.
+3. Delete the data directory: `~/.config/tokenstash` on Linux (`$XDG_CONFIG_HOME/tokenstash` if you set it), `~/Library/Application Support/tokenstash` on macOS, and any `TOKENSTASH_HOME` directory you used.
 
 Keys already written into projects' `.env.local` files stay there until you delete them.
 
