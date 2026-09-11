@@ -2620,6 +2620,11 @@ fn a_workspace_fingerprint_compares_more_than_the_inode() {
 /// first key while both calls report success.
 #[test]
 fn concurrent_writes_keep_every_key() {
+    // The writers take their lock under config_dir()/locks, and config_dir() follows
+    // TOKENSTASH_HOME, which locked tests set to homes of their own. Unlocked, writers started
+    // while another test had swapped it could hold different lock files, and two at once
+    // collided on the temp file ("creating ..env.local.tokenstash-<pid>.tmp: File exists").
+    let _g = env_lock();
     let dir = tmp("concurrent-env").canonicalize().unwrap();
     let names: Vec<String> = (0..12).map(|i| format!("K{i}")).collect();
     let handles: Vec<_> = names.iter().cloned().map(|name| {
