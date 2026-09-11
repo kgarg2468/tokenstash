@@ -3241,3 +3241,64 @@ fn a_query_probe_transport_error_contains_no_credential_or_url() {
         other => panic!("expected transport failure, got {other:?}"),
     }
 }
+
+/// The probe's timeout is a promise to the caller, whatever phase the request is in. This
+/// provider completes the TCP handshake, opens a TLS record and trickles it a byte at a time:
+/// rustls keeps reading, and each byte restarts the socket timeouts ureq set. The caller must
+/// still have its answer at the deadline.
+#[test]
+fn a_provider_that_trickles_its_tls_handshake_costs_the_probe_timeout() {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("https://127.0.0.1:{}/probe", l.local_addr().unwrap().port());
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let Ok((mut s, _)) = l.accept() else { return };
+        let mut hello = [0u8; 4096];
+        let _ = s.read(&mut hello);
+        // A handshake record announcing 16 KiB, then one byte every 100 ms for up to 30 s.
+        if s.write_all(&[0x16, 0x03, 0x03, 0x40, 0x00]).is_err() {
+            return;
+        }
+        for _ in 0..300 {
+            if stop_rx.try_recv().is_ok() || s.write_all(&[0]).is_err() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+    let v = SecretString::from("sk-probe-value-000000000000".to_string());
+    let started = std::time::Instant::now();
+    let verdict = validate::liveness(&check_for(&url, "bearer"), &v, std::time::Duration::from_secs(1));
+    let took = started.elapsed();
+    let _ = stop_tx.send(());
+    assert_eq!(verdict, validate::Liveness::Unknown("provider check timed out".into()));
+    assert!(took < std::time::Duration::from_secs(3), "{took:?}");
+}
+
+/// ...and one that takes the request and never answers costs the same. The listener reports
+/// what it received, so an unrelated early failure cannot pass for this.
+#[test]
+fn a_silent_provider_costs_the_probe_timeout_and_no_more() {
+    use std::io::Read;
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}/probe", l.local_addr().unwrap().port());
+    let (got_tx, got_rx) = std::sync::mpsc::channel::<String>();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let Ok((mut s, _)) = l.accept() else { return };
+        let mut buf = [0u8; 4096];
+        let n = s.read(&mut buf).unwrap_or(0);
+        let _ = got_tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+        let _ = stop_rx.recv_timeout(std::time::Duration::from_secs(30));
+    });
+    let v = SecretString::from("sk-probe-value-000000000000".to_string());
+    let started = std::time::Instant::now();
+    let verdict = validate::liveness(&check_for(&url, "bearer"), &v, std::time::Duration::from_secs(1));
+    let took = started.elapsed();
+    let _ = stop_tx.send(());
+    assert!(matches!(verdict, validate::Liveness::Unknown(_)), "{verdict:?}");
+    assert!(took < std::time::Duration::from_secs(3), "{took:?}");
+    let req = got_rx.recv_timeout(std::time::Duration::from_secs(1)).expect("the request reached the provider");
+    assert!(req.starts_with("GET /probe"), "{req}");
+}
