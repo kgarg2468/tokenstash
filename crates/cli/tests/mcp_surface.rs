@@ -99,16 +99,21 @@ fn no_tool_result_ever_contains_a_value() {
     let proj = tmp("secrecy-proj");
     let canary = "sk-mcpcanary-9f2b1c7d4e6a8b0c";
     seed(&home, &proj, "OPENAI_API_KEY", canary);
+    // A report is confirmed with the provider before it changes anything, so reporting a key
+    // that has a probe sends it to the real provider. EXA_API_KEY has none: this test must
+    // never depend on, or talk to, the internet.
+    let reported = "exa-mcpcanary-3c5e7a9b1d2f4e6a";
+    seed(&home, &proj, "EXA_API_KEY", reported);
 
     let mut c = Client::start(&home, &proj);
     let mut seen = String::new();
     seen.push_str(&c.call(2, "secrets_request", serde_json::json!({ "secrets": [{ "name": "OPENAI_API_KEY", "why": "test" }] })).to_string());
     seen.push_str(&c.call(3, "secrets_list", serde_json::json!({})).to_string());
     seen.push_str(&c.call(4, "task_list", serde_json::json!({})).to_string());
-    seen.push_str(&c.call(5, "secrets_report_invalid", serde_json::json!({ "name": "OPENAI_API_KEY", "message": canary })).to_string());
+    seen.push_str(&c.call(5, "secrets_report_invalid", serde_json::json!({ "name": "EXA_API_KEY", "message": canary })).to_string());
     seen.push_str(&c.call(6, "human_request", serde_json::json!({ "title": "check something", "expects": "confirm" })).to_string());
 
-    assert!(!seen.contains(canary), "a value reached the agent: {seen}");
+    assert!(!seen.contains(canary) && !seen.contains(reported), "a value reached the agent: {seen}");
     // ...and the delivery really happened: the value is in the env file and nowhere else.
     let env = std::fs::read_to_string(proj.join(".env.local")).unwrap();
     assert!(env.contains(canary), "the key was delivered to the project");
