@@ -113,9 +113,11 @@ tokenstash doctor                               # check the setup
 
 Do this for the default data directory and for every `TOKENSTASH_HOME` you have used; each one has its own keychain entries.
 
-1. Run `tokenstash list`, with `TOKENSTASH_HOME` set for a custom home and kept set for the next command. It shows every stored key with its identity; generated secrets like `AUTH_SECRET` have one identity per folder. Remove each with `tokenstash forget NAME --identity IDENTITY`.
+1. Run `tokenstash list`, with `TOKENSTASH_HOME` set for a custom home and kept set for the next command. It shows every key in that home's index, with its identity; generated secrets like `AUTH_SECRET` have one identity per folder. Remove each with `tokenstash forget NAME --identity IDENTITY`.
 2. Stop any program you started with `tokenstash run`, close your agent sessions, then stop any tokenstash still running, for example with `pkill -x tokenstash` (which stops it for every home). A background inbox only exits on its own after 30 idle minutes with nothing waiting, and never if it was started with `--keep`.
 3. Delete the data directory: `~/.config/tokenstash` on Linux (`$XDG_CONFIG_HOME/tokenstash` if you set it), `~/Library/Application Support/tokenstash` on macOS, and any `TOKENSTASH_HOME` directory you used.
+
+`list` reads the index in the data directory, so a key whose index is gone (you deleted the directory first, say) doesn't show up. To catch those, look in the OS store itself for entries named `tokenstash`, or `tokenstash-` and eight hex characters for a custom home. On macOS, search for `tokenstash` in Keychain Access. On Linux, search in Passwords and Keys (Seahorse), or run `secret-tool clear service tokenstash` for the default home. If `tokenstash doctor` shows the `keyutils` backend, the keys are in the kernel keyring and are gone after a reboot.
 
 Keys already written into projects' `.env.local` files stay there until you delete them.
 
