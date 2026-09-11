@@ -3251,6 +3251,7 @@ fn a_provider_that_trickles_its_tls_handshake_costs_the_probe_timeout() {
     use std::io::{Read, Write};
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("https://127.0.0.1:{}/probe", l.local_addr().unwrap().port());
+    let (trickling_tx, trickling_rx) = std::sync::mpsc::channel::<()>();
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
         let Ok((mut s, _)) = l.accept() else { return };
@@ -3260,6 +3261,7 @@ fn a_provider_that_trickles_its_tls_handshake_costs_the_probe_timeout() {
         if s.write_all(&[0x16, 0x03, 0x03, 0x40, 0x00]).is_err() {
             return;
         }
+        let _ = trickling_tx.send(());
         for _ in 0..300 {
             if stop_rx.try_recv().is_ok() || s.write_all(&[0]).is_err() {
                 return;
@@ -3272,12 +3274,13 @@ fn a_provider_that_trickles_its_tls_handshake_costs_the_probe_timeout() {
     let verdict = validate::liveness(&check_for(&url, "bearer"), &v, std::time::Duration::from_secs(1));
     let took = started.elapsed();
     let _ = stop_tx.send(());
+    assert!(trickling_rx.try_recv().is_ok(), "the provider reached the trickle, so the TLS phase is what was cut");
     assert_eq!(verdict, validate::Liveness::Unknown("provider check timed out".into()));
     assert!(took < std::time::Duration::from_secs(3), "{took:?}");
 }
 
 /// ...and one that takes the request and never answers costs the same. The listener reports
-/// what it received, so an unrelated early failure cannot pass for this.
+/// the request line it received, so an unrelated early failure cannot pass for this.
 #[test]
 fn a_silent_provider_costs_the_probe_timeout_and_no_more() {
     use std::io::Read;
@@ -3287,9 +3290,14 @@ fn a_silent_provider_costs_the_probe_timeout_and_no_more() {
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
         let Ok((mut s, _)) = l.accept() else { return };
-        let mut buf = [0u8; 4096];
-        let n = s.read(&mut buf).unwrap_or(0);
-        let _ = got_tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+        let (mut buf, mut chunk) = (Vec::new(), [0u8; 1024]);
+        while !buf.windows(2).any(|w| w == b"\r\n") {
+            match s.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+        let _ = got_tx.send(String::from_utf8_lossy(&buf).to_string());
         let _ = stop_rx.recv_timeout(std::time::Duration::from_secs(30));
     });
     let v = SecretString::from("sk-probe-value-000000000000".to_string());
@@ -3300,5 +3308,45 @@ fn a_silent_provider_costs_the_probe_timeout_and_no_more() {
     assert!(matches!(verdict, validate::Liveness::Unknown(_)), "{verdict:?}");
     assert!(took < std::time::Duration::from_secs(3), "{took:?}");
     let req = got_rx.recv_timeout(std::time::Duration::from_secs(1)).expect("the request reached the provider");
-    assert!(req.starts_with("GET /probe"), "{req}");
+    assert!(req.starts_with("GET /probe "), "{req}");
+}
+
+/// The worker limiter admits up to its size, refuses the next at once, and gets each slot
+/// back when a worker ends, however it ends. A local limiter, so saturating it cannot starve
+/// the probes other tests run in parallel.
+#[test]
+fn the_probe_limiter_admits_refuses_and_gives_slots_back() {
+    use std::time::{Duration, Instant};
+    let lim: &'static validate::Limiter = Box::leak(Box::new(validate::Limiter::new(2)));
+    let drained = |lim: &validate::Limiter| {
+        let until = Instant::now() + Duration::from_secs(5);
+        while lim.running() > 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        lim.running()
+    };
+    // Two workers that keep their slots after their callers stop waiting.
+    let mut holds = Vec::new();
+    for _ in 0..2 {
+        let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
+        holds.push(hold_tx);
+        let r = validate::within(lim, Duration::from_millis(50), move || {
+            let _ = hold_rx.recv();
+        });
+        assert!(matches!(r, Err(validate::Waited::TimedOut)), "{r:?}");
+    }
+    assert_eq!(lim.running(), 2);
+    let started = Instant::now();
+    let r = validate::within(lim, Duration::from_secs(5), || 1);
+    assert!(matches!(r, Err(validate::Waited::Busy)), "{r:?}");
+    assert!(started.elapsed() < Duration::from_millis(500), "a full limiter refuses at once");
+    drop(holds); // the holders' recv() fails, they end, and their slots come back
+    assert_eq!(drained(lim), 0);
+    assert_eq!(validate::within(lim, Duration::from_secs(5), || 7).ok(), Some(7));
+    // A worker that dies without answering is not a timeout, and still gives its slot back.
+    let started = Instant::now();
+    let r = validate::within(lim, Duration::from_secs(5), || -> u8 { panic!("worker died on purpose") });
+    assert!(matches!(r, Err(validate::Waited::Died)), "{r:?}");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(drained(lim), 0);
 }

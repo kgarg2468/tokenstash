@@ -51,36 +51,91 @@ pub fn liveness(check: &Check, value: &SecretString, timeout: Duration) -> Liven
     // request deadline, name resolution has no bound, and rustls finishes a handshake with
     // socket timeouts set once, so a peer that trickles bytes holds it open. The request runs
     // on a worker instead, and the caller stops waiting at the deadline whatever phase it is in.
-    if IN_FLIGHT.fetch_add(1, Ordering::SeqCst) >= MAX_IN_FLIGHT {
-        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-        return Liveness::Unknown("too many provider checks already waiting".into());
-    }
-    let (tx, rx) = mpsc::channel();
     let (check, value) = (check.clone(), SecretString::from(value.expose_secret().to_string()));
-    let spawned = std::thread::Builder::new().name("tokenstash-probe".into()).spawn(move || {
-        let _slot = Slot;
-        let _ = tx.send(probe_once(&check, &value, timeout));
-    });
-    if spawned.is_err() {
-        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-        return Liveness::Unknown("could not start the provider check".into());
+    match within(&PROBES, timeout, move || probe_once(&check, &value, timeout)) {
+        Ok(verdict) => verdict,
+        Err(Waited::Busy) => Liveness::Unknown("too many provider checks already waiting".into()),
+        Err(Waited::SpawnFailed) => Liveness::Unknown("could not start the provider check".into()),
+        Err(Waited::TimedOut) => Liveness::Unknown("provider check timed out".into()),
+        // The worker ended without an answer, which only a panic does: still no verdict, but
+        // not a network one either.
+        Err(Waited::Died) => Liveness::Unknown("provider check failed".into()),
     }
-    rx.recv_timeout(timeout).unwrap_or_else(|_| Liveness::Unknown("provider check timed out".into()))
 }
 
-/// Probes in flight in this process, counted until each worker actually exits. A worker whose
-/// request is stuck keeps its slot, so a network that never answers costs at most
-/// `MAX_IN_FLIGHT` threads; past that a probe is Unknown at once, and Unknown delivers the key
-/// unverified exactly as any other failed check does.
-static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
-const MAX_IN_FLIGHT: usize = 8;
+/// Workers for provider checks. A worker whose request is stuck keeps its slot, so a network
+/// that never answers costs at most this many threads; past that a probe is Unknown at once,
+/// and Unknown delivers the key unverified exactly as any other failed check does.
+static PROBES: Limiter = Limiter::new(8);
 
-struct Slot;
+/// Admission for workers: a count of the ones still running, given back when each worker
+/// actually exits, not when its caller stops waiting.
+pub(crate) struct Limiter {
+    running: AtomicUsize,
+    max: usize,
+}
 
-impl Drop for Slot {
-    fn drop(&mut self) {
-        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+impl Limiter {
+    pub(crate) const fn new(max: usize) -> Self {
+        Limiter { running: AtomicUsize::new(0), max }
     }
+
+    fn admit(&'static self) -> Option<Permit> {
+        if self.running.fetch_add(1, Ordering::SeqCst) >= self.max {
+            self.running.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Permit(self))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn running(&self) -> usize {
+        self.running.load(Ordering::SeqCst)
+    }
+}
+
+struct Permit(&'static Limiter);
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.0.running.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Why `within` has no answer.
+#[derive(Debug)]
+pub(crate) enum Waited {
+    /// Every slot is taken.
+    Busy,
+    /// The OS would not start a thread.
+    SpawnFailed,
+    /// The deadline passed. The worker keeps running, and keeps its slot, until it ends.
+    TimedOut,
+    /// The worker ended without an answer.
+    Died,
+}
+
+/// Run `f` on a worker admitted by `limiter` and wait at most `timeout` for its answer. The
+/// permit moves into the worker, so it is given back when the worker ends, or at once if the
+/// thread never starts, because the closure that holds it is dropped with it.
+pub(crate) fn within<T: Send + 'static>(
+    limiter: &'static Limiter,
+    timeout: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Waited> {
+    let permit = limiter.admit().ok_or(Waited::Busy)?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("tokenstash-probe".into())
+        .spawn(move || {
+            let _permit = permit;
+            let _ = tx.send(f());
+        })
+        .map_err(|_| Waited::SpawnFailed)?;
+    rx.recv_timeout(timeout).map_err(|e| match e {
+        mpsc::RecvTimeoutError::Timeout => Waited::TimedOut,
+        mpsc::RecvTimeoutError::Disconnected => Waited::Died,
+    })
 }
 
 /// The one request, on the worker `liveness` waits for.
