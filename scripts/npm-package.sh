@@ -38,6 +38,17 @@ same_package() { # <pkg dir>
      && tar -xzf "$tmp"/pack/*.tgz -C "$tmp/ours" && diff -r "$tmp/theirs" "$tmp/ours" >/dev/null; then ok=0; fi
   rm -rf "$tmp"; return $ok
 }
+# The registry can answer a version it accepted seconds ago with a 404 — writes and reads take
+# different paths — so the final check gives each package up to two minutes to appear before
+# judging it. A package that is there and differs still fails; it just fails after the wait.
+settled() { # <pkg dir>
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    same_package "$1" && return 0
+    sleep 10
+  done
+  return 1
+}
 publish() { # <pkg dir>
   [ "${NPM_PUBLISH:-}" = 1 ] || return 0
   local name; name=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["name"])' "$1/package.json")
@@ -89,9 +100,9 @@ publish "$main"
 if [ "${NPM_PUBLISH:-}" = 1 ]; then
   # Final check: every package resolves AND is exactly ours.
   for name in linux-x64 linux-arm64 darwin-arm64 darwin-x64; do
-    name="tokenstash-$name"; same_package "$out/$name" || { echo "$name@$version is missing or not ours" >&2; exit 1; }
+    name="tokenstash-$name"; settled "$out/$name" || { echo "$name@$version is missing or not ours" >&2; exit 1; }
   done
-  name=tokenstash; same_package "$main" || { echo "tokenstash@$version is missing or not ours" >&2; exit 1; }
+  name=tokenstash; settled "$main" || { echo "tokenstash@$version is missing or not ours" >&2; exit 1; }
   # What the registry actually did with the tags, in the job log: the only place the
   # "first publish takes latest" behaviour above is observable rather than assumed. Never
   # fatal — every package is published and verified by this point, and a rate-limited
