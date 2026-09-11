@@ -953,6 +953,7 @@ fn a_git_dir_in_a_shared_ancestor_never_becomes_the_project_root() {
     // a normal, user-owned repo still resolves as before
     let repo = tmp("owned-repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
     let sub = repo.join("a/b");
     std::fs::create_dir_all(&sub).unwrap();
     assert_eq!(envfile::git_root(&sub), Some(repo.clone()));
@@ -2066,6 +2067,7 @@ fn refused_roots_include_home_and_tool_dirs_and_a_dotfiles_repo_is_not_a_project
     // a `.git` at a refused root does not make its children resolve to it
     let fake_home = tmp("v2-fakehome").canonicalize().unwrap();
     std::fs::create_dir_all(fake_home.join(".git")).unwrap();
+    std::fs::write(fake_home.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
     std::fs::create_dir_all(fake_home.join("scratch/foo")).unwrap();
     assert_eq!(envfile::owned_git_root(&fake_home.join("scratch/foo")).unwrap(), Some(fake_home.clone()), "an ordinary dir with .git is a root");
     assert!(trust::refused_root(&home).is_some());
@@ -2400,6 +2402,7 @@ fn an_unverifiable_ignore_rule_refuses_the_write() {
     // The child-local git proves `ls-files` has no match, then fails `check-ignore`.
     let root = tmp("unverifiable").canonicalize().unwrap();
     std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
     std::fs::write(root.join(".gitignore"), "*.local\n").unwrap();
     let deeper = root.join("svc/web");
     std::fs::create_dir_all(&deeper).unwrap();
@@ -3349,4 +3352,67 @@ fn the_probe_limiter_admits_refuses_and_gives_slots_back() {
     assert!(matches!(r, Err(validate::Waited::Died)), "{r:?}");
     assert!(started.elapsed() < Duration::from_secs(2));
     assert_eq!(drained(lim), 0);
+}
+
+/// An empty `.git` is not a repository. Codex's sandbox puts one into each writable root (the
+/// project directory, and /tmp) for as long as a session runs, and git itself answers "not a
+/// git repository" there. Treating it as a checkout made the tracked-file check fail closed,
+/// so no key could be delivered into a project that was not a repo.
+#[test]
+fn an_empty_git_directory_is_not_a_repository() {
+    let dir = tmp("placeholder-git").canonicalize().unwrap();
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    let sub = dir.join("app");
+    std::fs::create_dir_all(&sub).unwrap();
+    assert_eq!(envfile::git_root(&sub), None, "an empty .git is not a repo");
+    assert_eq!(envfile::owned_git_root(&sub).unwrap(), None);
+    assert!(!envfile::git_trackedness(&sub, &sub.join(".env.local")).unwrap());
+    // ...so a key can be delivered there,
+    let written = envfile::write(&sub, ".env.local", "K", &SecretString::from("vvvvvvvv".to_string())).unwrap();
+    assert!(written.starts_with(&sub), "{}", written.display());
+    // and a real repository is still one: HEAD makes the difference.
+    std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    assert_eq!(envfile::git_root(&sub), Some(dir.clone()));
+    assert_eq!(envfile::owned_git_root(&sub).unwrap(), Some(dir.clone()));
+}
+
+/// Only an empty directory is set aside. A real repository must never read as absent, so every
+/// other shape of `.git` still counts: a worktree or submodule gitfile of any size or bytes, a
+/// repository on an unborn branch whose HEAD is a symlink to a ref that does not exist yet, and
+/// a `.git` that cannot be read.
+#[test]
+fn every_other_git_entry_still_counts_as_a_repository() {
+    let gitfile = tmp("gitfile").canonicalize().unwrap();
+    std::fs::write(gitfile.join(".git"), "gitdir: /elsewhere/.git/worktrees/x\n").unwrap();
+    assert_eq!(envfile::git_root(&gitfile), Some(gitfile.clone()));
+    // git trims trailing newlines, so a gitfile padded past any size limit is still valid
+    let padded = tmp("gitfile-padded").canonicalize().unwrap();
+    std::fs::write(padded.join(".git"), format!("gitdir: /elsewhere/.git{}", "\n".repeat(8192))).unwrap();
+    assert_eq!(envfile::git_root(&padded), Some(padded.clone()));
+    let empty_file = tmp("gitfile-empty").canonicalize().unwrap();
+    std::fs::write(empty_file.join(".git"), "").unwrap();
+    assert_eq!(envfile::git_root(&empty_file), Some(empty_file.clone()), "only an empty directory is set aside");
+    #[cfg(unix)]
+    {
+        // an unborn branch: HEAD is a symlink to a ref that does not exist yet
+        let unborn = tmp("unborn-symlink-head").canonicalize().unwrap();
+        std::fs::create_dir_all(unborn.join(".git")).unwrap();
+        std::os::unix::fs::symlink("refs/heads/main", unborn.join(".git/HEAD")).unwrap();
+        assert_eq!(envfile::git_root(&unborn), Some(unborn.clone()));
+        // a gitfile whose path is not UTF-8
+        let bytes = tmp("gitfile-non-utf8").canonicalize().unwrap();
+        std::fs::write(bytes.join(".git"), b"gitdir: /elsewhere/\xff\xfe/.git\n").unwrap();
+        assert_eq!(envfile::git_root(&bytes), Some(bytes.clone()));
+        // a .git directory that cannot be read is not provably empty (root reads it anyway)
+        use std::os::unix::fs::PermissionsExt;
+        let locked = tmp("unreadable-git").canonicalize().unwrap();
+        std::fs::create_dir_all(locked.join(".git")).unwrap();
+        std::fs::set_permissions(locked.join(".git"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read_dir(locked.join(".git")).is_err();
+        let seen = envfile::git_root(&locked);
+        std::fs::set_permissions(locked.join(".git"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        if unreadable {
+            assert_eq!(seen, Some(locked.clone()), "unreadable is not provably empty");
+        }
+    }
 }

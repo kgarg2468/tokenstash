@@ -254,6 +254,7 @@ fn several_roots_follow_the_rules() {
     // two roots inside one git repo collapse to the repo, wherever in it we were started
     let repo = tmp("many-repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
     std::fs::create_dir_all(repo.join("a/deep")).unwrap();
     std::fs::create_dir_all(repo.join("b")).unwrap();
     let mut c = Client::start(&home, &repo.join("a/deep"), true);

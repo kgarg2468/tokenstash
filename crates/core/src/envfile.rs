@@ -336,10 +336,25 @@ pub fn is_git_tracked(project: &Path, path: &Path) -> bool {
 
 /// Nearest ancestor (or `start` itself) that holds a `.git` — plain detection, no policy.
 /// Callers that decide where to WRITE use [`owned_git_root`].
+/// Is there a repository at `dir`? Any `.git` counts, exactly as before, except an empty
+/// directory. Codex's sandbox puts one into each writable root (the session's working directory,
+/// and /tmp) for as long as a session runs; git itself answers "not a git repository" there, and
+/// taken for a checkout it made the tracked-file check fail closed, so no key could be delivered.
+/// Nothing else is second-guessed. A `.git` that is a file, a symlink, unreadable, or anything
+/// but provably empty is a repository to this check, because reading a real one as absent would
+/// let a secret into a file git tracks.
+fn holds_repo(dir: &Path) -> bool {
+    let g = dir.join(".git");
+    match std::fs::metadata(&g) {
+        Ok(m) => !(m.is_dir() && std::fs::read_dir(&g).is_ok_and(|mut entries| entries.next().is_none())),
+        Err(_) => false,
+    }
+}
+
 pub fn git_root(start: &Path) -> Option<PathBuf> {
     let mut p = start.to_path_buf();
     loop {
-        if p.join(".git").exists() {
+        if holds_repo(&p) {
             return Some(p);
         }
         if !p.pop() {
@@ -361,7 +376,7 @@ pub fn git_root(start: &Path) -> Option<PathBuf> {
 pub fn owned_git_root(start: &Path) -> Result<Option<PathBuf>> {
     let mut p = start.to_path_buf();
     loop {
-        let has_git = p.join(".git").exists();
+        let has_git = holds_repo(&p);
         match dir_class(&p) {
             DirClass::Shared => return Ok(None),
             DirClass::Foreign if has_git => anyhow::bail!(
