@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 340" width="880" height="340" role="img" aria-labelledby="t d">
+  <title id="t">How tokenstash works</title>
+  <desc id="d">Your agent needs a key and runs tokenstash need. If the key is in your stash and this folder is approved, it is written to .env.local and the agent carries on. If not, you get a notification and a link to a page on localhost; you paste the key once, it is saved to your OS keychain, and then written to .env.local.</desc>
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+  </defs>
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; }
+    .panel { fill: #FFFFFF; stroke: #D0D7DE; }
+    .box   { fill: #F6F8FA; stroke: #8C959F; stroke-width: 1.2; }
+    .tbox  { fill: #FFFFFF; stroke: #BF6A2B; stroke-width: 2; }
+    .h     { font-size: 15px; font-weight: 600; fill: #1F2328; }
+    .s     { font-size: 13px; fill: #59636E; }
+    .lbl   { font-size: 12.5px; fill: #59636E; }
+    .acc   { fill: #A0521C; }
+    .line  { stroke: #8C959F; stroke-width: 1.8; fill: none; }
+    .head  { fill: #8C959F; }
+    .ok    { fill: #1A7F37; }
+    .okst  { stroke: #1A7F37; }
+    .wt    { stroke: #9A6700; }
+    @media (prefers-color-scheme: dark) {
+      .panel { fill: #0D1117; stroke: #3D444D; }
+      .box   { fill: #161B22; stroke: #6E7681; }
+      .tbox  { fill: #0D1117; stroke: #E08A4B; }
+      .h     { fill: #E6EDF3; }
+      .s, .lbl { fill: #9198A1; }
+      .acc   { fill: #E08A4B; }
+      .line  { stroke: #6E7681; }
+      .head  { fill: #6E7681; }
+      .ok    { fill: #3FB950; }
+      .okst  { stroke: #3FB950; }
+      .wt    { stroke: #D29922; }
+    }
+  </style>
+
+  <rect class="panel" x="0.5" y="0.5" width="879" height="339" rx="12"/>
+
+  <!-- agent -->
+  <rect class="box" x="24" y="138" width="150" height="64" rx="8"/>
+  <text class="h" x="99" y="165" text-anchor="middle">Your agent</text>
+  <text class="s" x="99" y="186" text-anchor="middle">needs a key</text>
+  <line class="line" x1="174" y1="170" x2="202" y2="170" marker-end="url(#ah)"/>
+
+  <!-- tokenstash need -->
+  <rect class="tbox" x="206" y="138" width="180" height="64" rx="8"/>
+  <text class="h mono acc" x="296" y="165" text-anchor="middle">tokenstash need</text>
+  <text class="s mono" x="296" y="186" text-anchor="middle">OPENAI_API_KEY</text>
+
+  <!-- split -->
+  <line class="line" x1="386" y1="170" x2="410" y2="170"/>
+  <line class="line" x1="410" y1="72" x2="410" y2="268"/>
+  <line class="line" x1="410" y1="72" x2="448" y2="72" marker-end="url(#ah)"/>
+  <line class="line" x1="410" y1="268" x2="448" y2="268" marker-end="url(#ah)"/>
+  <text class="lbl" x="416" y="64">yes</text>
+  <text class="lbl" x="416" y="260">no</text>
+  <text class="lbl" x="424" y="174">In your stash, and this folder approved?</text>
+
+  <!-- yes: written -->
+  <rect class="box" x="452" y="40" width="404" height="64" rx="8"/>
+  <circle class="ok" cx="478" cy="72" r="11"/>
+  <path d="M473,72.5 l3.4,3.4 l6.4,-7" fill="none" stroke="#FFFFFF" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+  <text class="h" x="500" y="67">Written to <tspan class="mono">.env.local</tspan></text>
+  <text class="s" x="500" y="88">agent carries on; it never sees the value</text>
+
+  <!-- no: notification -->
+  <rect class="box" x="452" y="230" width="190" height="76" rx="8"/>
+  <text class="h" x="547" y="255" text-anchor="middle">You're notified</text>
+  <text class="s" x="547" y="275" text-anchor="middle">with a link to a page</text>
+  <text class="s" x="547" y="293" text-anchor="middle">on localhost</text>
+  <line class="line" x1="642" y1="268" x2="662" y2="268" marker-end="url(#ah)"/>
+
+  <!-- paste -->
+  <rect class="box" x="666" y="230" width="190" height="76" rx="8"/>
+  <text class="h" x="761" y="255" text-anchor="middle">You paste it once</text>
+  <text class="s" x="761" y="275" text-anchor="middle">it's saved to your</text>
+  <text class="s" x="761" y="293" text-anchor="middle">OS keychain</text>
+
+  <!-- then written -->
+  <line class="line" x1="761" y1="230" x2="761" y2="108" marker-end="url(#ah)"/>
+  <text class="lbl" x="770" y="174">then written</text>
+</svg>

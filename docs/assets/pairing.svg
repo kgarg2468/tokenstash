@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 300" width="880" height="300" role="img" aria-labelledby="t d">
+  <title id="t">One key, many folders</title>
+  <desc id="d">OPENAI_API_KEY is stored once in your OS keychain. The folder where you pasted it has it. Another folder asked once, you approved it on a page on localhost, and it is quiet from then on. A third folder has not asked yet and will get one approval when it does. Sensitive keys ask for each folder separately.</desc>
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+  </defs>
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; }
+    .panel { fill: #FFFFFF; stroke: #D0D7DE; }
+    .box   { fill: #F6F8FA; stroke: #8C959F; stroke-width: 1.2; }
+    .tbox  { fill: #FFFFFF; stroke: #BF6A2B; stroke-width: 2; }
+    .h     { font-size: 14.5px; font-weight: 600; fill: #1F2328; }
+    .s     { font-size: 13px; fill: #59636E; }
+    .acc   { fill: #A0521C; }
+    .okt   { fill: #1A7F37; }
+    .wtt   { fill: #9A6700; }
+    .line  { stroke: #8C959F; stroke-width: 1.8; fill: none; }
+    .head  { fill: #8C959F; }
+    .fold  { fill: none; stroke: #59636E; stroke-width: 1.5; stroke-linejoin: round; }
+    .ok    { fill: #1A7F37; }
+    .wt    { stroke: #9A6700; }
+    @media (prefers-color-scheme: dark) {
+      .panel { fill: #0D1117; stroke: #3D444D; }
+      .box   { fill: #161B22; stroke: #6E7681; }
+      .tbox  { fill: #0D1117; stroke: #E08A4B; }
+      .h     { fill: #E6EDF3; }
+      .s     { fill: #9198A1; }
+      .acc   { fill: #E08A4B; }
+      .okt   { fill: #3FB950; }
+      .wtt   { fill: #D29922; }
+      .line  { stroke: #6E7681; }
+      .head  { fill: #6E7681; }
+      .fold  { stroke: #9198A1; }
+      .ok    { fill: #3FB950; }
+      .wt    { stroke: #D29922; }
+    }
+  </style>
+
+  <rect class="panel" x="0.5" y="0.5" width="879" height="299" rx="12"/>
+
+  <!-- keychain -->
+  <rect class="tbox" x="24" y="98" width="220" height="84" rx="8"/>
+  <text class="s" x="134" y="124" text-anchor="middle">your OS keychain</text>
+  <text class="h mono acc" x="134" y="147" text-anchor="middle">OPENAI_API_KEY</text>
+  <text class="s" x="134" y="168" text-anchor="middle">pasted once</text>
+
+  <!-- connectors -->
+  <path class="line" d="M244,128 C 290,128 290,62 330,62" marker-end="url(#ah)"/>
+  <path class="line" d="M244,140 L330,140" marker-end="url(#ah)"/>
+  <path class="line" d="M244,152 C 290,152 290,218 330,218" stroke-dasharray="5 5" marker-end="url(#ah)"/>
+
+  <!-- folder 1 -->
+  <rect class="box" x="334" y="30" width="522" height="64" rx="8"/>
+  <path class="fold" d="M352,52 h9 l3,4 h13 v18 h-25 z"/>
+  <text class="h mono" x="390" y="57">~/code/app</text>
+  <circle class="ok" cx="398" cy="77" r="7"/><path d="M394.8,77.3 l2.2,2.2 l4.2,-4.6" fill="none" stroke="#FFFFFF" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+  <text class="s" x="412" y="81"><tspan class="okt">has it</tspan> · you pasted it here</text>
+
+  <!-- folder 2 -->
+  <rect class="box" x="334" y="108" width="522" height="64" rx="8"/>
+  <path class="fold" d="M352,130 h9 l3,4 h13 v18 h-25 z"/>
+  <text class="h mono" x="390" y="135">~/code/landing-page</text>
+  <circle class="ok" cx="398" cy="155" r="7"/><path d="M394.8,155.3 l2.2,2.2 l4.2,-4.6" fill="none" stroke="#FFFFFF" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+  <text class="s" x="412" y="159"><tspan class="okt">approved once</tspan> · on a page on localhost, then quiet from then on</text>
+
+  <!-- folder 3 -->
+  <rect class="box" x="334" y="186" width="522" height="64" rx="8"/>
+  <path class="fold" d="M352,208 h9 l3,4 h13 v18 h-25 z"/>
+  <text class="h mono" x="390" y="213">~/code/side-project</text>
+  <g transform="translate(398,233)"><circle r="6.5" fill="none" class="wt" stroke-width="1.6"/><path d="M0,-3.4 V0 L2.6,1.6" fill="none" class="wt" stroke-width="1.4" stroke-linecap="round"/></g>
+  <text class="s" x="412" y="237"><tspan class="wtt">not yet</tspan> · gets one approval the first time it asks</text>
+
+  <text class="s" x="440" y="280" text-anchor="middle">Sensitive keys (live Stripe, AWS, deploy and package-registry tokens) ask for each folder separately.</text>
+</svg>

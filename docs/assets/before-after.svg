@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 262" width="880" height="262" role="img" aria-labelledby="t d">
+  <title id="t">Without tokenstash and with tokenstash</title>
+  <desc id="d">Left: the agent stops and asks you to paste three API keys into the chat, and the key you paste stays in the transcript. Right: the agent runs tokenstash need; two keys you already have are injected into .env.local, and the third is pending with a link to a page on localhost.</desc>
+  <style>
+    .win { fill: #161B22; stroke: #30363D; stroke-width: 1.5; }
+    .bar { stroke: #30363D; stroke-width: 1; }
+    .ttl { font: 500 12.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #8B949E; }
+    .cap { font: 12.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #8B949E; }
+    .m   { font: 13px ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; fill: #E6EDF3; }
+    .dim { fill: #8B949E; }
+    .pr  { fill: #E08A4B; }
+    .ok  { fill: #3FB950; }
+    .wt  { fill: #D29922; }
+    .bad { fill: #F85149; }
+  </style>
+
+  <!-- without -->
+  <rect class="win" x="1" y="1" width="426" height="260" rx="10"/>
+  <line class="bar" x1="1" y1="34" x2="427" y2="34"/>
+  <circle cx="20" cy="17.5" r="5.5" fill="#FF5F57"/><circle cx="38" cy="17.5" r="5.5" fill="#FEBC2E"/><circle cx="56" cy="17.5" r="5.5" fill="#28C840"/>
+  <text class="ttl" x="214" y="22" text-anchor="middle">without tokenstash</text>
+  <text class="m" x="20" y="64"><tspan class="dim">agent</tspan></text>
+  <text class="m" x="76" y="64">I need three API keys to continue.</text>
+  <text class="m" x="76" y="86">Please paste them here:</text>
+  <text class="m" x="76" y="112">OPENAI_API_KEY=</text>
+  <text class="m" x="76" y="134">RESEND_API_KEY=</text>
+  <text class="m" x="76" y="156">TAVUS_API_KEY=</text>
+  <text class="m" x="20" y="194"><tspan class="dim">you</tspan></text>
+  <text class="m bad" x="76" y="194">sk-proj-4f9a2c7e1b…</text>
+  <text class="m bad" x="76" y="216">↑ now in the chat transcript</text>
+  <text class="cap" x="20" y="242">…and in your agent's conversation history, for good.</text>
+
+  <!-- with -->
+  <rect class="win" x="453" y="1" width="426" height="260" rx="10"/>
+  <line class="bar" x1="453" y1="34" x2="879" y2="34"/>
+  <circle cx="472" cy="17.5" r="5.5" fill="#FF5F57"/><circle cx="490" cy="17.5" r="5.5" fill="#FEBC2E"/><circle cx="508" cy="17.5" r="5.5" fill="#28C840"/>
+  <text class="ttl" x="666" y="22" text-anchor="middle">with tokenstash</text>
+  <text class="m" x="472" y="64"><tspan class="pr">$</tspan> tokenstash need OPENAI_API_KEY \</text>
+  <text class="m" x="519" y="86">RESEND_API_KEY TAVUS_API_KEY</text>
+  <text class="m" x="472" y="120"><tspan class="ok">✓</tspan> OPENAI_API_KEY injected → .env.local</text>
+  <text class="m" x="472" y="142"><tspan class="ok">✓</tspan> RESEND_API_KEY injected → .env.local</text>
+  <g transform="translate(476.5,159.5)"><circle r="5.2" fill="none" stroke="#D29922" stroke-width="1.6"/><path d="M0,-2.8 V0 L2.2,1.4" fill="none" stroke="#D29922" stroke-width="1.4" stroke-linecap="round"/></g>
+  <text class="m" x="472" y="164"><tspan dx="0" fill-opacity="0">✓</tspan> <tspan class="wt">TAVUS_API_KEY pending</tspan> — task t_7fa2</text>
+  <text class="m dim" x="488" y="186">→ http://127.0.0.1:7433/…</text>
+  <text class="cap" x="472" y="242">Keys land in .env.local. The agent only sees these lines.</text>
+</svg>

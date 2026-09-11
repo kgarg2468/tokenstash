@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 320" width="880" height="320" role="img" aria-labelledby="t d">
+  <title id="t">Where your key goes, and what your agent gets</title>
+  <desc id="d">The key: you paste it on a page on localhost, it is stored in your OS keychain, written to your project's .env.local (mode 0600, gitignored), and your app reads it. What your agent gets: a status line such as OPENAI_API_KEY injected to .env.local and exit code 0, never the value, and nothing in the chat. It is not a sandbox: an agent with a shell in the folder can still read the file.</desc>
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="head"/></marker>
+  </defs>
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; }
+    .panel { fill: #FFFFFF; stroke: #D0D7DE; }
+    .box   { fill: #F6F8FA; stroke: #8C959F; stroke-width: 1.2; }
+    .tbox  { fill: #FFFFFF; stroke: #BF6A2B; stroke-width: 2; }
+    .note  { fill: none; stroke: #8C959F; stroke-width: 1.2; stroke-dasharray: 4 4; }
+    .h     { font-size: 14.5px; font-weight: 600; fill: #1F2328; }
+    .s     { font-size: 12.5px; fill: #59636E; }
+    .sec   { font-size: 11.5px; font-weight: 600; letter-spacing: 0.08em; fill: #59636E; }
+    .okt   { fill: #1A7F37; }
+    .line  { stroke: #8C959F; stroke-width: 1.8; fill: none; }
+    .div   { stroke: #D0D7DE; stroke-width: 1.2; stroke-dasharray: 6 6; }
+    .dot   { stroke: #8C959F; stroke-width: 1.6; fill: none; stroke-dasharray: 2 5; stroke-linecap: round; }
+    .head  { fill: #8C959F; }
+    @media (prefers-color-scheme: dark) {
+      .panel { fill: #0D1117; stroke: #3D444D; }
+      .box   { fill: #161B22; stroke: #6E7681; }
+      .tbox  { fill: #0D1117; stroke: #E08A4B; }
+      .note  { stroke: #6E7681; }
+      .h     { fill: #E6EDF3; }
+      .s, .sec { fill: #9198A1; }
+      .okt   { fill: #3FB950; }
+      .line  { stroke: #6E7681; }
+      .div   { stroke: #3D444D; }
+      .dot   { stroke: #6E7681; }
+      .head  { fill: #6E7681; }
+    }
+  </style>
+
+  <rect class="panel" x="0.5" y="0.5" width="879" height="319" rx="12"/>
+
+  <text class="sec" x="24" y="32">THE KEY</text>
+  <rect class="box" x="24" y="44" width="180" height="64" rx="8"/>
+  <text class="h" x="114" y="71" text-anchor="middle">You paste it</text>
+  <text class="s" x="114" y="92" text-anchor="middle">on a page on localhost</text>
+  <line class="line" x1="204" y1="76" x2="232" y2="76" marker-end="url(#ah)"/>
+
+  <rect class="tbox" x="236" y="44" width="180" height="64" rx="8"/>
+  <text class="h" x="326" y="71" text-anchor="middle">Your OS keychain</text>
+  <text class="s" x="326" y="92" text-anchor="middle">where tokenstash keeps it</text>
+  <line class="line" x1="416" y1="76" x2="444" y2="76" marker-end="url(#ah)"/>
+
+  <rect class="box" x="448" y="44" width="196" height="64" rx="8"/>
+  <text class="h mono" x="546" y="71" text-anchor="middle">.env.local</text>
+  <text class="s" x="546" y="92" text-anchor="middle">gitignored · mode 0600</text>
+  <line class="line" x1="644" y1="76" x2="672" y2="76" marker-end="url(#ah)"/>
+
+  <rect class="box" x="676" y="44" width="180" height="64" rx="8"/>
+  <text class="h" x="766" y="71" text-anchor="middle">Your app</text>
+  <text class="s" x="766" y="92" text-anchor="middle">reads it when it starts</text>
+
+  <line class="div" x1="24" y1="148" x2="856" y2="148"/>
+
+  <text class="sec" x="24" y="180">WHAT YOUR AGENT GETS</text>
+  <rect class="box" x="24" y="192" width="180" height="64" rx="8"/>
+  <text class="h" x="114" y="219" text-anchor="middle">Your agent</text>
+  <text class="s" x="114" y="240" text-anchor="middle">ran tokenstash need</text>
+  <line class="line" x1="232" y1="224" x2="206" y2="224" marker-end="url(#ah)"/>
+
+  <rect class="box" x="236" y="192" width="408" height="64" rx="8"/>
+  <text class="h mono" x="256" y="219"><tspan class="okt">✓</tspan> OPENAI_API_KEY injected → .env.local</text>
+  <text class="s" x="256" y="240">exit 0 · a status line, never the value · nothing in the chat</text>
+
+  <rect class="note" x="676" y="192" width="180" height="64" rx="8"/>
+  <text class="h" x="766" y="216" text-anchor="middle">Not a sandbox</text>
+  <text class="s" x="766" y="234" text-anchor="middle">a shell in this folder can</text>
+  <text class="s" x="766" y="249" text-anchor="middle">still read .env.local</text>
+  <path class="dot" d="M766,192 C 766,150 620,150 590,112"/>
+
+  <text class="s" x="440" y="296" text-anchor="middle">tokenstash removes the casual leak (the key pasted into chat, or echoed back in a summary), not a deliberate read.</text>
+</svg>
