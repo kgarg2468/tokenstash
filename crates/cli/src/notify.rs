@@ -3,7 +3,7 @@
 use crate::inbox_auth;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokenstash_core::Config;
 
 /// What is actually on the inbox port.
@@ -29,6 +29,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(400);
 const IO_TIMEOUT: Duration = Duration::from_millis(1500);
 /// A hostile listener must not be able to stream at us forever.
 const MAX_REPLY: u64 = 64 * 1024;
+/// How long a freshly spawned inbox gets to bind and answer.
+const SPAWN_WAIT: Duration = Duration::from_secs(2);
 
 fn addr(cfg: &Config) -> SocketAddr {
     ([127, 0, 0, 1], cfg.inbox_port).into()
@@ -51,12 +53,26 @@ fn probe(addr: &SocketAddr, proof: &str) -> Inbox {
 /// One `GET /verify?c=<nonce>` over a raw socket, returning the response body. Hand-rolled
 /// rather than pulling in an HTTP client: one request, one connection, no redirects.
 fn challenge(s: &mut TcpStream, addr: &SocketAddr, nonce: &str) -> Option<String> {
-    s.set_read_timeout(Some(IO_TIMEOUT)).ok()?;
+    // One deadline for the whole exchange. A read timeout alone restarts with every byte, so
+    // a listener that trickled its reply could hold this, and the `need` waiting on it, for
+    // as long as it liked.
+    let deadline = Instant::now() + IO_TIMEOUT;
     s.set_write_timeout(Some(IO_TIMEOUT)).ok()?;
     write!(s, "GET /verify?c={nonce} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").ok()?;
     s.flush().ok()?;
     let mut buf = Vec::new();
-    s.take(MAX_REPLY).read_to_end(&mut buf).ok()?;
+    let mut chunk = [0u8; 4096];
+    loop {
+        let left = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero())?;
+        s.set_read_timeout(Some(left)).ok()?;
+        match s.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) if buf.len() + n > MAX_REPLY as usize => return None,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
     let text = String::from_utf8(buf).ok()?;
     let (head, body) = text.split_once("\r\n\r\n")?;
     head.starts_with("HTTP/1.1 200").then(|| body.to_string())
@@ -97,7 +113,10 @@ pub fn ensure_inbox(cfg: &Config) -> Inbox {
         eprintln!("tokenstash: could not start the inbox ({e})");
         return Inbox::Down;
     }
-    for _ in 0..20 {
+    // Measured on the clock, not in attempts: one attempt can itself take CONNECT_TIMEOUT +
+    // IO_TIMEOUT against a listener that is slow to answer.
+    let until = Instant::now() + SPAWN_WAIT;
+    while Instant::now() < until {
         let state = inbox_state(cfg);
         if state == Inbox::Ours {
             return state;
@@ -131,4 +150,43 @@ pub fn desktop(cfg: &Config, title: &str, body: &str, where_to: &str) {
         .body(&if where_to.is_empty() { body.to_string() } else { format!("{body}\n{where_to}") })
         .timeout(notify_rust::Timeout::Milliseconds(15000))
         .show();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// A listener that answers one byte at a time must not hold the ownership check open.
+    #[test]
+    fn a_trickling_listener_cannot_hold_the_ownership_check() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = l.accept() else { return };
+            for _ in 0..600 {
+                if s.write_all(b"H").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let started = Instant::now();
+        assert_eq!(probe(&addr, "proof"), Inbox::Foreign);
+        assert!(started.elapsed() < IO_TIMEOUT + Duration::from_secs(1), "{:?}", started.elapsed());
+    }
+
+    /// ...nor one that accepts and never answers.
+    #[test]
+    fn a_silent_listener_costs_one_io_timeout() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let _held = l.accept();
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        let started = Instant::now();
+        assert_eq!(probe(&addr, "proof"), Inbox::Foreign);
+        assert!(started.elapsed() < IO_TIMEOUT + Duration::from_secs(1), "{:?}", started.elapsed());
+    }
 }
