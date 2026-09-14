@@ -61,9 +61,11 @@ impl From<Mode> for AgentMode {
 struct Removed {
     file: PathBuf,
     /// `mcpServers` (a JSON config's top level), `projects/<path>` (a Claude local-scope
-    /// registration in `~/.claude.json`), or `mcp_servers` (Codex's config.toml).
+    /// registration in `~/.claude.json`), `mcp_servers` (Codex's config.toml), or `section`
+    /// (a marked tokenstash section an AGENTS.md held before init).
     key: String,
-    /// The entry as JSON text, or for TOML a document holding just `[mcp_servers.tokenstash]`.
+    /// The entry as JSON text, for TOML a document holding just `[mcp_servers.tokenstash]`,
+    /// for a section its text.
     value: String,
 }
 
@@ -210,17 +212,22 @@ impl Manifest {
 
     /// Init's entry is out of a shared config it held a whole-file record for, so the record
     /// is retired: whatever else the file holds is the user's — put there before init or
-    /// after it — and restoring a copy would overwrite it. What init itself replaced, a
-    /// tokenstash entry the user had before init, comes back through an entry record instead.
-    /// A file init created that holds nothing else is removed rather than left as a stub.
+    /// after it — and restoring a copy would overwrite it. What init itself replaced — a
+    /// tokenstash entry the user had before init, a marked section in an AGENTS.md — comes
+    /// back through an entry record instead. A file init created that holds nothing else is
+    /// removed rather than left as a stub. A backup that cannot be read keeps the whole-file
+    /// record: the only way back it offers is the one there is.
     fn retire(&mut self, p: &Path) -> Result<()> {
         let Some(i) = self.files.iter().position(|(q, _)| q == p) else { return Ok(()) };
         match self.files[i].1.clone() {
-            Some(b) => {
-                if let Some(value) = original_entry(&b) {
-                    self.entries.push(Removed { file: p.to_path_buf(), key: if is_toml(p) { "mcp_servers".into() } else { "mcpServers".into() }, value });
+            Some(b) => match original_entry(&b) {
+                Ok(Some((key, value))) => self.entries.push(Removed { file: p.to_path_buf(), key, value }),
+                Ok(None) => {}
+                Err(e) => {
+                    println!("! {}: its backup could not be read ({e:#}); the whole-file undo record is kept", p.display());
+                    return Ok(());
                 }
-            }
+            },
             None => if effectively_empty(p) { remove_file_if_present(p)?; },
         }
         self.files.remove(i);
@@ -229,24 +236,34 @@ impl Manifest {
     }
 }
 
-fn is_toml(p: &Path) -> bool { p.extension().is_some_and(|e| e == "toml") }
-
-/// The tokenstash entry a backup holds — the user's own registration that init's replaced —
-/// as an entry record's value. None for a backup without one, or a non-config file.
-fn original_entry(backup: &Path) -> Option<String> {
-    let s = fs::read_to_string(backup).ok()?;
-    if backup.to_string_lossy().ends_with(".toml") {
-        let doc: toml_edit::DocumentMut = s.parse().ok()?;
-        let item = doc.get("mcp_servers")?.get("tokenstash")?.clone();
+/// What a backup holds that init's wiring replaced: the user's own registration (as an
+/// entry record's key and value), or an AGENTS.md's marked section. `None` for a backup
+/// without one; an error for a backup that cannot be read or parsed.
+fn original_entry(backup: &Path) -> Result<Option<(String, String)>> {
+    let s = fs::read_to_string(backup).map_err(|e| anyhow::anyhow!("reading {}: {e}", backup.display()))?;
+    let name = backup.to_string_lossy();
+    if name.ends_with(".toml") {
+        let doc: toml_edit::DocumentMut = s.parse().map_err(|e| anyhow::anyhow!("{} does not parse: {e}", backup.display()))?;
+        let Some(item) = doc.get("mcp_servers").and_then(|m| m.get("tokenstash")).cloned() else { return Ok(None) };
         let mut snip = toml_edit::DocumentMut::new();
         let mut t = toml_edit::Table::new();
         t.set_implicit(true);
         t.insert("tokenstash", item);
         snip.insert("mcp_servers", toml_edit::Item::Table(t));
-        return Some(snip.to_string());
+        return Ok(Some(("mcp_servers".into(), snip.to_string())));
     }
-    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
-    Some(v.get("mcpServers")?.get("tokenstash")?.to_string())
+    if name.ends_with(".json") {
+        let v: serde_json::Value = serde_json::from_str(&s).map_err(|e| anyhow::anyhow!("{} does not parse: {e}", backup.display()))?;
+        return Ok(v.get("mcpServers").and_then(|m| m.get("tokenstash")).map(|e| ("mcpServers".into(), e.to_string())));
+    }
+    Ok(section_of(&s).map(|sec| ("section".into(), sec.to_string())))
+}
+
+/// The first marked section of an AGENTS.md, marks included.
+fn section_of(s: &str) -> Option<&str> {
+    let start = s.find(SNIPPET_MARK)?;
+    let end = start + s[start..].find(SNIPPET_END)? + SNIPPET_END.len();
+    Some(&s[start..end])
 }
 
 fn remove_file_if_present(p: &Path) -> Result<()> {
@@ -286,12 +303,12 @@ fn effectively_empty(p: &Path) -> bool {
 
 fn undo() -> Result<i32> {
     let m = Manifest::load()?;
-    undo_with(m, which("claude"))
+    undo_with(m, which("claude"), &dirs::home_dir().unwrap_or_default())
 }
 
 /// `claude_cli`: `claude` is on PATH, so init's own registration can be removed through it.
-/// A parameter, not a lookup, so a test on a fake home never reaches the real one.
-fn undo_with(m: Manifest, claude_cli: bool) -> Result<i32> {
+/// A parameter, not a lookup, like `home`, so a test on a fake home never reaches the real one.
+fn undo_with(m: Manifest, claude_cli: bool, home: &Path) -> Result<i32> {
     if m.is_empty() {
         println!("nothing to undo: no init manifest at {}", m.path().display());
         println!("(if that init ran with a custom TOKENSTASH_HOME under an older version, run --undo with the same TOKENSTASH_HOME set: the record is adopted from there)");
@@ -327,7 +344,13 @@ fn undo_with(m: Manifest, claude_cli: bool) -> Result<i32> {
         }
     }
     // Init's own CLI registration goes before any entry comes back: `reinsert` yields to a
-    // tokenstash entry already present, and init's would be mistaken for the user's.
+    // tokenstash entry already present, and init's would be mistaken for the user's. A flag
+    // left set by a run that crashed after removing the registration is settled by looking:
+    // confirmed absence is completion, an unreadable file is not.
+    if cur.claude_mcp_registered && matches!(json_server_state(&home.join(".claude.json"), false), Ok(false)) {
+        cur.claude_mcp_registered = false;
+        cur.save()?;
+    }
     if cur.claude_mcp_registered {
         let ok = claude_cli && claude_mcp(&["remove", "-s", "user", "tokenstash"]);
         if ok { println!("✓ claude mcp remove tokenstash"); cur.claude_mcp_registered = false; cur.save()?; } else {
@@ -360,6 +383,16 @@ fn undo_with(m: Manifest, claude_cli: bool) -> Result<i32> {
 /// now (an agent uninstalled in between): they are recreated around the entry.
 fn reinsert(r: &Removed) -> Result<()> {
     if let Some(d) = r.file.parent() { fs::create_dir_all(d)?; }
+    if r.key == "section" {
+        if has_snippet(&r.file) { return Ok(()); }
+        let mut s = fs::read_to_string(&r.file).unwrap_or_default();
+        if !s.is_empty() && !s.ends_with('\n') { s.push('\n'); }
+        if !s.is_empty() { s.push('\n'); }
+        s.push_str(&r.value);
+        s.push('\n');
+        fs::write(&r.file, s)?;
+        return Ok(());
+    }
     if r.key == "mcp_servers" {
         let mut doc = read_toml(&r.file)?;
         let snip: toml_edit::DocumentMut = r.value.parse().map_err(|e| anyhow::anyhow!("the saved entry does not parse ({e})"))?;
@@ -542,9 +575,14 @@ fn unwire_auto(manifest: &mut Manifest, w: &Wiring) -> Result<()> {
     remove_json_server(manifest, &w.claude_json(), "Claude Code", true)?;
     remove_toml_server(manifest, &w.codex().join("config.toml"))?;
     let cagents = w.codex_agents();
-    if has_snippet(&cagents) {
-        manifest.mutate(&cagents, || strip_snippet(&cagents))?;
-        println!("✓ Codex: usage section removed from {}", cagents.display());
+    match fs::read_to_string(&cagents) {
+        Ok(text) if text.contains(SNIPPET_MARK) => {
+            manifest.mutate(&cagents, || strip_snippet(&cagents))?;
+            println!("✓ Codex: usage section removed from {}", cagents.display());
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => anyhow::bail!("reading {}: {e}", cagents.display()),
     }
     manifest.retire(&cagents)?;
     remove_json_server(manifest, &w.cursor().join("mcp.json"), "Cursor", false)?;
@@ -559,7 +597,7 @@ fn unwire_auto(manifest: &mut Manifest, w: &Wiring) -> Result<()> {
 /// the CLI flag and the whole-file record are reconciled either way.
 fn remove_json_server(manifest: &mut Manifest, p: &Path, name: &str, claude: bool) -> Result<()> {
     let recorded = manifest.recorded(p);
-    if json_has_server(p, claude) {
+    if json_server_state(p, claude)? {
         let mut v = read_json(p)?;
         let mut removed: Vec<(String, serde_json::Value)> = vec![];
         if let Some(m) = v.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
@@ -588,7 +626,7 @@ fn remove_json_server(manifest: &mut Manifest, p: &Path, name: &str, claude: boo
         fs::write(p, serde_json::to_string_pretty(&v)?)?;
         println!("✓ {name}: MCP server removed from {}", p.display());
     }
-    if claude && manifest.claude_mcp_registered && !json_has_server(p, false) {
+    if claude && manifest.claude_mcp_registered && !json_server_state(p, false)? {
         manifest.claude_mcp_registered = false;
         manifest.save()?;
     }
@@ -599,7 +637,7 @@ fn remove_json_server(manifest: &mut Manifest, p: &Path, name: &str, claude: boo
 /// Same for Codex's `mcp_servers.tokenstash`, keeping the user's comments and formatting.
 fn remove_toml_server(manifest: &mut Manifest, p: &Path) -> Result<()> {
     let recorded = manifest.recorded(p);
-    if toml_has_server(p) {
+    if toml_server_state(p)? {
         let mut doc = read_toml(p)?;
         let item = doc.get_mut("mcp_servers").and_then(|s| s.as_table_like_mut()).and_then(|s| s.remove("tokenstash"));
         if let (Some(item), false) = (item, recorded) {
@@ -874,12 +912,21 @@ fn read_toml(p: &Path) -> Result<toml_edit::DocumentMut> {
     existing.parse().map_err(|e| anyhow::anyhow!("{} is not valid TOML ({e}); fix it or add the MCP server by hand", p.display()))
 }
 
-fn toml_has_server(p: &Path) -> bool {
-    fs::read_to_string(p).ok()
-        .and_then(|s| s.parse::<toml_edit::DocumentMut>().ok())
-        .map(|d| d.get("mcp_servers").and_then(|m| m.get("tokenstash")).is_some())
-        .unwrap_or(false)
+/// Whether Codex's config holds a tokenstash entry. `Ok(false)` for a missing file; an
+/// unreadable or unparseable one is an error, not an absence — bookkeeping that treated it as
+/// one would give up records over a file whose state is unknown.
+fn toml_server_state(p: &Path) -> Result<bool> {
+    let s = match fs::read_to_string(p) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(anyhow::anyhow!("reading {}: {e}", p.display())),
+    };
+    let d: toml_edit::DocumentMut = s.parse().map_err(|e| anyhow::anyhow!("{} is not valid TOML ({e}); fix it or take the MCP server out by hand", p.display()))?;
+    Ok(d.get("mcp_servers").and_then(|m| m.get("tokenstash")).is_some())
 }
+
+/// For display (`doctor`): unknown reads as absent.
+fn toml_has_server(p: &Path) -> bool { toml_server_state(p).unwrap_or(false) }
 
 /// Add `mcpServers.tokenstash` to a JSON config owned by another tool. If the file exists
 /// but cannot be parsed as a JSON object, refuse rather than replace it.
@@ -913,12 +960,22 @@ fn read_json(p: &Path) -> Result<serde_json::Value> {
 }
 
 /// A tokenstash entry under `mcpServers`, or — `~/.claude.json`, where `claude mcp add`
-/// without `-s user` puts it — under any project's `mcpServers`.
-fn json_has_server(p: &Path, claude: bool) -> bool {
-    let Some(v) = fs::read_to_string(p).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) else { return false };
-    if v.get("mcpServers").and_then(|m| m.get("tokenstash")).is_some() { return true; }
-    claude && v.get("projects").and_then(|p| p.as_object()).is_some_and(|ps| ps.values().any(|proj| proj.get("mcpServers").and_then(|m| m.get("tokenstash")).is_some()))
+/// without `-s user` puts it — under any project's `mcpServers`. Same contract as
+/// [`toml_server_state`]: unknown is an error, not an absence.
+fn json_server_state(p: &Path, claude: bool) -> Result<bool> {
+    let s = match fs::read_to_string(p) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(anyhow::anyhow!("reading {}: {e}", p.display())),
+    };
+    if s.trim().is_empty() { return Ok(false); }
+    let v: serde_json::Value = serde_json::from_str(&s).map_err(|e| anyhow::anyhow!("{} is not valid JSON ({e}); fix it or take the MCP server out by hand", p.display()))?;
+    if v.get("mcpServers").and_then(|m| m.get("tokenstash")).is_some() { return Ok(true); }
+    Ok(claude && v.get("projects").and_then(|p| p.as_object()).is_some_and(|ps| ps.values().any(|proj| proj.get("mcpServers").and_then(|m| m.get("tokenstash")).is_some())))
 }
+
+/// For display (`doctor`): unknown reads as absent.
+fn json_has_server(p: &Path, claude: bool) -> bool { json_server_state(p, claude).unwrap_or(false) }
 
 const SNIPPET_MARK: &str = "<!-- tokenstash -->";
 const SNIPPET_END: &str = "<!-- /tokenstash -->";
@@ -1218,7 +1275,7 @@ mod tests {
         wire(&mut m, &w, AgentMode::Auto).unwrap();
         wire(&mut m, &w, AgentMode::Explicit).unwrap();
         let root = m.root.clone();
-        assert_eq!(undo_with(m, false).unwrap(), 0);
+        assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
         assert!(!root.join("init.manifest.json").exists());
         assert_eq!(read(&w.codex().join("config.toml")), codex_toml);
         for gone in [w.claude_skill_dir(), w.cursor_skill_dir(), w.codex_prompt(), w.gemini_command(), w.claude_json(), w.codex_agents(), w.cursor().join("mcp.json"), w.gemini().join("settings.json")] {
@@ -1251,7 +1308,7 @@ mod tests {
         assert!(m.files.iter().all(|(p, _)| !p.ends_with("mcp.json") && !p.ends_with("settings.json") && !p.ends_with("config.toml")), "{:?}", m.files);
         // After the switch: Codex's config.toml is back to the original; the user adds to it.
         write(&w.codex().join("config.toml"), &format!("{original}\n[mcp_servers.linear]\ncommand = \"linear-mcp\"\n"));
-        assert_eq!(undo_with(m, false).unwrap(), 0);
+        assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
         assert!(read(&w.cursor().join("mcp.json")).contains("linear-mcp") && read(&w.cursor().join("mcp.json")).contains("gh-mcp"));
         assert!(read(&w.gemini().join("settings.json")).contains("theme"));
         assert!(read(&w.codex().join("config.toml")).contains("linear-mcp") && read(&w.codex().join("config.toml")).contains("gh-mcp"));
@@ -1273,7 +1330,7 @@ mod tests {
         let mut cursor: serde_json::Value = serde_json::from_str(&read(&w.cursor().join("mcp.json"))).unwrap();
         cursor["mcpServers"]["linear"] = serde_json::json!({ "command": "linear-mcp" });
         write(&w.cursor().join("mcp.json"), &cursor.to_string());
-        assert_eq!(undo_with(m, false).unwrap(), 0);
+        assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
         let cursor: serde_json::Value = serde_json::from_str(&read(&w.cursor().join("mcp.json"))).unwrap();
         assert_eq!(cursor["mcpServers"]["tokenstash"]["command"], "/old/tokenstash");
         assert_eq!(cursor["mcpServers"]["linear"]["command"], "linear-mcp");
@@ -1301,7 +1358,7 @@ mod tests {
         assert!(!w.cursor_skill_dir().join("SKILL.md").exists());
         assert_eq!(read(&w.cursor_skill_dir().join("helper.sh")), "#!/bin/sh");
         write(&w.claude_skill_dir().join("notes.md"), "mine");
-        assert_eq!(undo_with(m, false).unwrap(), 0);
+        assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
         assert!(!w.claude_skill_dir().join("SKILL.md").exists());
         assert_eq!(read(&w.claude_skill_dir().join("notes.md")), "mine");
     }
@@ -1329,7 +1386,7 @@ mod tests {
         // The user changes the files afterwards...
         write(&w.cursor().join("mcp.json"), "{\"mcpServers\":{\"github\":{\"command\":\"gh-mcp\"},\"linear\":{\"command\":\"linear-mcp\"}}}");
         // ...and undo brings the entries back beside those changes.
-        assert_eq!(undo_with(m, false).unwrap(), 0);
+        assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
         let cursor: serde_json::Value = serde_json::from_str(&read(&w.cursor().join("mcp.json"))).unwrap();
         assert_eq!(cursor["mcpServers"]["tokenstash"]["command"], "/old/tokenstash");
         assert_eq!(cursor["mcpServers"]["linear"]["command"], "linear-mcp");
@@ -1357,7 +1414,7 @@ mod tests {
         assert!(!m.claude_mcp_registered);
         assert_eq!(m.entries.len(), 1, "{:?}", m.entries);
         assert!(m.entries[0].key.starts_with("projects/"));
-        assert_eq!(undo_with(m, false).unwrap(), 0);
+        assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
         let claude: serde_json::Value = serde_json::from_str(&read(&w.claude_json())).unwrap();
         assert!(claude["mcpServers"].get("tokenstash").is_none(), "init's own registration must not come back: {claude}");
         assert_eq!(claude["projects"]["/home/u/app"]["mcpServers"]["tokenstash"]["command"], "/old/tokenstash");
@@ -1391,7 +1448,7 @@ mod tests {
         m.claude_mcp_registered = true;
         m.save().unwrap();
         let root = m.root.clone();
-        assert_eq!(undo_with(m, false).unwrap(), 1, "unfinished: init's registration is still there");
+        assert_eq!(undo_with(m, false, &w.home).unwrap(), 1, "unfinished: init's registration is still there");
         let left = Manifest::load_at(root).unwrap();
         assert!(left.claude_mcp_registered && left.entries.len() == 1, "{left:?}");
         assert!(read(&w.claude_json()).contains("/opt/tokenstash") && !read(&w.claude_json()).contains("/old/tokenstash"));
@@ -1406,7 +1463,7 @@ mod tests {
         wire(&mut m, &w, AgentMode::Explicit).unwrap();
         fs::remove_dir_all(w.cursor()).unwrap();
         fs::remove_dir_all(w.codex()).unwrap();
-        assert_eq!(undo_with(m, false).unwrap(), 0);
+        assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
         let cursor: serde_json::Value = serde_json::from_str(&read(&w.cursor().join("mcp.json"))).unwrap();
         assert_eq!(cursor["mcpServers"]["tokenstash"]["command"], "/old/tokenstash");
         assert!(toml_has_server(&w.codex().join("config.toml")));
@@ -1420,6 +1477,76 @@ mod tests {
         let m = Manifest::load_at(root).unwrap();
         assert_eq!(m.files.len(), 1);
         assert!(m.entries.is_empty() && !m.is_empty());
+    }
+
+    /// Astra: a marked section the global AGENTS.md held before init (an older init's, edited
+    /// by the user) is not an MCP entry, but it is theirs: it comes back on undo.
+    #[test]
+    fn a_pre_existing_agents_section_comes_back_on_undo() {
+        let (w, mut m) = machine("old-section");
+        let old = format!("# Rules\n\n{SNIPPET_MARK}\n## Keys\n\nmy own wording\n{SNIPPET_END}\n");
+        write(&w.codex_agents(), &old);
+        wire(&mut m, &w, AgentMode::Auto).unwrap();
+        assert!(read(&w.codex_agents()).contains("secrets_request") && !read(&w.codex_agents()).contains("my own wording"));
+        wire(&mut m, &w, AgentMode::Explicit).unwrap();
+        assert_eq!(read(&w.codex_agents()), "# Rules\n");
+        assert!(m.entries.iter().any(|r| r.key == "section" && r.value.contains("my own wording")), "{:?}", m.entries);
+        write(&w.codex_agents(), "# Rules\n\nBe brief.\n");
+        assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
+        assert_eq!(read(&w.codex_agents()), format!("# Rules\n\nBe brief.\n\n{SNIPPET_MARK}\n## Keys\n\nmy own wording\n{SNIPPET_END}\n"));
+    }
+
+    /// Astra: a config that cannot be parsed is unknown, not empty. The switch stops with an
+    /// error and every record stays, instead of ownership being given up or the whole-file
+    /// record retired over a registration that is still there.
+    #[test]
+    fn an_unreadable_config_stops_the_switch_and_keeps_the_records() {
+        let (w, mut m) = machine("unparseable");
+        wire(&mut m, &w, AgentMode::Auto).unwrap();
+        write(&w.cursor().join("mcp.json"), "{ not json");
+        let err = wire(&mut m, &w, AgentMode::Explicit).unwrap_err();
+        assert!(err.to_string().contains("mcp.json") && err.to_string().contains("not valid JSON"), "{err:#}");
+        // The files before it in the order were settled; the unreadable one and everything
+        // after it keep their records, and nothing was recorded as removed.
+        assert!(m.recorded(&w.cursor().join("mcp.json")) && m.recorded(&w.gemini().join("settings.json")), "{:?}", m.files);
+        assert!(m.entries.is_empty());
+        assert_eq!(read(&w.cursor().join("mcp.json")), "{ not json", "left exactly as found");
+        // Same for the flag: an unreadable ~/.claude.json does not settle it.
+        let (w2, mut m2) = machine("unparseable-claude");
+        write(&w2.claude_json(), "{ not json");
+        m2.claude_mcp_registered = true;
+        m2.save().unwrap();
+        assert!(wire(&mut m2, &w2, AgentMode::Explicit).is_err());
+        assert!(m2.claude_mcp_registered);
+    }
+
+    /// Astra: a backup that cannot be read keeps the whole-file record rather than dropping
+    /// the only way back.
+    #[test]
+    fn an_unreadable_backup_keeps_the_whole_file_record() {
+        let (w, mut m) = machine("bad-backup");
+        write(&w.cursor().join("mcp.json"), "{\"mcpServers\":{\"tokenstash\":{\"command\":\"/old/tokenstash\"}}}");
+        wire(&mut m, &w, AgentMode::Auto).unwrap();
+        let backup = m.files.iter().find(|(p, _)| p == &w.cursor().join("mcp.json")).unwrap().1.clone().unwrap();
+        fs::write(&backup, "{ corrupt").unwrap();
+        wire(&mut m, &w, AgentMode::Explicit).unwrap();
+        assert!(m.recorded(&w.cursor().join("mcp.json")) && m.entries.is_empty(), "{:?} {:?}", m.files, m.entries);
+    }
+
+    /// Astra: a flag left set by a run that crashed after removing init's registration must
+    /// not make undo wait forever; confirmed absence settles it.
+    #[test]
+    fn undo_settles_a_stale_cli_flag_by_looking() {
+        let (w, mut m) = machine("stale-flag");
+        write(&w.claude_json(), "{\"mcpServers\":{\"tokenstash\":{\"command\":\"/old/tokenstash\"}},\"projects\":{\"/a\":{\"mcpServers\":{\"tokenstash\":{\"command\":\"/old/tokenstash\"}}}}}");
+        wire(&mut m, &w, AgentMode::Explicit).unwrap();
+        assert_eq!(m.entries.len(), 2);
+        m.claude_mcp_registered = true;
+        m.save().unwrap();
+        assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
+        let claude: serde_json::Value = serde_json::from_str(&read(&w.claude_json())).unwrap();
+        assert_eq!(claude["mcpServers"]["tokenstash"]["command"], "/old/tokenstash");
+        assert_eq!(claude["projects"]["/a"]["mcpServers"]["tokenstash"]["command"], "/old/tokenstash");
     }
 
     /// Astra: `init --project` sections must follow the mode, in every project they were
@@ -1445,12 +1572,17 @@ mod tests {
         assert_eq!(read(&proj).matches(SNIPPET_MARK).count(), 1);
         assert!(snippet_is(&proj, AgentMode::Explicit) && !read(&proj).contains("secrets_request"));
         assert!(stray_project_sections(&m, &w, AgentMode::Explicit).is_empty());
+        // A recorded project file that somehow still carries the auto section is a stray.
+        let other = scratch("projects-other").join("AGENTS.md");
+        write(&other, "# Other\n");
+        m.mutate(&other, || set_snippet(&other, AgentMode::Auto)).unwrap();
+        assert_eq!(stray_project_sections(&m, &w, AgentMode::Explicit), vec![other.clone()]);
         wire(&mut m, &w, AgentMode::Auto).unwrap();
         // set_snippet on a file already holding the right section changes nothing.
         let before = read(&proj);
         set_snippet(&proj, AgentMode::Auto).unwrap();
         assert_eq!(read(&proj), before);
-        assert_eq!(undo_with(m, false).unwrap(), 0);
+        assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
         assert_eq!(read(&proj), "# App\n");
     }
 
