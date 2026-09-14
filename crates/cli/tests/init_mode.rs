@@ -59,6 +59,11 @@ fn the_skill_and_snippet_print_for_each_mode_without_touching_anything() {
     assert!(out(&run(&home, &proj, &["init", "--print-snippet"])).contains("secrets_request"));
     assert!(!home.join("tokenstash.db").exists(), "--print-* must not set anything up");
     assert!(!proj.join("AGENTS.md").exists());
+    // Without --mode, printing follows the mode remembered for this machine.
+    std::fs::write(home.join("config.toml"), format!("{}agent_mode = \"explicit\"\n", std::fs::read_to_string(home.join("config.toml")).unwrap())).unwrap();
+    assert!(out(&run(&home, &proj, &["init", "--print-skill"])).contains("disable-model-invocation: true"));
+    assert!(out(&run(&home, &proj, &["init", "--print-snippet"])).contains("Do not run tokenstash until the user invokes"));
+    assert!(!out(&run(&home, &proj, &["init", "--print-skill", "--mode", "auto"])).contains("disable-model-invocation"));
 }
 
 /// Astra: an agent with a shell must not be able to choose the mode (it could put automatic

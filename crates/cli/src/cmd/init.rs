@@ -384,8 +384,14 @@ fn undo_with(m: Manifest, claude_cli: bool, home: &Path) -> Result<i32> {
 fn reinsert(r: &Removed) -> Result<()> {
     if let Some(d) = r.file.parent() { fs::create_dir_all(d)?; }
     if r.key == "section" {
-        if has_snippet(&r.file) { return Ok(()); }
-        let mut s = fs::read_to_string(&r.file).unwrap_or_default();
+        // Read once; only a missing file is empty text. Anything else that cannot be read
+        // (not UTF-8, say) is an error, not a blank to overwrite.
+        let mut s = match fs::read_to_string(&r.file) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(anyhow::anyhow!("reading {}: {e}", r.file.display())),
+        };
+        if s.contains(SNIPPET_MARK) { return Ok(()); }
         if !s.is_empty() && !s.ends_with('\n') { s.push('\n'); }
         if !s.is_empty() { s.push('\n'); }
         s.push_str(&r.value);
@@ -697,8 +703,11 @@ fn resync_project_snippets(manifest: &mut Manifest, w: &Wiring, mode: AgentMode)
 
 pub fn init(a: InitArgs) -> Result<i32> {
     let env_home = std::env::var("TOKENSTASH_HOME").ok().filter(|h| !h.is_empty());
-    if a.print_snippet { print!("{}", snippet_for(a.mode.map(Into::into).unwrap_or_default())); return Ok(0); }
-    if a.print_skill { print!("{}", skill_text(a.mode.map(Into::into).unwrap_or_default(), env_home.as_deref())); return Ok(0); }
+    // Printing follows the mode chosen for this machine unless one is named, so text
+    // redirected into a file by hand is the text init would have written.
+    let print_mode = || a.mode.map(Into::into).unwrap_or_else(|| Config::load().map(|c| c.agent_mode).unwrap_or_default());
+    if a.print_snippet { print!("{}", snippet_for(print_mode())); return Ok(0); }
+    if a.print_skill { print!("{}", skill_text(print_mode(), env_home.as_deref())); return Ok(0); }
     // Undo restores what init found, which can be automatic wiring explicit mode took out;
     // the mode and a project's instructions decide how agents reach tokenstash. All three
     // are the person's call, not an agent's.
@@ -1494,6 +1503,23 @@ mod tests {
         write(&w.codex_agents(), "# Rules\n\nBe brief.\n");
         assert_eq!(undo_with(m, false, &w.home).unwrap(), 0);
         assert_eq!(read(&w.codex_agents()), format!("# Rules\n\nBe brief.\n\n{SNIPPET_MARK}\n## Keys\n\nmy own wording\n{SNIPPET_END}\n"));
+    }
+
+    /// Astra: an AGENTS.md that exists but cannot be read as text is not blank; undo must not
+    /// overwrite it with the saved section, and the entry must stay for a retry.
+    #[test]
+    fn undo_does_not_overwrite_an_unreadable_agents_file_with_the_section() {
+        let (w, mut m) = machine("bad-utf8");
+        write(&w.codex_agents(), &format!("# Rules\n\n{SNIPPET_MARK}\n## Keys\n\nmine\n{SNIPPET_END}\n"));
+        wire(&mut m, &w, AgentMode::Auto).unwrap();
+        wire(&mut m, &w, AgentMode::Explicit).unwrap();
+        assert!(m.entries.iter().any(|r| r.key == "section"));
+        let bytes = b"# Rules\n\xff\xfe not text\n".to_vec();
+        fs::write(w.codex_agents(), &bytes).unwrap();
+        let root = m.root.clone();
+        assert_eq!(undo_with(m, false, &w.home).unwrap(), 1, "unfinished: the section could not be put back");
+        assert_eq!(fs::read(w.codex_agents()).unwrap(), bytes, "left exactly as found");
+        assert!(Manifest::load_at(root).unwrap().entries.iter().any(|r| r.key == "section"));
     }
 
     /// Astra: a config that cannot be parsed is unknown, not empty. The switch stops with an
