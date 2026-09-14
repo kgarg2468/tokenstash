@@ -3421,3 +3421,19 @@ fn every_other_git_entry_still_counts_as_a_repository() {
         }
     }
 }
+
+/// `agent_mode` is written only when it is not the default, so a config this version saved
+/// still loads in 0.2 (`deny_unknown_fields`) for everyone who kept auto mode.
+#[test]
+fn agent_mode_round_trips_and_the_default_is_not_written() {
+    use crate::config::AgentMode;
+    let auto = toml::to_string(&Config::default()).unwrap();
+    assert!(!auto.contains("agent_mode"), "{auto}");
+    let explicit = toml::to_string(&Config { agent_mode: AgentMode::Explicit, ..Default::default() }).unwrap();
+    assert!(explicit.contains("agent_mode = \"explicit\""), "{explicit}");
+    let back: Config = toml::from_str(&explicit).unwrap();
+    assert_eq!(back.agent_mode, AgentMode::Explicit);
+    let back: Config = toml::from_str(&auto).unwrap();
+    assert_eq!(back.agent_mode, AgentMode::Auto);
+    assert!(toml::from_str::<Config>("agent_mode = \"sometimes\"\n").is_err());
+}

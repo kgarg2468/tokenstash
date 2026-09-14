@@ -48,17 +48,16 @@ pub fn doctor() -> Result<i32> {
         format!("{}  {}", crate::util::inbox_url_tty(&cfg, None, None, inbox, crate::util::Stream::Stdout), notify::describe(inbox)),
     );
 
+    check("agent mode", true, crate::cmd::init::describe_mode(cfg.agent_mode).into());
     let home = dirs::home_dir().unwrap_or_default();
-    let claude_skill = home.join(".claude/skills/tokenstash/SKILL.md").exists();
-    let codex = std::fs::read_to_string(home.join(".codex/config.toml")).map(|s| s.contains("mcp_servers.tokenstash")).unwrap_or(false);
-    let cursor = std::fs::read_to_string(home.join(".cursor/mcp.json")).map(|s| s.contains("tokenstash")).unwrap_or(false);
-    let gemini = std::fs::read_to_string(home.join(".gemini/settings.json")).map(|s| s.contains("tokenstash")).unwrap_or(false);
-    let mut agents = vec![];
-    if claude_skill { agents.push("claude-code"); }
-    if codex { agents.push("codex"); }
-    if cursor { agents.push("cursor"); }
-    if gemini { agents.push("gemini-cli"); }
-    check("agents", true, if agents.is_empty() { "none configured (run `tokenstash init`)".into() } else { agents.join(", ") });
+    let agents = crate::cmd::init::installed(&home);
+    // Auto mode's hooks left behind in explicit mode (or the other way round) mean the agent
+    // is not in the mode config says: a registration made by hand after the switch, say.
+    let stray = match cfg.agent_mode {
+        tokenstash_core::config::AgentMode::Explicit => agents.iter().any(|a| a.contains("mcp") || a.contains("snippet") || a.contains("skill: auto")),
+        tokenstash_core::config::AgentMode::Auto => agents.iter().any(|a| a.contains("prompt") || a.contains("command") || a.contains("skill: explicit")),
+    };
+    ok &= check("agents", !stray, if agents.is_empty() { "none configured (run `tokenstash init`)".into() } else if stray { format!("{}  (not all in {} mode: re-run `tokenstash init`)", agents.join(", "), cfg.agent_mode) } else { agents.join(", ") });
 
     let project = tokenstash_core::project::current();
     let standing = match Db::open_default() {

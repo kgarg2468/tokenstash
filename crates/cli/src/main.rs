@@ -49,7 +49,7 @@ enum Cmd {
     Workspaces(cmd::admin::WorkspacesArgs),
     /// Show recent audit events (never values).
     Audit(cmd::admin::AuditArgs),
-    /// Detect agents, write MCP config + skill file, choose a stash backend.
+    /// Detect agents and wire them up (MCP server + skill, or a `/tokenstash` command with --mode explicit); choose a stash backend.
     Init(cmd::init::InitArgs),
     /// Check that everything works.
     Doctor,
