@@ -26,8 +26,14 @@ fn home(name: &str) -> PathBuf {
     h
 }
 
+/// $HOME and the config root are scratch too: `init` keeps its undo record under the fixed
+/// config dir and `doctor` reads the agents' files under $HOME, and neither may be the
+/// developer's.
 fn run(home: &Path, cwd: &Path, args: &[&str]) -> std::process::Output {
+    let user_home = home.join("user-home");
+    std::fs::create_dir_all(&user_home).unwrap();
     Command::new(env!("CARGO_BIN_EXE_tokenstash")).args(args).current_dir(cwd)
+        .env("HOME", &user_home).env("XDG_CONFIG_HOME", user_home.join(".config"))
         .env("TOKENSTASH_HOME", home).env("TOKENSTASH_STASH", "insecure-file").env_remove("CLAUDECODE")
         .stdout(Stdio::piped()).stderr(Stdio::piped()).output().unwrap()
 }
