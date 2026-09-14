@@ -16,8 +16,11 @@
 # bare `npm install tokenstash` (and bun / pnpm / npx) resolves to until the final version
 # moves `latest`. Keep that window short; a dry run on an established name is free.
 #
-# Platform packages are published first; the launcher last, so a partially failed release
-# never leaves a launcher that resolves to a missing platform package.
+# Platform packages are published first and each must be VISIBLE on the registry before the
+# launcher is published, so a launcher that pins them never resolves to a package the
+# registry has accepted but does not serve yet. (0.2.0: npm took ~11 minutes to serve one
+# platform package it had accepted; the launcher was already live, so `npm install` on
+# that platform failed for those minutes.)
 set -euo pipefail
 version="${1:?version}"; src="${2:?tarball dir}"; out="${3:?out dir}"
 tagopt=(); case "$version" in *-*) tagopt=(--tag next) ;; esac
@@ -29,29 +32,37 @@ here="$(cd "$(dirname "$0")/.." && pwd)"
 # dependencies can hide behind a familiar binary). Anything else stops the release.
 # Never unpublish: npm forbids re-using name@version forever and the launcher pins exact
 # versions — ship a patch release instead.
+# The tarball URL for name@version, from the registry's own document with the CDN cache
+# bypassed (`?write=true`): `npm view` reads through the CDN, which can serve a packument
+# up to five minutes stale. A version the registry does not serve yet is a miss.
+tarball_url() { # <name>
+  curl -fsSL "https://registry.npmjs.org/$1?write=true" 2>/dev/null \
+    | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["versions"][sys.argv[1]]["dist"]["tarball"])' "$version" 2>/dev/null
+}
 same_package() { # <pkg dir>
   local dir="$1" url tmp ok=1
-  url=$(npm view "$name@$version" dist.tarball 2>/dev/null) || return 1
+  url=$(tarball_url "$name") && [ -n "$url" ] || return 1
   tmp=$(mktemp -d); mkdir -p "$tmp/theirs" "$tmp/ours" "$tmp/pack"
   if curl -fsSL "$url" -o "$tmp/theirs.tgz" && tar -xzf "$tmp/theirs.tgz" -C "$tmp/theirs" \
      && (cd "$dir" && npm pack --silent --pack-destination "$tmp/pack" >/dev/null) \
      && tar -xzf "$tmp"/pack/*.tgz -C "$tmp/ours" && diff -r "$tmp/theirs" "$tmp/ours" >/dev/null; then ok=0; fi
   rm -rf "$tmp"; return $ok
 }
-# The registry can answer a version it accepted seconds ago with a 404 — writes and reads take
-# different paths — so the final check gives each package up to two minutes to appear before
-# judging it. A package that is there and differs still fails; it just fails after the wait.
+# The registry can answer a version it accepted with a 404 for a while — writes and reads
+# take different paths, and 0.2.0 saw eleven minutes — so a package gets up to fifteen
+# minutes to appear before it is judged. A package that is there and differs still fails; it
+# just fails after the wait.
 settled() { # <pkg dir>
   local i url
-  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  for i in $(seq 1 60); do
     same_package "$1" && return 0
-    if [ "$i" -lt 12 ]; then sleep 10; fi
+    if [ "$i" -lt 60 ]; then sleep 15; fi
   done
   # Two different failures read the same from here; say which one this was.
-  if url=$(npm view "$name@$version" dist.tarball 2>/dev/null) && [ -n "$url" ]; then
+  if url=$(tarball_url "$name") && [ -n "$url" ]; then
     echo "$name@$version is on the registry ($url) but does not match what we built, or could not be compared" >&2
   else
-    echo "$name@$version did not appear on the registry within two minutes" >&2
+    echo "$name@$version did not appear on the registry within fifteen minutes" >&2
   fi
   return 1
 }
@@ -90,6 +101,12 @@ JSON
   printf '# tokenstash-%s\n\nPrebuilt `tokenstash` binary for this platform. Install the `tokenstash` package instead; it selects this one automatically.\n' "$name" > "$pkg/README.md"
   publish "$pkg"
 done
+# Every platform package must be served before the launcher that pins them is published.
+if [ "${NPM_PUBLISH:-}" = 1 ]; then
+  for name in linux-x64 linux-arm64 darwin-arm64 darwin-x64; do
+    name="tokenstash-$name"; settled "$out/$name" || { echo "$name@$version is missing or not ours; the launcher is not published" >&2; exit 1; }
+  done
+fi
 main="$out/tokenstash"; mkdir -p "$main"
 cp -r "$here/npm/tokenstash/bin" "$main/"
 cp "$here/LICENSE" "$main/"
@@ -104,10 +121,8 @@ json.dump(p, open(sys.argv[2], "w"), indent=2); open(sys.argv[2], "a").write("\n
 PY
 publish "$main"
 if [ "${NPM_PUBLISH:-}" = 1 ]; then
-  # Final check: every package resolves AND is exactly ours.
-  for name in linux-x64 linux-arm64 darwin-arm64 darwin-x64; do
-    name="tokenstash-$name"; settled "$out/$name" || { echo "$name@$version is missing or not ours" >&2; exit 1; }
-  done
+  # Final check: the launcher resolves AND is exactly ours (the platform packages were
+  # checked before it was published).
   name=tokenstash; settled "$main" || { echo "tokenstash@$version is missing or not ours" >&2; exit 1; }
   # What the registry actually did with the tags, in the job log: the only place the
   # "first publish takes latest" behaviour above is observable rather than assumed. Never
