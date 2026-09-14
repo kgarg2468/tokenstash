@@ -114,10 +114,13 @@ rm -rf "$reg"/* "$work/out"
 tampered="$work/tampered"; mkdir -p "$tampered"
 cat > "$work/bin/npm-tamper" <<SH
 #!/usr/bin/env bash
-# after the real fake publish, replace linux-x64's served tarball with something else
+# After the fake publish of linux-x64, replace its served tarball with something else —
+# before returning, so the release script can never observe the original.
 "$work/bin/npm.real" "\$@"; status=\$?
 if [ "\$1" = publish ] && grep -q '"name": "tokenstash-linux-x64"' package.json; then
-  ( sleep 0.2; d="$reg/tokenstash-linux-x64"; mkdir -p "$tampered/pkg"; printf '{"name":"tokenstash-linux-x64","version":"0.0.0-test.1","description":"not ours"}\n' > "$tampered/pkg/package.json"; tar -czf "\$d/0.0.0-test.1.tgz" -C "$tampered" pkg ) &
+  d="$reg/tokenstash-linux-x64"; mkdir -p "$tampered/pkg"
+  printf '{"name":"tokenstash-linux-x64","version":"0.0.0-test.1","description":"not ours"}\n' > "$tampered/pkg/package.json"
+  tar -czf "\$d/0.0.0-test.1.tgz" -C "$tampered" pkg
 fi
 exit \$status
 SH
