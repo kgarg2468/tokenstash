@@ -64,6 +64,11 @@ fn the_skill_and_snippet_print_for_each_mode_without_touching_anything() {
     assert!(out(&run(&home, &proj, &["init", "--print-skill"])).contains("disable-model-invocation: true"));
     assert!(out(&run(&home, &proj, &["init", "--print-snippet"])).contains("Do not run tokenstash until the user invokes"));
     assert!(!out(&run(&home, &proj, &["init", "--print-skill", "--mode", "auto"])).contains("disable-model-invocation"));
+    // A config that does not load is an error, not a silent fall-back to auto text.
+    std::fs::write(home.join("config.toml"), "agent_mode = \"explicit\"\nverify_every = \"soon\"\n").unwrap();
+    let o = run(&home, &proj, &["init", "--print-skill"]);
+    assert!(!o.status.success() && err(&o).contains("verify_every"), "{}", err(&o));
+    assert!(out(&o).is_empty());
 }
 
 /// Astra: an agent with a shell must not be able to choose the mode (it could put automatic
