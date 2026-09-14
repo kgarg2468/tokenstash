@@ -5,7 +5,9 @@
 //! command the person types (`/tokenstash`), which runs the CLI: nothing an agent reads
 //! unprompted mentions tokenstash, so a session in which it is never typed never touches it.
 //! Switching modes removes the other mode's wiring, or the agent would keep calling tokenstash
-//! on its own after the person asked it not to.
+//! on its own after the person asked it not to. Choosing a mode, writing project instructions
+//! and undoing are a person's decisions: an agent with a shell could otherwise put automatic
+//! mode back.
 
 use anyhow::Result;
 use clap::Args;
@@ -20,13 +22,13 @@ pub const SKILL_MD: &str = include_str!("../../SKILL.md");
 pub struct InitArgs {
     /// How agents reach tokenstash: `auto` (registers the MCP server; the agent asks on its own)
     /// or `explicit` (a `/tokenstash` command you type; runs the CLI; nothing automatic).
-    /// Remembered in config.toml, so a later `init` without --mode keeps it.
+    /// Remembered in config.toml, so a later `init` without --mode keeps it. For a person at a terminal.
     #[arg(long, value_enum)]
     pub mode: Option<Mode>,
-    /// Also write an AGENTS.md snippet into the current project.
+    /// Also write an AGENTS.md section for the mode into the current project. For a person at a terminal.
     #[arg(long)]
     pub project: bool,
-    /// Print the AGENTS.md snippet and exit (no files touched).
+    /// Print the AGENTS.md section and exit (no files touched).
     #[arg(long)]
     pub print_snippet: bool,
     /// Print the skill file for the mode and exit (no files touched).
@@ -39,7 +41,8 @@ pub struct InitArgs {
     #[arg(long = "trust", hide = true)]
     pub trust: Vec<PathBuf>,
     /// Undo a previous `init`: restore every agent config file it changed (from the backups
-    /// it took), remove the skill file and the MCP registrations. Leaves the stash alone.
+    /// it took), remove the skill files, commands and MCP registrations. Leaves the stash alone.
+    /// For a person at a terminal.
     #[arg(long)]
     pub undo: bool,
 }
@@ -51,15 +54,30 @@ impl From<Mode> for AgentMode {
     fn from(m: Mode) -> Self { match m { Mode::Auto => AgentMode::Auto, Mode::Explicit => AgentMode::Explicit } }
 }
 
+/// An MCP registration explicit mode took out that init had not made: the user's own
+/// `claude mcp add`, a Cursor entry written by hand. Undo puts the entry back — the entry,
+/// not the file, so nothing the user changed in that file since is lost.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct Removed {
+    file: PathBuf,
+    /// `mcpServers` (a JSON config's top level), `projects/<path>` (a Claude local-scope
+    /// registration in `~/.claude.json`), or `mcp_servers` (Codex's config.toml).
+    key: String,
+    /// The entry as JSON text, or for TOML a document holding just `[mcp_servers.tokenstash]`.
+    value: String,
+}
+
 /// What `init` did to files it does not own, so `--undo` can put them back exactly.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct Manifest {
     /// (path, backup) — `backup` is `None` when the file did not exist before.
     files: Vec<(PathBuf, Option<PathBuf>)>,
-    /// Directories created wholesale (the skill dirs).
+    /// Skill directories init created.
     dirs: Vec<PathBuf>,
     /// `claude mcp add` was run, so `claude mcp remove` undoes it.
     claude_mcp_registered: bool,
+    #[serde(default)]
+    entries: Vec<Removed>,
     /// Where this manifest and its backups live. Not part of the record.
     #[serde(skip)]
     root: PathBuf,
@@ -105,11 +123,15 @@ impl Manifest {
         m.root = root;
         Ok(m)
     }
+    fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.dirs.is_empty() && !self.claude_mcp_registered && self.entries.is_empty()
+    }
     fn save(&self) -> Result<()> {
         fs::create_dir_all(&self.root)?;
         tokenstash_core::fsutil::write_atomic_private(&self.path(), &serde_json::to_string_pretty(self)?)?;
         Ok(())
     }
+    fn recorded(&self, p: &Path) -> bool { self.files.iter().any(|(q, _)| q == p) }
     /// Back up `p`, run the mutation, and record the file ONLY if the mutation succeeded —
     /// a failed merge changed nothing, so `--undo` must not later "restore" a stale copy
     /// over work the user did afterwards. The manifest is saved after every recorded
@@ -117,7 +139,7 @@ impl Manifest {
     /// Idempotent across re-runs: the backup taken by the FIRST init is the one that
     /// matters, later runs keep it.
     fn mutate(&mut self, p: &Path, f: impl FnOnce() -> Result<()>) -> Result<()> {
-        if self.files.iter().any(|(q, _)| q == p) {
+        if self.recorded(p) {
             return f();
         }
         let backup = if p.exists() {
@@ -158,7 +180,7 @@ impl Manifest {
 
     /// Put one recorded file back the way init found it — the backup, or nothing — and drop
     /// its record. For a file the other agent mode owns when modes switch: the file is
-    /// tokenstash's own (a `tokenstash.md` prompt, a skill dir), so restoring the original is
+    /// tokenstash's own (a `tokenstash.md` prompt, a skill file), so restoring the original is
     /// the right move, unlike the shared configs where only the entry is taken out. A file
     /// that is not in the manifest is not init's to touch: `Ok(false)`.
     fn release(&mut self, p: &Path) -> Result<bool> {
@@ -167,31 +189,90 @@ impl Manifest {
         match &backup {
             Some(b) if b.exists() => { fs::copy(b, p)?; }
             Some(b) => anyhow::bail!("backup of {} missing at {}", p.display(), b.display()),
-            None => match fs::remove_file(p) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            },
+            None => remove_file_if_present(p)?,
         }
         self.files.remove(i);
         self.save()?;
         Ok(true)
     }
 
-    /// Remove a directory init created wholesale and drop its record. `Ok(false)` if the
-    /// directory is not init's.
+    /// Remove a skill directory init created: its SKILL.md, then the directory if that was
+    /// all it held. Anything else in there is not init's (a script the user added), so the
+    /// directory stays with it and the record is dropped either way.
     fn release_dir(&mut self, d: &Path) -> Result<bool> {
         let Some(i) = self.dirs.iter().position(|q| q == d) else { return Ok(false) };
-        match fs::remove_dir_all(d) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-        // A file inside that directory has its own record; it is gone with the directory.
+        remove_skill_dir(d)?;
         self.files.retain(|(p, _)| !p.starts_with(d));
         self.dirs.remove(i);
         self.save()?;
         Ok(true)
+    }
+
+    /// A shared config init changed is back to what init found — the tokenstash entry is out
+    /// and the rest matches the backup, or init created it and nothing else was ever put in
+    /// it — so its whole-file record is retired: an undo later would only restore a copy
+    /// over whatever the user changes from now on. A file that differs from its backup keeps
+    /// the record, since something in it is still init's to put back.
+    fn retire_if_pristine(&mut self, p: &Path) -> Result<()> {
+        let Some(i) = self.files.iter().position(|(q, _)| q == p) else { return Ok(()) };
+        let pristine = match &self.files[i].1 {
+            Some(b) => same_content(p, b),
+            None => effectively_empty(p),
+        };
+        if !pristine { return Ok(()); }
+        if self.files[i].1.is_none() { remove_file_if_present(p)?; }
+        self.files.remove(i);
+        self.save()?;
+        Ok(())
+    }
+}
+
+fn remove_file_if_present(p: &Path) -> Result<()> {
+    match fs::remove_file(p) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// SKILL.md out, then the directory if it is empty; a directory holding the user's other
+/// files is left, and said so.
+fn remove_skill_dir(d: &Path) -> Result<()> {
+    remove_file_if_present(&d.join("SKILL.md"))?;
+    match fs::remove_dir(d) {
+        Ok(()) => println!("✓ removed {}", d.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("✓ removed {}", d.display()),
+        Err(_) => println!("! left {}: it holds files init did not write", d.display()),
+    }
+    Ok(())
+}
+
+/// Same bytes, or the same document (a config rewritten by serde_json/toml_edit differs in
+/// whitespace from the user's original and nothing else).
+fn same_content(a: &Path, b: &Path) -> bool {
+    let (Ok(x), Ok(y)) = (fs::read_to_string(a), fs::read_to_string(b)) else { return false };
+    if x == y { return true; }
+    match a.extension().and_then(|e| e.to_str()) {
+        Some("json") => matches!((serde_json::from_str::<serde_json::Value>(&x), serde_json::from_str::<serde_json::Value>(&y)), (Ok(p), Ok(q)) if p == q),
+        Some("toml") => matches!((toml::from_str::<toml::Value>(&x), toml::from_str::<toml::Value>(&y)), (Ok(p), Ok(q)) if p == q),
+        _ => false,
+    }
+}
+
+/// Nothing but empty containers: `{"mcpServers": {}}`, `[mcp_servers]` with no entries, a
+/// blank AGENTS.md.
+fn effectively_empty(p: &Path) -> bool {
+    let Ok(s) = fs::read_to_string(p) else { return true };
+    fn json_empty(v: &serde_json::Value) -> bool {
+        match v { serde_json::Value::Object(m) => m.values().all(json_empty), serde_json::Value::Array(a) => a.is_empty(), _ => false }
+    }
+    fn toml_empty(v: &toml::Value) -> bool {
+        match v { toml::Value::Table(t) => t.values().all(toml_empty), toml::Value::Array(a) => a.is_empty(), _ => false }
+    }
+    match p.extension().and_then(|e| e.to_str()) {
+        Some("json") => serde_json::from_str::<serde_json::Value>(&s).map(|v| json_empty(&v)).unwrap_or(false),
+        Some("toml") => toml::from_str::<toml::Value>(&s).map(|v| toml_empty(&v)).unwrap_or(false),
+        _ => s.trim().is_empty(),
     }
 }
 
@@ -201,7 +282,7 @@ fn undo() -> Result<i32> {
 }
 
 fn undo_with(m: Manifest) -> Result<i32> {
-    if m.files.is_empty() && m.dirs.is_empty() && !m.claude_mcp_registered {
+    if m.is_empty() {
         println!("nothing to undo: no init manifest at {}", m.path().display());
         println!("(if that init ran with a custom TOKENSTASH_HOME under an older version, run --undo with the same TOKENSTASH_HOME set: the record is adopted from there)");
         return Ok(0);
@@ -216,11 +297,7 @@ fn undo_with(m: Manifest) -> Result<i32> {
         let r: Result<()> = match &backup {
             Some(b) if b.exists() => fs::copy(b, &p).map(|_| ()).map_err(Into::into),
             Some(b) => Err(anyhow::anyhow!("backup missing at {}", b.display())),
-            None => match fs::remove_file(&p) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e.into()),
-            },
+            None => remove_file_if_present(&p),
         };
         match r {
             Ok(()) => {
@@ -234,10 +311,17 @@ fn undo_with(m: Manifest) -> Result<i32> {
     let mut i = 0;
     while i < cur.dirs.len() {
         let d = cur.dirs[i].clone();
-        match fs::remove_dir_all(&d) {
-            Ok(()) => { println!("✓ removed {}", d.display()); cur.dirs.remove(i); cur.save()?; }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => { println!("✓ removed {}", d.display()); cur.dirs.remove(i); cur.save()?; }
+        match remove_skill_dir(&d) {
+            Ok(()) => { cur.dirs.remove(i); cur.save()?; }
             Err(e) => { println!("! {}: {e} (kept in the manifest)", d.display()); i += 1; }
+        }
+    }
+    let mut i = 0;
+    while i < cur.entries.len() {
+        let r = cur.entries[i].clone();
+        match reinsert(&r) {
+            Ok(()) => { println!("✓ put the tokenstash MCP entry back in {}", r.file.display()); cur.entries.remove(i); cur.save()?; }
+            Err(e) => { println!("! {}: {e} (kept in the manifest; re-run --undo to retry)", r.file.display()); i += 1; }
         }
     }
     if cur.claude_mcp_registered {
@@ -246,12 +330,41 @@ fn undo_with(m: Manifest) -> Result<i32> {
             println!("! could not run `claude mcp remove -s user tokenstash` (kept in the manifest; run it by hand or re-run --undo with `claude` on PATH)");
         }
     }
-    let all_done = cur.files.is_empty() && cur.dirs.is_empty() && !cur.claude_mcp_registered;
+    let all_done = cur.is_empty();
     if all_done {
         let _ = fs::remove_file(cur.path());
     }
     println!("\nThe stash, config and database were not touched (`tokenstash forget NAME` removes secrets).");
     Ok(if all_done { 0 } else { 1 })
+}
+
+/// Put a removed registration back where it was, unless a tokenstash entry is there already
+/// (the user re-added one since; theirs wins).
+fn reinsert(r: &Removed) -> Result<()> {
+    if r.key == "mcp_servers" {
+        let mut doc = read_toml(&r.file)?;
+        let snip: toml_edit::DocumentMut = r.value.parse().map_err(|e| anyhow::anyhow!("the saved entry does not parse ({e})"))?;
+        let item = snip.get("mcp_servers").and_then(|m| m.get("tokenstash")).cloned().ok_or_else(|| anyhow::anyhow!("the saved entry holds no mcp_servers.tokenstash"))?;
+        let servers = doc.entry("mcp_servers").or_insert(toml_edit::table());
+        let Some(servers) = servers.as_table_like_mut() else { anyhow::bail!("mcp_servers is not a table") };
+        if servers.get("tokenstash").is_none() { servers.insert("tokenstash", item); }
+        let out = doc.to_string();
+        toml::from_str::<toml::Value>(&out).map_err(|e| anyhow::anyhow!("refusing to write: result would not parse ({e})"))?;
+        fs::write(&r.file, out)?;
+        return Ok(());
+    }
+    let value: serde_json::Value = serde_json::from_str(&r.value).map_err(|e| anyhow::anyhow!("the saved entry does not parse ({e})"))?;
+    let mut v = read_json(&r.file)?;
+    let root = v.as_object_mut().ok_or_else(|| anyhow::anyhow!("root is not a JSON object"))?;
+    let scope = match r.key.strip_prefix("projects/") {
+        Some(path) => root.entry("projects").or_insert(serde_json::json!({})).as_object_mut().ok_or_else(|| anyhow::anyhow!("projects is not an object"))?
+            .entry(path).or_insert(serde_json::json!({})).as_object_mut().ok_or_else(|| anyhow::anyhow!("projects entry is not an object"))?,
+        None => root,
+    };
+    let m = scope.entry("mcpServers").or_insert(serde_json::json!({})).as_object_mut().ok_or_else(|| anyhow::anyhow!("mcpServers is not an object"))?;
+    m.entry("tokenstash").or_insert(value);
+    fs::write(&r.file, serde_json::to_string_pretty(&v)?)?;
+    Ok(())
 }
 
 fn claude_mcp(args: &[&str]) -> bool {
@@ -263,7 +376,8 @@ fn claude_mcp(args: &[&str]) -> bool {
 struct Wiring {
     home: PathBuf,
     exe: String,
-    /// A non-default `TOKENSTASH_HOME`, baked into every registration.
+    /// A non-default `TOKENSTASH_HOME`, baked into every registration and named in every
+    /// command, or the agent's session and this shell would use two different homes.
     ts_home: Option<String>,
     /// `claude` is on PATH, so registration can go through `claude mcp` instead of the file.
     claude_cli: bool,
@@ -274,6 +388,7 @@ impl Wiring {
     fn claude_skill_dir(&self) -> PathBuf { self.home.join(".claude/skills/tokenstash") }
     fn claude_json(&self) -> PathBuf { self.home.join(".claude.json") }
     fn codex(&self) -> PathBuf { self.home.join(".codex") }
+    fn codex_agents(&self) -> PathBuf { self.home.join(".codex/AGENTS.md") }
     fn codex_prompt(&self) -> PathBuf { self.home.join(".codex/prompts/tokenstash.md") }
     fn cursor(&self) -> PathBuf { self.home.join(".cursor") }
     fn cursor_skill_dir(&self) -> PathBuf { self.home.join(".cursor/skills/tokenstash") }
@@ -281,9 +396,9 @@ impl Wiring {
     fn gemini_command(&self) -> PathBuf { self.home.join(".gemini/commands/tokenstash.toml") }
 }
 
-/// Write a skill directory's SKILL.md, recording the directory wholesale when init creates
-/// it, or just the file when the directory was already there (a hand-written skill, an older
-/// init) so undo restores exactly that.
+/// Write a skill directory's SKILL.md, recording the directory when init creates it, or
+/// just the file when the directory was already there (a hand-written skill, an older init)
+/// so undo restores exactly that.
 fn write_skill(manifest: &mut Manifest, dir: &Path, text: &str) -> Result<PathBuf> {
     let md = dir.join("SKILL.md");
     if !dir.exists() {
@@ -294,15 +409,16 @@ fn write_skill(manifest: &mut Manifest, dir: &Path, text: &str) -> Result<PathBu
     Ok(md)
 }
 
-/// Auto mode: MCP registrations, the auto-loading skill, the AGENTS.md snippet.
+/// Auto mode: MCP registrations, the auto-loading skill, the AGENTS.md section.
 fn wire_auto(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
     let mut touched = vec![];
     if w.claude_present() {
         touched.push(write_skill(manifest, &w.claude_skill_dir(), SKILL_MD)?);
+        let cj = w.claude_json();
         // The CLI registers cleanly when present. The desktop app ships without `claude`
         // on PATH, so fall back to writing the same user-scope entry into ~/.claude.json
         // ourselves — otherwise a desktop-only user is left with a printed command.
-        let added = if w.claude_cli && claude_mcp(&["get", "tokenstash"]) && !manifest.claude_mcp_registered {
+        let added = if w.claude_cli && !manifest.claude_mcp_registered && !manifest.recorded(&cj) && json_has_server(&cj, false) {
             // Already registered by someone else (the user, an older install): not ours
             // to remove on --undo, so no record is taken.
             if let Some(h) = &w.ts_home {
@@ -321,7 +437,6 @@ fn wire_auto(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
             if !ok { manifest.claude_mcp_registered = false; manifest.save()?; }
             ok
         } else {
-            let cj = w.claude_json();
             match manifest.mutate(&cj, || merge_mcp_json_typed(&cj, &w.exe, true, w.ts_home.as_deref())) {
                 Ok(()) => { touched.push(cj); true }
                 Err(e) => { println!("! Claude Code: left {} untouched — {e}", cj.display()); false }
@@ -333,13 +448,13 @@ fn wire_auto(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
 
     let codex = w.codex();
     if codex.is_dir() {
-        let (ctoml, cagents) = (codex.join("config.toml"), codex.join("AGENTS.md"));
+        let (ctoml, cagents) = (codex.join("config.toml"), w.codex_agents());
         match manifest.mutate(&ctoml, || merge_codex_toml(&ctoml, &w.exe, w.ts_home.as_deref())) {
             Ok(()) => {
-                manifest.mutate(&cagents, || append_snippet(&cagents))?;
+                manifest.mutate(&cagents, || set_snippet(&cagents, AgentMode::Auto))?;
                 touched.push(ctoml.clone());
                 touched.push(cagents.clone());
-                println!("✓ Codex: MCP server ({}) + usage snippet ({})", ctoml.display(), cagents.display());
+                println!("✓ Codex: MCP server ({}) + usage section ({})", ctoml.display(), cagents.display());
             }
             Err(e) => println!("! Codex: left {} untouched — {e}", ctoml.display()),
         }
@@ -366,31 +481,32 @@ fn wire_auto(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
 }
 
 /// Explicit mode: a user-invoked command per agent, running the CLI. No MCP server, no
-/// snippet, nothing the agent loads on its own.
+/// section in the global AGENTS.md, nothing the agent loads on its own.
 fn wire_explicit(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
     let mut touched = vec![];
+    let home = w.ts_home.as_deref();
     if w.claude_present() {
-        touched.push(write_skill(manifest, &w.claude_skill_dir(), &skill_text(AgentMode::Explicit))?);
+        touched.push(write_skill(manifest, &w.claude_skill_dir(), &skill_text(AgentMode::Explicit, home))?);
         println!("✓ Claude Code: /tokenstash installed (only you can invoke it)");
     }
     if w.codex().is_dir() {
         let p = w.codex_prompt();
         manifest.mutate(&p, || {
             if let Some(d) = p.parent() { fs::create_dir_all(d)?; }
-            Ok(fs::write(&p, codex_prompt_text())?)
+            Ok(fs::write(&p, codex_prompt_text(home))?)
         })?;
         touched.push(p.clone());
         println!("✓ Codex: /prompts:tokenstash installed ({})", p.display());
     }
     if w.cursor().is_dir() {
-        touched.push(write_skill(manifest, &w.cursor_skill_dir(), &skill_text(AgentMode::Explicit))?);
+        touched.push(write_skill(manifest, &w.cursor_skill_dir(), &skill_text(AgentMode::Explicit, home))?);
         println!("✓ Cursor: /tokenstash installed (only you can invoke it)");
     }
     if w.gemini().is_dir() {
         let p = w.gemini_command();
         manifest.mutate(&p, || {
             if let Some(d) = p.parent() { fs::create_dir_all(d)?; }
-            Ok(fs::write(&p, gemini_command_text()?)?)
+            Ok(fs::write(&p, gemini_command_text(home)?)?)
         })?;
         touched.push(p.clone());
         println!("✓ Gemini CLI: /tokenstash installed ({})", p.display());
@@ -398,56 +514,85 @@ fn wire_explicit(manifest: &mut Manifest, w: &Wiring) -> Result<Vec<PathBuf>> {
     Ok(touched)
 }
 
-/// Take auto mode's wiring out: every MCP registration and the AGENTS.md snippet. Only the
-/// tokenstash entry leaves a shared config; the rest of the file is the user's. A registration
-/// that is there but not init's (the user's own `claude mcp add`) is removed too — leaving it
-/// would keep the agent calling tokenstash on its own, which is what explicit mode is against.
+/// Take auto mode's wiring out: every MCP registration and the global AGENTS.md section.
+/// Only the tokenstash entry leaves a shared config; the rest of the file is the user's. A
+/// registration init did not make (the user's own `claude mcp add`, at user or local scope)
+/// goes too — leaving it would keep the agent calling tokenstash on its own, which is what
+/// explicit mode is against — and is recorded entry by entry so undo puts it back.
 fn unwire_auto(manifest: &mut Manifest, w: &Wiring) -> Result<()> {
-    if manifest.claude_mcp_registered && w.claude_cli && claude_mcp(&["remove", "-s", "user", "tokenstash"]) {
-        manifest.claude_mcp_registered = false;
-        manifest.save()?;
-        println!("✓ Claude Code: MCP server removed (claude mcp remove)");
-    } else if w.claude_cli && claude_mcp(&["get", "tokenstash"]) {
-        if claude_mcp(&["remove", "-s", "user", "tokenstash"]) {
-            manifest.claude_mcp_registered = false;
-            manifest.save()?;
-            println!("✓ Claude Code: MCP server removed (claude mcp remove)");
-        } else {
-            println!("! Claude Code: could not remove the MCP registration; run: claude mcp remove -s user tokenstash");
-        }
-    }
-    let cj = w.claude_json();
-    if json_has_server(&cj) {
-        manifest.mutate(&cj, || remove_mcp_json(&cj))?;
-        release_if_empty(manifest, &cj)?;
-        println!("✓ Claude Code: MCP server removed from {}", cj.display());
-    }
-    let ctoml = w.codex().join("config.toml");
-    if toml_has_server(&ctoml) {
-        manifest.mutate(&ctoml, || remove_codex_toml(&ctoml))?;
-        println!("✓ Codex: MCP server removed from {}", ctoml.display());
-    }
-    let cagents = w.codex().join("AGENTS.md");
-    if fs::read_to_string(&cagents).map(|s| s.contains(SNIPPET_MARK)).unwrap_or(false) {
+    remove_json_server(manifest, &w.claude_json(), "Claude Code", true)?;
+    remove_toml_server(manifest, &w.codex().join("config.toml"))?;
+    let cagents = w.codex_agents();
+    if has_snippet(&cagents) {
         manifest.mutate(&cagents, || strip_snippet(&cagents))?;
-        println!("✓ Codex: usage snippet removed from {}", cagents.display());
+        manifest.retire_if_pristine(&cagents)?;
+        println!("✓ Codex: usage section removed from {}", cagents.display());
     }
-    for (name, p) in [("Cursor", w.cursor().join("mcp.json")), ("Gemini CLI", w.gemini().join("settings.json"))] {
-        if json_has_server(&p) {
-            manifest.mutate(&p, || remove_mcp_json(&p))?;
-            release_if_empty(manifest, &p)?;
-            println!("✓ {name}: MCP server removed from {}", p.display());
-        }
-    }
+    remove_json_server(manifest, &w.cursor().join("mcp.json"), "Cursor", false)?;
+    remove_json_server(manifest, &w.gemini().join("settings.json"), "Gemini CLI", false)?;
     Ok(())
 }
 
-/// A JSON config init created (no backup) that now holds nothing but an empty `mcpServers`
-/// is init's own leftover: remove it rather than leave a stub in the user's home.
-fn release_if_empty(manifest: &mut Manifest, p: &Path) -> Result<()> {
-    let created = manifest.files.iter().any(|(q, b)| q == p && b.is_none());
-    let empty = read_json(p).map(|v| v == serde_json::json!({ "mcpServers": {} })).unwrap_or(false);
-    if created && empty { manifest.release(p)?; }
+/// Take `tokenstash` out of a JSON config's `mcpServers` — and, for `~/.claude.json`, out of
+/// every project's local-scope `mcpServers` too, which is where a plain `claude mcp add`
+/// puts it. Init's own entry just goes; anyone else's is recorded for undo.
+fn remove_json_server(manifest: &mut Manifest, p: &Path, name: &str, claude: bool) -> Result<()> {
+    if !json_has_server(p, claude) { return Ok(()); }
+    let recorded = manifest.recorded(p);
+    let mut v = read_json(p)?;
+    let mut removed: Vec<(String, serde_json::Value)> = vec![];
+    if let Some(m) = v.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
+        if let Some(x) = m.remove("tokenstash") { removed.push(("mcpServers".into(), x)); }
+    }
+    if claude {
+        if let Some(projects) = v.get_mut("projects").and_then(|s| s.as_object_mut()) {
+            for (path, proj) in projects.iter_mut() {
+                if let Some(m) = proj.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
+                    if let Some(x) = m.remove("tokenstash") { removed.push((format!("projects/{path}"), x)); }
+                }
+            }
+        }
+    }
+    // The user-scope entry is init's when init wrote this file, or registered through the
+    // CLI; either way it is not user data and undo must not bring it back.
+    let own_user_scope = recorded || (claude && manifest.claude_mcp_registered);
+    for (key, value) in removed {
+        if key == "mcpServers" && own_user_scope { continue; }
+        manifest.entries.push(Removed { file: p.to_path_buf(), key, value: value.to_string() });
+    }
+    if claude { manifest.claude_mcp_registered = false; }
+    // The record first: an entry recorded but still present is re-inserted by undo only if
+    // absent, so a crash between the two leaves nothing wrong.
+    manifest.save()?;
+    fs::write(p, serde_json::to_string_pretty(&v)?)?;
+    if recorded { manifest.retire_if_pristine(p)?; }
+    println!("✓ {name}: MCP server removed from {}", p.display());
+    Ok(())
+}
+
+/// Same for Codex's `mcp_servers.tokenstash`, keeping the user's comments and formatting.
+fn remove_toml_server(manifest: &mut Manifest, p: &Path) -> Result<()> {
+    if !toml_has_server(p) { return Ok(()); }
+    let recorded = manifest.recorded(p);
+    let mut doc = read_toml(p)?;
+    let item = doc.get_mut("mcp_servers").and_then(|s| s.as_table_like_mut()).and_then(|s| s.remove("tokenstash"));
+    if let (Some(item), false) = (item, recorded) {
+        let mut snip = toml_edit::DocumentMut::new();
+        let mut t = toml_edit::Table::new();
+        t.set_implicit(true);
+        t.insert("tokenstash", item);
+        snip.insert("mcp_servers", toml_edit::Item::Table(t));
+        manifest.entries.push(Removed { file: p.to_path_buf(), key: "mcp_servers".into(), value: snip.to_string() });
+        manifest.save()?;
+    }
+    let out = doc.to_string();
+    let back: toml::Value = toml::from_str(&out).map_err(|e| anyhow::anyhow!("refusing to write {}: result would not parse ({e})", p.display()))?;
+    if back.get("mcp_servers").and_then(|m| m.get("tokenstash")).is_some() {
+        anyhow::bail!("refusing to write {}: could not take the tokenstash entry out cleanly; edit it by hand", p.display());
+    }
+    fs::write(p, out)?;
+    if recorded { manifest.retire_if_pristine(p)?; }
+    println!("✓ Codex: MCP server removed from {}", p.display());
     Ok(())
 }
 
@@ -471,10 +616,37 @@ fn unwire_explicit(manifest: &mut Manifest, w: &Wiring) -> Result<()> {
     Ok(())
 }
 
+/// Every project AGENTS.md `init --project` wrote a section into gets the section for the
+/// mode now chosen: one left saying "ask tokenstash whenever a key is needed" would undo
+/// explicit mode in that project.
+fn resync_project_snippets(manifest: &mut Manifest, w: &Wiring, mode: AgentMode) -> Result<()> {
+    let files: Vec<PathBuf> = manifest.files.iter().map(|(p, _)| p.clone()).filter(|p| p.file_name().is_some_and(|n| n == "AGENTS.md") && *p != w.codex_agents()).collect();
+    for p in files {
+        if has_snippet(&p) && !snippet_is(&p, mode) {
+            manifest.mutate(&p, || set_snippet(&p, mode))?;
+            println!("✓ {}: tokenstash section rewritten for {} mode", p.display(), mode);
+        }
+    }
+    Ok(())
+}
+
 pub fn init(a: InitArgs) -> Result<i32> {
+    let env_home = std::env::var("TOKENSTASH_HOME").ok().filter(|h| !h.is_empty());
     if a.print_snippet { print!("{}", snippet_for(a.mode.map(Into::into).unwrap_or_default())); return Ok(0); }
-    if a.print_skill { print!("{}", skill_text(a.mode.map(Into::into).unwrap_or_default())); return Ok(0); }
-    if a.undo { return undo(); }
+    if a.print_skill { print!("{}", skill_text(a.mode.map(Into::into).unwrap_or_default(), env_home.as_deref())); return Ok(0); }
+    // Undo restores what init found, which can be automatic wiring explicit mode took out;
+    // the mode and a project's instructions decide how agents reach tokenstash. All three
+    // are the person's call, not an agent's.
+    if a.undo {
+        crate::util::require_human("init --undo", "it puts agent wiring back the way init found it")?;
+        return undo();
+    }
+    if a.mode.is_some() {
+        crate::util::require_human("init --mode", "how agents reach tokenstash is your decision")?;
+    }
+    if a.project {
+        crate::util::require_human("init --project", "it writes instructions the agents in this project follow")?;
+    }
     let mut cfg = Config::load()?;
     let fresh = !Config::exists();
     let mut manifest = Manifest::load()?;
@@ -506,6 +678,7 @@ pub fn init(a: InitArgs) -> Result<i32> {
 
     // 3. agents
     let mut touched: Vec<PathBuf> = vec![];
+    let mut code = 0;
     // Registering points every future agent session at this binary. Run by an agent from a
     // hostile checkout (`cargo build && ./target/debug/tokenstash init`) that would be a
     // binary that hands values to the model. The stash and config are set up either way.
@@ -513,25 +686,31 @@ pub fn init(a: InitArgs) -> Result<i32> {
         Ok(()) => true,
         Err(e) => { println!("! {e:#}\n  Agents were not registered; the stash and config are ready. (--no-agents silences this.)"); false }
     };
+    let home = dirs::home_dir().unwrap_or_default();
+    // An agent spawns the MCP server from its own environment, not this shell's. If this
+    // init is running against a non-default TOKENSTASH_HOME, bake it into every
+    // registration and name it in every command, or the server and the CLI silently use
+    // two different homes.
+    let w = Wiring { home, exe: std::env::current_exe()?.display().to_string(), ts_home: env_home, claude_cli: which("claude") };
     if register_agents {
-        let exe = std::env::current_exe()?;
-        let home = dirs::home_dir().unwrap_or_default();
-        // An agent spawns the MCP server from its own environment, not this shell's. If this
-        // init is running against a non-default TOKENSTASH_HOME, bake it into every
-        // registration, or the server and the CLI silently use two different homes.
-        let ts_home = std::env::var("TOKENSTASH_HOME").ok().filter(|h| !h.is_empty());
-        if let (Some(h), AgentMode::Auto) = (&ts_home, mode) {
-            println!("  (registrations carry TOKENSTASH_HOME={h} so agents use the same home as this shell)");
+        if let Some(h) = &w.ts_home {
+            println!("  (agents are pointed at TOKENSTASH_HOME={h}, the home this shell uses)");
         }
-        let w = Wiring { home, exe: exe.display().to_string(), ts_home, claude_cli: which("claude") };
         touched = wire(&mut manifest, &w, mode)?;
+        if mode == AgentMode::Explicit {
+            let stray: Vec<String> = installed(&w.home).into_iter().filter(|a| is_auto_wiring(a)).collect();
+            if !stray.is_empty() {
+                println!("! automatic wiring is still in place: {}. Take it out by hand, then re-run `tokenstash init`.", stray.join(", "));
+                code = 1;
+            }
+        }
     }
 
     if a.project {
         let p = std::env::current_dir()?.join("AGENTS.md");
-        manifest.mutate(&p, || append_snippet_for(&p, mode))?;
+        manifest.mutate(&p, || set_snippet(&p, mode))?;
         touched.push(p.clone());
-        println!("✓ wrote tokenstash section to {}", p.display());
+        println!("✓ wrote the tokenstash section for {mode} mode to {}", p.display());
     }
 
     if !touched.is_empty() {
@@ -557,23 +736,26 @@ pub fn init(a: InitArgs) -> Result<i32> {
             AgentMode::Explicit => println!("\nNext: in your agent, type   /tokenstash OPENAI_API_KEY   (Codex: /prompts:tokenstash)"),
         }
     }
-    Ok(0)
+    Ok(code)
 }
 
-/// Wire one mode and take the other's wiring out, in that order for auto (the skill file is
-/// shared, and the rewrite must win) and the other way round for explicit (nothing automatic
-/// may be left once the command is in place; the command itself never depends on it).
+/// Wire one mode and take the other's wiring out. Explicit first removes, then installs:
+/// nothing automatic may be left once the command is in place, and the command never
+/// depends on it. Auto first removes the commands (the Claude skill file is shared, and the
+/// rewrite must win), then installs. Project sections follow the mode either way.
 fn wire(manifest: &mut Manifest, w: &Wiring, mode: AgentMode) -> Result<Vec<PathBuf>> {
-    match mode {
+    let touched = match mode {
         AgentMode::Auto => {
             unwire_explicit(manifest, w)?;
-            wire_auto(manifest, w)
+            wire_auto(manifest, w)?
         }
         AgentMode::Explicit => {
             unwire_auto(manifest, w)?;
-            wire_explicit(manifest, w)
+            wire_explicit(manifest, w)?
         }
-    }
+    };
+    resync_project_snippets(manifest, w, mode)?;
+    Ok(touched)
 }
 
 pub fn describe_mode(mode: AgentMode) -> &'static str {
@@ -583,9 +765,9 @@ pub fn describe_mode(mode: AgentMode) -> &'static str {
     }
 }
 
-/// What is installed for each agent on this machine, for `doctor`: "claude-code (skill: auto)",
-/// "codex (mcp, snippet)", "gemini-cli (command)". Read from the files, not the manifest, so a
-/// registration made by hand shows too.
+/// What is installed for each agent on this machine, for `doctor`: "claude-code (skill: auto,
+/// mcp)", "codex (prompt)", "gemini-cli (command)". Read from the files, not the manifest,
+/// so a registration made by hand shows too.
 pub fn installed(home: &Path) -> Vec<String> {
     let mut out = vec![];
     let skill_mode = |dir: &Path| -> Option<&'static str> {
@@ -594,22 +776,32 @@ pub fn installed(home: &Path) -> Vec<String> {
     };
     let mut claude = vec![];
     if let Some(m) = skill_mode(&home.join(".claude/skills/tokenstash")) { claude.push(m); }
-    if json_has_server(&home.join(".claude.json")) { claude.push("mcp"); }
+    if json_has_server(&home.join(".claude.json"), true) { claude.push("mcp"); }
     if !claude.is_empty() { out.push(format!("claude-code ({})", claude.join(", "))); }
     let mut codex = vec![];
     if toml_has_server(&home.join(".codex/config.toml")) { codex.push("mcp"); }
-    if fs::read_to_string(home.join(".codex/AGENTS.md")).map(|s| s.contains(SNIPPET_MARK)).unwrap_or(false) { codex.push("snippet"); }
+    if has_snippet(&home.join(".codex/AGENTS.md")) { codex.push("snippet"); }
     if home.join(".codex/prompts/tokenstash.md").is_file() { codex.push("prompt"); }
     if !codex.is_empty() { out.push(format!("codex ({})", codex.join(", "))); }
     let mut cursor = vec![];
-    if json_has_server(&home.join(".cursor/mcp.json")) { cursor.push("mcp"); }
+    if json_has_server(&home.join(".cursor/mcp.json"), false) { cursor.push("mcp"); }
     if let Some(m) = skill_mode(&home.join(".cursor/skills/tokenstash")) { cursor.push(m); }
     if !cursor.is_empty() { out.push(format!("cursor ({})", cursor.join(", "))); }
     let mut gemini = vec![];
-    if json_has_server(&home.join(".gemini/settings.json")) { gemini.push("mcp"); }
+    if json_has_server(&home.join(".gemini/settings.json"), false) { gemini.push("mcp"); }
     if home.join(".gemini/commands/tokenstash.toml").is_file() { gemini.push("command"); }
     if !gemini.is_empty() { out.push(format!("gemini-cli ({})", gemini.join(", "))); }
     out
+}
+
+/// An `installed()` line that means the agent reaches tokenstash without being asked.
+pub fn is_auto_wiring(line: &str) -> bool {
+    line.contains("mcp") || line.contains("snippet") || line.contains("skill: auto")
+}
+
+/// ...and one that belongs to explicit mode.
+pub fn is_explicit_wiring(line: &str) -> bool {
+    line.contains("prompt") || line.contains("command") || line.contains("skill: explicit")
 }
 
 /// Set `mcp_servers.tokenstash` in Codex's config.toml with `toml_edit`, which preserves
@@ -641,22 +833,6 @@ fn merge_codex_toml(p: &Path, exe: &str, ts_home: Option<&str>) -> Result<()> {
         anyhow::bail!("refusing to write {}: could not set the tokenstash entry cleanly; edit it by hand", p.display());
     }
     if let Some(parent) = p.parent() { fs::create_dir_all(parent)?; }
-    fs::write(p, out)?;
-    Ok(())
-}
-
-/// Take `mcp_servers.tokenstash` out of Codex's config.toml, leaving everything else as
-/// written. An empty `mcp_servers` table is left in place: it is the user's line now.
-fn remove_codex_toml(p: &Path) -> Result<()> {
-    let mut doc = read_toml(p)?;
-    if let Some(servers) = doc.get_mut("mcp_servers").and_then(|s| s.as_table_like_mut()) {
-        servers.remove("tokenstash");
-    }
-    let out = doc.to_string();
-    let back: toml::Value = toml::from_str(&out).map_err(|e| anyhow::anyhow!("refusing to write {}: result would not parse ({e})", p.display()))?;
-    if back.get("mcp_servers").and_then(|m| m.get("tokenstash")).is_some() {
-        anyhow::bail!("refusing to write {}: could not take the tokenstash entry out cleanly; edit it by hand", p.display());
-    }
     fs::write(p, out)?;
     Ok(())
 }
@@ -699,16 +875,6 @@ fn merge_mcp_json_typed(p: &Path, exe: &str, typed: bool, ts_home: Option<&str>)
     Ok(())
 }
 
-/// Take `mcpServers.tokenstash` out of a JSON config, leaving the other servers.
-fn remove_mcp_json(p: &Path) -> Result<()> {
-    let mut v = read_json(p)?;
-    if let Some(m) = v.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
-        m.remove("tokenstash");
-    }
-    fs::write(p, serde_json::to_string_pretty(&v)?)?;
-    Ok(())
-}
-
 fn read_json(p: &Path) -> Result<serde_json::Value> {
     Ok(match fs::read_to_string(p) {
         Ok(s) if s.trim().is_empty() => serde_json::json!({}),
@@ -718,37 +884,49 @@ fn read_json(p: &Path) -> Result<serde_json::Value> {
     })
 }
 
-fn json_has_server(p: &Path) -> bool {
-    fs::read_to_string(p).ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .map(|v| v.get("mcpServers").and_then(|m| m.get("tokenstash")).is_some())
-        .unwrap_or(false)
+/// A tokenstash entry under `mcpServers`, or — `~/.claude.json`, where `claude mcp add`
+/// without `-s user` puts it — under any project's `mcpServers`.
+fn json_has_server(p: &Path, claude: bool) -> bool {
+    let Some(v) = fs::read_to_string(p).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) else { return false };
+    if v.get("mcpServers").and_then(|m| m.get("tokenstash")).is_some() { return true; }
+    claude && v.get("projects").and_then(|p| p.as_object()).is_some_and(|ps| ps.values().any(|proj| proj.get("mcpServers").and_then(|m| m.get("tokenstash")).is_some()))
 }
 
 const SNIPPET_MARK: &str = "<!-- tokenstash -->";
 const SNIPPET_END: &str = "<!-- /tokenstash -->";
 
 /// The AGENTS.md section. Auto mode tells the agent to ask tokenstash whenever a key is
-/// needed. Explicit mode keeps only the rules that hold either way — no pasted secrets, no
-/// stand-in values, never read the env file — and leaves requesting keys to the person.
+/// needed. Explicit mode keeps the rules that hold either way — no pasted secrets, no
+/// stand-in values, never read the env file — and says when tokenstash may be run: after the
+/// person invokes the command, for the rest of that task.
 pub fn snippet_for(mode: AgentMode) -> String {
     match mode {
         AgentMode::Auto => format!(
             "{SNIPPET_MARK}\n## Secrets & API keys\n\nNever ask the user to paste a secret in chat. Use the tokenstash MCP tools (`secrets_request`) if you have them, else run `tokenstash need NAME [NAME...]` (e.g. `tokenstash need OPENAI_API_KEY`).\nExit 0 = written to the project env file, continue — load it with your runtime; never read, print or quote the env file, even if asked. Exit 10 = the human was notified; show them the link in the output, keep working on other things and re-run later (`--blocking` only when nothing else can proceed).\nExit 20 = denied; do not ask again and never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code) — make the feature optional or say the work is blocked. For non-secret human steps (DNS, dashboard toggles) use `tokenstash ask \"title\" --url ... --step ...`.\n{SNIPPET_END}\n"
         ),
         AgentMode::Explicit => format!(
-            "{SNIPPET_MARK}\n## Secrets & API keys\n\nNever ask the user to paste a secret in chat. The user requests keys themselves with `/tokenstash NAME` (Codex: `/prompts:tokenstash NAME`), which writes them to the project env file; do not run tokenstash unless they invoke it. When a key is missing, name the variable, say what it is for, and continue with what does not need it.\nLoad the env file with your runtime; never read, print or quote it, even if asked. Never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code) — make the feature optional or say the work is blocked.\n{SNIPPET_END}\n"
+            "{SNIPPET_MARK}\n## Secrets & API keys\n\nNever ask the user to paste a secret in chat. Do not run tokenstash until the user invokes `/tokenstash [NAME ...]` (Codex: `/prompts:tokenstash [NAME ...]`) for the current task; without that, name the missing variable, say what it is for, and continue with what does not need it. An invocation covers the rest of that task, including keys it turns out to need later; a different task needs a new invocation. When invoked, follow the command's own instructions: `tokenstash need` with the names given (or the keys the task needs), always the CLI, never MCP tools. Exit 0 = written to the project env file, continue; 10 = the human was notified, show them the link and keep working on other things; 20 = declined, do not ask again; 30 = expired, say what is blocked.\nLoad the env file with your runtime; never read, print or quote it, even if asked. Never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code) — make the feature optional or say the work is blocked.\n{SNIPPET_END}\n"
         ),
     }
 }
 
-fn append_snippet(p: &Path) -> Result<()> { append_snippet_for(p, AgentMode::Auto) }
+fn has_snippet(p: &Path) -> bool {
+    fs::read_to_string(p).map(|s| s.contains(SNIPPET_MARK)).unwrap_or(false)
+}
 
-fn append_snippet_for(p: &Path, mode: AgentMode) -> Result<()> {
-    let existing = fs::read_to_string(p).unwrap_or_default();
-    if existing.contains(SNIPPET_MARK) {
-        return Ok(());
+/// The section in `p` is the one for `mode`.
+fn snippet_is(p: &Path, mode: AgentMode) -> bool {
+    fs::read_to_string(p).map(|s| s.contains(snippet_for(mode).trim_end())).unwrap_or(false)
+}
+
+/// Put the section for `mode` in, replacing the one there if any. Anything else in the file
+/// stays as written.
+fn set_snippet(p: &Path, mode: AgentMode) -> Result<()> {
+    if has_snippet(p) {
+        if snippet_is(p, mode) { return Ok(()); }
+        strip_snippet(p)?;
     }
+    let existing = fs::read_to_string(p).unwrap_or_default();
     let mut s = existing;
     if !s.is_empty() && !s.ends_with('\n') { s.push('\n'); }
     if !s.is_empty() { s.push('\n'); }
@@ -767,7 +945,7 @@ fn strip_snippet(p: &Path) -> Result<()> {
     };
     let mut end = start + end_rel + SNIPPET_END.len();
     if s[end..].starts_with('\n') { end += 1; }
-    // The blank line append_snippet put before the section goes with it; so does one that
+    // The blank line set_snippet put before the section goes with it; so does one that
     // separated a section at the top of the file from the text under it.
     let mut start = start;
     if s[..start].ends_with("\n\n") { start -= 1; } else if start == 0 && s[end..].starts_with('\n') { end += 1; }
@@ -790,19 +968,20 @@ const MCP_SECTION: &str = "## If MCP tools are available";
 /// is derived from it: only the person can invoke it, the arguments name the keys, and the
 /// MCP section goes (there is no server in that mode). Everything else — never paste, never
 /// read the env file, exit codes, no stand-in values, report-bad — is the same text.
-pub fn skill_text(mode: AgentMode) -> String {
+pub fn skill_text(mode: AgentMode, ts_home: Option<&str>) -> String {
     match mode {
         AgentMode::Auto => SKILL_MD.to_string(),
         AgentMode::Explicit => format!(
             "---\nname: tokenstash\ndescription: Get API keys and secrets for this project through tokenstash, without pasting them in chat. /tokenstash NAME [NAME...] requests those keys; bare /tokenstash requests whatever the current task needs.\ndisable-model-invocation: true\n---\n\n{}",
-            explicit_body("$ARGUMENTS")
+            explicit_body("/tokenstash $ARGUMENTS", ts_home)
         ),
     }
 }
 
-/// The explicit-mode rules with the harness's own placeholder for what the user typed after
-/// the command: `$ARGUMENTS` for Claude Code, Cursor and Codex, `{{args}}` for Gemini CLI.
-pub fn explicit_body(args: &str) -> String {
+/// The explicit-mode rules, opened by what the user typed: `invocation` is the command with
+/// the harness's own placeholder for its arguments — `$ARGUMENTS` for Claude Code, Cursor
+/// and Codex, `{{args}}` for Gemini CLI.
+pub fn explicit_body(invocation: &str, ts_home: Option<&str>) -> String {
     let b = body(SKILL_MD);
     let b = match b.find(MCP_SECTION) {
         Some(i) => {
@@ -812,28 +991,32 @@ pub fn explicit_body(args: &str) -> String {
         }
         None => b.to_string(),
     };
+    let home = match ts_home {
+        Some(h) => format!(" This machine keeps its stash under `TOKENSTASH_HOME={h}`: set that in the environment of every tokenstash command."),
+        None => String::new(),
+    };
     let intro = format!(
-        "# tokenstash\n\nThe user invoked this themselves: `/tokenstash {args}`. The names after the command are the keys to request; with none, request the keys the current task needs. Nothing else in this session asks tokenstash on its own, so from here on every key this task turns out to need goes through `tokenstash need`, never through the chat.\n"
+        "# tokenstash\n\nThe user invoked this for the current task: `{invocation}`. Run `tokenstash need` with the names after the command; with none, request the keys the current task needs. That invocation covers the rest of this task — keys it turns out to need later, checking on pending cards, non-secret human steps, loading the env file with the runtime, replacing a rejected key — without being invoked again; a different task needs a new invocation. Always the CLI, never MCP tools.{home}\n"
     );
     b.replacen("# tokenstash\n", &intro, 1).trim_start_matches('\n').to_string()
 }
 
 /// Codex custom prompt: `~/.codex/prompts/tokenstash.md`, invoked as `/prompts:tokenstash`.
 /// `$ARGUMENTS` is Codex's own placeholder; a literal `$` would need `$$`, and the body has none.
-pub fn codex_prompt_text() -> String {
+pub fn codex_prompt_text(ts_home: Option<&str>) -> String {
     format!(
         "---\ndescription: Get API keys for this project through tokenstash (never pasted in chat)\nargument-hint: \"[NAME ...]\"\n---\n\n{}",
-        explicit_body("$ARGUMENTS").replace("`/tokenstash $ARGUMENTS`", "`/prompts:tokenstash $ARGUMENTS`")
+        explicit_body("/prompts:tokenstash $ARGUMENTS", ts_home)
     )
 }
 
 /// Gemini CLI custom command: `~/.gemini/commands/tokenstash.toml`, invoked as `/tokenstash`.
-pub fn gemini_command_text() -> Result<String> {
+pub fn gemini_command_text(ts_home: Option<&str>) -> Result<String> {
     #[derive(serde::Serialize)]
     struct Command { description: &'static str, prompt: String }
     Ok(toml::to_string(&Command {
         description: "Get API keys for this project through tokenstash (never pasted in chat)",
-        prompt: explicit_body("{{args}}"),
+        prompt: explicit_body("/tokenstash {{args}}", ts_home),
     })?)
 }
 
@@ -865,42 +1048,49 @@ mod tests {
     }
 
     fn read(p: &Path) -> String { fs::read_to_string(p).unwrap_or_default() }
+    fn write(p: &Path, s: &str) { fs::create_dir_all(p.parent().unwrap()).unwrap(); fs::write(p, s).unwrap(); }
+
+    const AUTO_INSTALLED: [&str; 4] = ["claude-code (skill: auto, mcp)", "codex (mcp, snippet)", "cursor (mcp)", "gemini-cli (mcp)"];
+    const EXPLICIT_INSTALLED: [&str; 4] = ["claude-code (skill: explicit)", "codex (prompt)", "cursor (skill: explicit)", "gemini-cli (command)"];
 
     #[test]
     fn the_explicit_skill_is_user_only_and_keeps_every_rule() {
-        let auto = skill_text(AgentMode::Auto);
-        let explicit = skill_text(AgentMode::Explicit);
+        let auto = skill_text(AgentMode::Auto, None);
+        let explicit = skill_text(AgentMode::Explicit, None);
         assert_eq!(auto, SKILL_MD);
         assert!(!frontmatter(&auto).contains("disable-model-invocation"));
         assert!(frontmatter(&explicit).contains("disable-model-invocation: true"), "{explicit}");
         assert!(frontmatter(&explicit).starts_with("name: tokenstash\n"));
-        assert!(explicit.contains("`/tokenstash $ARGUMENTS`"));
+        assert!(explicit.contains("`/tokenstash $ARGUMENTS`") && explicit.contains("a different task needs a new invocation"));
         // The rules are the same text, MCP section aside.
-        for rule in ["## Never do this", "Never ask the user to paste", "Never read `.env.local`", "`20` the user declined", "never invent a stand-in value", "## When a provider rejects a key", "tokenstash report-bad", "## Non-secret human steps", "## Running things"] {
+        for rule in ["## Never do this", "Never ask the user to paste", "Never read the project's env file", "Never invent a stand-in secret value", "`20` the user declined", "## When a provider rejects a key", "tokenstash report-bad", "## Non-secret human steps", "## Running things"] {
             assert!(auto.contains(rule) && explicit.contains(rule), "{rule}");
         }
         assert!(auto.contains(MCP_SECTION));
-        for mcp in [MCP_SECTION, "secrets_request", "task_check", "MCP"] {
+        for mcp in [MCP_SECTION, "secrets_request", "task_check", "MCP tools are"] {
             assert!(!explicit.contains(mcp), "explicit mode has no server, so nothing may point at one: {mcp}");
         }
         // Derived text is a slice of the original: nothing was lost around the cut.
         let end_of_mcp = body(SKILL_MD).find("## Running things").unwrap();
         assert!(explicit.ends_with(&body(SKILL_MD)[end_of_mcp..]));
+        assert!(!explicit.contains("TOKENSTASH_HOME"));
+        let homed = skill_text(AgentMode::Explicit, Some("/srv/ts"));
+        assert!(homed.contains("`TOKENSTASH_HOME=/srv/ts`: set that in the environment of every tokenstash command"), "{homed}");
     }
 
     #[test]
     fn each_harness_gets_its_own_placeholder_and_nothing_else_is_a_dollar() {
-        let codex = codex_prompt_text();
+        let codex = codex_prompt_text(None);
         assert!(codex.starts_with("---\ndescription: "));
         assert!(codex.contains("`/prompts:tokenstash $ARGUMENTS`"));
         assert_eq!(codex.matches('$').count(), codex.matches("$ARGUMENTS").count(), "Codex expands every `$`; a stray one would need `$$`");
-        let gemini = gemini_command_text().unwrap();
+        let gemini = gemini_command_text(None).unwrap();
         let v: toml::Value = toml::from_str(&gemini).unwrap();
         let prompt = v["prompt"].as_str().unwrap();
         assert!(prompt.contains("`/tokenstash {{args}}`"));
         assert!(!prompt.contains("$ARGUMENTS"));
         assert!(v["description"].as_str().unwrap().contains("tokenstash"));
-        assert_eq!(prompt, explicit_body("{{args}}"));
+        assert_eq!(prompt, explicit_body("/tokenstash {{args}}", None));
     }
 
     #[test]
@@ -912,11 +1102,11 @@ mod tests {
         assert!(read(&w.cursor_skill_dir().join("SKILL.md")).contains("disable-model-invocation: true"));
         assert!(read(&w.codex_prompt()).contains("/prompts:tokenstash"));
         assert!(read(&w.gemini_command()).contains("{{args}}"));
-        for absent in [w.claude_json(), w.codex().join("config.toml"), w.codex().join("AGENTS.md"), w.cursor().join("mcp.json"), w.gemini().join("settings.json")] {
+        for absent in [w.claude_json(), w.codex().join("config.toml"), w.codex_agents(), w.cursor().join("mcp.json"), w.gemini().join("settings.json")] {
             assert!(!absent.exists(), "explicit mode must not write {}", absent.display());
         }
-        assert!(!m.claude_mcp_registered);
-        assert_eq!(installed(&w.home), ["claude-code (skill: explicit)", "codex (prompt)", "cursor (skill: explicit)", "gemini-cli (command)"]);
+        assert!(!m.claude_mcp_registered && m.entries.is_empty());
+        assert_eq!(installed(&w.home), EXPLICIT_INSTALLED);
     }
 
     #[test]
@@ -924,44 +1114,45 @@ mod tests {
         let (w, mut m) = machine("auto");
         wire(&mut m, &w, AgentMode::Auto).unwrap();
         assert_eq!(read(&w.claude_skill_dir().join("SKILL.md")), SKILL_MD);
-        assert!(json_has_server(&w.claude_json()));
+        assert!(json_has_server(&w.claude_json(), true));
         assert!(toml_has_server(&w.codex().join("config.toml")));
-        assert!(read(&w.codex().join("AGENTS.md")).contains("secrets_request"));
-        assert!(json_has_server(&w.cursor().join("mcp.json")));
-        assert!(json_has_server(&w.gemini().join("settings.json")));
+        assert!(read(&w.codex_agents()).contains("secrets_request"));
+        assert!(json_has_server(&w.cursor().join("mcp.json"), false));
+        assert!(json_has_server(&w.gemini().join("settings.json"), false));
         for absent in [w.codex_prompt(), w.gemini_command(), w.cursor_skill_dir()] {
             assert!(!absent.exists(), "auto mode must not write {}", absent.display());
         }
-        assert_eq!(installed(&w.home), ["claude-code (skill: auto, mcp)", "codex (mcp, snippet)", "cursor (mcp)", "gemini-cli (mcp)"]);
+        assert_eq!(installed(&w.home), AUTO_INSTALLED);
     }
 
-    /// The point of explicit mode: after the switch nothing automatic is left, and the
-    /// user's other entries in the shared configs are exactly as they were.
+    /// The point of explicit mode: after the switch nothing automatic is left, the user's
+    /// other entries in the shared configs are exactly as they were, and files init created
+    /// for the server alone are gone rather than left as stubs.
     #[test]
     fn switching_to_explicit_removes_every_automatic_hook_and_keeps_the_users_entries() {
         let (w, mut m) = machine("to-explicit");
-        fs::write(w.codex().join("config.toml"), "# mine\nmodel = \"o3\"\n\n[mcp_servers.github]\ncommand = \"gh-mcp\"\n").unwrap();
-        fs::write(w.codex().join("AGENTS.md"), "# My rules\n\nBe brief.\n").unwrap();
-        fs::write(w.cursor().join("mcp.json"), "{\"mcpServers\":{\"github\":{\"command\":\"gh-mcp\"}}}").unwrap();
+        let codex_toml = "# mine\nmodel = \"o3\"\n\n[mcp_servers.github]\ncommand = \"gh-mcp\"\n";
+        write(&w.codex().join("config.toml"), codex_toml);
+        write(&w.codex_agents(), "# My rules\n\nBe brief.\n");
+        write(&w.cursor().join("mcp.json"), "{\"mcpServers\":{\"github\":{\"command\":\"gh-mcp\"}}}");
         wire(&mut m, &w, AgentMode::Auto).unwrap();
-        assert!(read(&w.codex().join("AGENTS.md")).contains(SNIPPET_MARK));
+        assert!(has_snippet(&w.codex_agents()));
 
         wire(&mut m, &w, AgentMode::Explicit).unwrap();
-        for (p, entry) in [(w.claude_json(), "tokenstash"), (w.cursor().join("mcp.json"), "tokenstash"), (w.gemini().join("settings.json"), "tokenstash")] {
-            assert!(!json_has_server(&p), "{}", p.display());
-            assert!(!read(&p).contains(entry), "{}: {}", p.display(), read(&p));
-        }
-        // Files init created that now hold nothing are gone; the user's Cursor file stays.
-        assert!(!w.claude_json().exists() && !w.gemini().join("settings.json").exists());
-        assert!(w.cursor().join("mcp.json").exists());
-        let codex_toml = read(&w.codex().join("config.toml"));
-        assert!(!toml_has_server(&w.codex().join("config.toml")));
-        assert!(codex_toml.contains("# mine") && codex_toml.contains("model = \"o3\"") && codex_toml.contains("[mcp_servers.github]"), "{codex_toml}");
-        assert_eq!(read(&w.codex().join("AGENTS.md")), "# My rules\n\nBe brief.\n");
+        assert!(!json_has_server(&w.claude_json(), true) && !json_has_server(&w.cursor().join("mcp.json"), false) && !json_has_server(&w.gemini().join("settings.json"), false));
+        assert!(!w.claude_json().exists() && !w.gemini().join("settings.json").exists(), "created for the server alone");
         assert!(read(&w.cursor().join("mcp.json")).contains("gh-mcp"));
+        assert_eq!(read(&w.codex().join("config.toml")), codex_toml, "only the tokenstash entry leaves");
+        assert_eq!(read(&w.codex_agents()), "# My rules\n\nBe brief.\n");
         assert!(read(&w.claude_skill_dir().join("SKILL.md")).contains("disable-model-invocation: true"));
         assert!(w.codex_prompt().is_file() && w.gemini_command().is_file() && w.cursor_skill_dir().join("SKILL.md").is_file());
-        assert_eq!(installed(&w.home), ["claude-code (skill: explicit)", "codex (prompt)", "cursor (skill: explicit)", "gemini-cli (command)"]);
+        assert_eq!(installed(&w.home), EXPLICIT_INSTALLED);
+        // Files that are back to what init found have no whole-file record any more: an undo
+        // after the user edits them must not restore a stale copy.
+        for p in [w.codex().join("config.toml"), w.codex_agents(), w.claude_json(), w.gemini().join("settings.json"), w.cursor().join("mcp.json")] {
+            assert!(!m.recorded(&p), "{} still recorded: {:?}", p.display(), m.files);
+        }
+        assert!(m.entries.is_empty(), "nothing foreign was removed: {:?}", m.entries);
     }
 
     #[test]
@@ -971,9 +1162,8 @@ mod tests {
         wire(&mut m, &w, AgentMode::Auto).unwrap();
         assert!(!w.codex_prompt().exists() && !w.gemini_command().exists() && !w.cursor_skill_dir().exists());
         assert_eq!(read(&w.claude_skill_dir().join("SKILL.md")), SKILL_MD);
-        assert!(json_has_server(&w.claude_json()) && toml_has_server(&w.codex().join("config.toml")));
-        assert_eq!(installed(&w.home), ["claude-code (skill: auto, mcp)", "codex (mcp, snippet)", "cursor (mcp)", "gemini-cli (mcp)"]);
-        // The released files are out of the manifest, so undo does not report them.
+        assert!(json_has_server(&w.claude_json(), true) && toml_has_server(&w.codex().join("config.toml")));
+        assert_eq!(installed(&w.home), AUTO_INSTALLED);
         assert!(!m.files.iter().any(|(p, _)| p == &w.codex_prompt() || p == &w.gemini_command()));
         assert!(!m.dirs.iter().any(|d| d == &w.cursor_skill_dir()));
     }
@@ -983,9 +1173,8 @@ mod tests {
     fn undo_after_switching_restores_the_original_files() {
         let (w, mut m) = machine("undo");
         let codex_toml = "[mcp_servers.github]\ncommand = \"gh-mcp\"\n";
-        fs::write(w.codex().join("config.toml"), codex_toml).unwrap();
-        fs::create_dir_all(w.codex_prompt().parent().unwrap()).unwrap();
-        fs::write(w.codex_prompt().parent().unwrap().join("other.md"), "keep").unwrap();
+        write(&w.codex().join("config.toml"), codex_toml);
+        write(&w.codex_prompt().parent().unwrap().join("other.md"), "keep");
         wire(&mut m, &w, AgentMode::Auto).unwrap();
         wire(&mut m, &w, AgentMode::Explicit).unwrap();
         wire(&mut m, &w, AgentMode::Auto).unwrap();
@@ -994,34 +1183,134 @@ mod tests {
         assert_eq!(undo_with(m).unwrap(), 0);
         assert!(!root.join("init.manifest.json").exists());
         assert_eq!(read(&w.codex().join("config.toml")), codex_toml);
-        for gone in [w.claude_skill_dir(), w.cursor_skill_dir(), w.codex_prompt(), w.gemini_command(), w.claude_json(), w.codex().join("AGENTS.md"), w.cursor().join("mcp.json"), w.gemini().join("settings.json")] {
+        for gone in [w.claude_skill_dir(), w.cursor_skill_dir(), w.codex_prompt(), w.gemini_command(), w.claude_json(), w.codex_agents(), w.cursor().join("mcp.json"), w.gemini().join("settings.json")] {
             assert!(!gone.exists(), "{} should be gone", gone.display());
         }
         assert_eq!(read(&w.codex_prompt().parent().unwrap().join("other.md")), "keep", "the shared prompts dir is not init's");
         assert!(installed(&w.home).is_empty());
     }
 
+    /// Astra: a whole-file record kept after the switch turns a later undo into a delete or
+    /// a stale restore over whatever the user put in the file since.
+    #[test]
+    fn an_edit_made_after_the_switch_survives_undo() {
+        let (w, mut m) = machine("edit-after");
+        let original = "[mcp_servers.github]\ncommand = \"gh-mcp\"\n";
+        write(&w.codex().join("config.toml"), original);
+        wire(&mut m, &w, AgentMode::Auto).unwrap();
+        wire(&mut m, &w, AgentMode::Explicit).unwrap();
+        // Gemini's settings.json was created by init and is gone; the user now makes one.
+        write(&w.gemini().join("settings.json"), "{\"theme\":\"dark\"}");
+        // Codex's config.toml is back to the original; the user adds to it.
+        write(&w.codex().join("config.toml"), &format!("{original}\n[mcp_servers.linear]\ncommand = \"linear-mcp\"\n"));
+        assert_eq!(undo_with(m).unwrap(), 0);
+        assert_eq!(read(&w.gemini().join("settings.json")), "{\"theme\":\"dark\"}");
+        assert!(read(&w.codex().join("config.toml")).contains("linear-mcp"));
+    }
+
     #[test]
     fn a_pre_existing_command_file_is_restored_not_deleted() {
         let (w, mut m) = machine("preexisting");
-        fs::create_dir_all(w.codex_prompt().parent().unwrap()).unwrap();
-        fs::write(w.codex_prompt(), "my own prompt").unwrap();
+        write(&w.codex_prompt(), "my own prompt");
         wire(&mut m, &w, AgentMode::Explicit).unwrap();
         assert!(read(&w.codex_prompt()).contains("/prompts:tokenstash"));
         wire(&mut m, &w, AgentMode::Auto).unwrap();
         assert_eq!(read(&w.codex_prompt()), "my own prompt");
     }
 
+    /// Greptile: a skill directory init created may since hold the user's own files.
     #[test]
-    fn a_registration_init_did_not_make_is_still_removed_in_explicit_mode() {
-        let (w, mut m) = machine("foreign");
-        fs::write(w.cursor().join("mcp.json"), "{\"mcpServers\":{\"tokenstash\":{\"command\":\"/old/tokenstash\",\"args\":[\"mcp\"]},\"github\":{\"command\":\"gh-mcp\"}}}").unwrap();
+    fn a_users_file_in_a_skill_dir_init_created_is_left_alone() {
+        let (w, mut m) = machine("skill-extra");
         wire(&mut m, &w, AgentMode::Explicit).unwrap();
-        assert!(!json_has_server(&w.cursor().join("mcp.json")));
-        assert!(read(&w.cursor().join("mcp.json")).contains("gh-mcp"));
-        // ...and undo puts the user's registration back, since init backed the file up first.
+        write(&w.cursor_skill_dir().join("helper.sh"), "#!/bin/sh");
+        wire(&mut m, &w, AgentMode::Auto).unwrap();
+        assert!(!w.cursor_skill_dir().join("SKILL.md").exists());
+        assert_eq!(read(&w.cursor_skill_dir().join("helper.sh")), "#!/bin/sh");
+        write(&w.claude_skill_dir().join("notes.md"), "mine");
         assert_eq!(undo_with(m).unwrap(), 0);
-        assert!(read(&w.cursor().join("mcp.json")).contains("/old/tokenstash"));
+        assert!(!w.claude_skill_dir().join("SKILL.md").exists());
+        assert_eq!(read(&w.claude_skill_dir().join("notes.md")), "mine");
+    }
+
+    /// A registration the user made is removed (explicit means explicit) and recorded as an
+    /// entry, so undo puts the entry back without touching the rest of the file — including
+    /// what the user changed in it since.
+    #[test]
+    fn a_registration_init_did_not_make_is_removed_and_undo_puts_the_entry_back() {
+        let (w, mut m) = machine("foreign");
+        write(&w.cursor().join("mcp.json"), "{\"mcpServers\":{\"tokenstash\":{\"command\":\"/old/tokenstash\",\"args\":[\"mcp\"]},\"github\":{\"command\":\"gh-mcp\"}}}");
+        // Claude: one at user scope, one at local scope (a plain `claude mcp add` in a project).
+        write(&w.claude_json(), "{\"mcpServers\":{\"tokenstash\":{\"type\":\"stdio\",\"command\":\"/old/tokenstash\",\"args\":[\"mcp\"]}},\"projects\":{\"/home/u/app\":{\"mcpServers\":{\"tokenstash\":{\"command\":\"/old/tokenstash\",\"args\":[\"mcp\"]},\"other\":{\"command\":\"x\"}},\"history\":[1]}}}");
+        // (A comment directly above the tokenstash header is that entry's, and goes with it.)
+        write(&w.codex().join("config.toml"), "# keep me\nmodel = \"o3\"\n\n# theirs\n[mcp_servers.tokenstash]\ncommand = \"/old/tokenstash\"\nargs = [\"mcp\"]\n\n[mcp_servers.github]\ncommand = \"gh-mcp\"\n");
+        wire(&mut m, &w, AgentMode::Explicit).unwrap();
+        assert!(!json_has_server(&w.cursor().join("mcp.json"), false) && !json_has_server(&w.claude_json(), true) && !toml_has_server(&w.codex().join("config.toml")));
+        assert!(read(&w.cursor().join("mcp.json")).contains("gh-mcp"));
+        assert!(read(&w.claude_json()).contains("\"other\"") && read(&w.claude_json()).contains("history"));
+        let codex = read(&w.codex().join("config.toml"));
+        assert!(codex.contains("# keep me") && codex.contains("model = \"o3\"") && codex.contains("[mcp_servers.github]") && !codex.contains("# theirs"), "{codex}");
+        assert_eq!(m.entries.len(), 4, "{:?}", m.entries);
+        assert!(m.files.iter().all(|(p, _)| !p.ends_with(".claude.json") && !p.ends_with("mcp.json") && !p.ends_with("config.toml")), "foreign files get entry records, not whole-file ones: {:?}", m.files);
+        assert_eq!(installed(&w.home), EXPLICIT_INSTALLED);
+        // The user changes the files afterwards...
+        write(&w.cursor().join("mcp.json"), "{\"mcpServers\":{\"github\":{\"command\":\"gh-mcp\"},\"linear\":{\"command\":\"linear-mcp\"}}}");
+        // ...and undo brings the entries back beside those changes.
+        assert_eq!(undo_with(m).unwrap(), 0);
+        let cursor: serde_json::Value = serde_json::from_str(&read(&w.cursor().join("mcp.json"))).unwrap();
+        assert_eq!(cursor["mcpServers"]["tokenstash"]["command"], "/old/tokenstash");
+        assert_eq!(cursor["mcpServers"]["linear"]["command"], "linear-mcp");
+        let claude: serde_json::Value = serde_json::from_str(&read(&w.claude_json())).unwrap();
+        assert_eq!(claude["mcpServers"]["tokenstash"]["type"], "stdio");
+        assert_eq!(claude["projects"]["/home/u/app"]["mcpServers"]["tokenstash"]["command"], "/old/tokenstash");
+        assert_eq!(claude["projects"]["/home/u/app"]["history"][0], 1);
+        let codex = read(&w.codex().join("config.toml"));
+        assert!(codex.contains("# keep me") && codex.contains("# theirs") && toml_has_server(&w.codex().join("config.toml")) && codex.contains("[mcp_servers.github]"), "{codex}");
+        let back: toml::Value = toml::from_str(&codex).unwrap();
+        assert_eq!(back["mcp_servers"]["tokenstash"]["command"].as_str(), Some("/old/tokenstash"));
+    }
+
+    /// Astra: init registered through `claude mcp add`, and the switch happens with the CLI
+    /// gone (a desktop-only session). The entry is init's, so it just goes: no record that
+    /// undo would turn back into a registration, and the CLI flag does not linger either.
+    #[test]
+    fn an_entry_init_registered_through_the_cli_is_not_user_data() {
+        let (w, mut m) = machine("cli-owned");
+        // What `claude mcp add -s user` leaves behind, plus the user's own local-scope entry.
+        write(&w.claude_json(), "{\"mcpServers\":{\"tokenstash\":{\"type\":\"stdio\",\"command\":\"/opt/tokenstash\",\"args\":[\"mcp\"]}},\"projects\":{\"/home/u/app\":{\"mcpServers\":{\"tokenstash\":{\"command\":\"/old/tokenstash\"}}}}}");
+        m.claude_mcp_registered = true;
+        m.save().unwrap();
+        wire(&mut m, &w, AgentMode::Explicit).unwrap();
+        assert!(!m.claude_mcp_registered);
+        assert_eq!(m.entries.len(), 1, "{:?}", m.entries);
+        assert!(m.entries[0].key.starts_with("projects/"));
+        assert_eq!(undo_with(m).unwrap(), 0);
+        let claude: serde_json::Value = serde_json::from_str(&read(&w.claude_json())).unwrap();
+        assert!(claude["mcpServers"].get("tokenstash").is_none(), "init's own registration must not come back: {claude}");
+        assert_eq!(claude["projects"]["/home/u/app"]["mcpServers"]["tokenstash"]["command"], "/old/tokenstash");
+    }
+
+    /// Astra: `init --project` sections must follow the mode, in every project they were
+    /// written into, or one of them keeps telling the agent to ask on its own.
+    #[test]
+    fn project_sections_follow_the_mode() {
+        let (w, mut m) = machine("projects");
+        let proj = scratch("projects-app").join("AGENTS.md");
+        write(&proj, "# App\n");
+        m.mutate(&proj, || set_snippet(&proj, AgentMode::Auto)).unwrap();
+        assert!(read(&proj).contains("secrets_request"));
+        wire(&mut m, &w, AgentMode::Explicit).unwrap();
+        let s = read(&proj);
+        assert!(s.starts_with("# App\n\n<!-- tokenstash -->") && s.contains("Do not run tokenstash until the user invokes") && !s.contains("secrets_request"), "{s}");
+        assert_eq!(s.matches(SNIPPET_MARK).count(), 1);
+        wire(&mut m, &w, AgentMode::Auto).unwrap();
+        assert!(read(&proj).contains("secrets_request") && !read(&proj).contains("Do not run tokenstash until"));
+        // set_snippet on a file already holding the right section changes nothing.
+        let before = read(&proj);
+        set_snippet(&proj, AgentMode::Auto).unwrap();
+        assert_eq!(read(&proj), before);
+        assert_eq!(undo_with(m).unwrap(), 0);
+        assert_eq!(read(&proj), "# App\n");
     }
 
     #[test]
@@ -1029,8 +1318,8 @@ mod tests {
         let d = scratch("snippet");
         let p = d.join("AGENTS.md");
         fs::write(&p, "# Rules\n").unwrap();
-        append_snippet_for(&p, AgentMode::Auto).unwrap();
-        append_snippet_for(&p, AgentMode::Auto).unwrap();
+        set_snippet(&p, AgentMode::Auto).unwrap();
+        set_snippet(&p, AgentMode::Auto).unwrap();
         assert_eq!(read(&p).matches(SNIPPET_MARK).count(), 1);
         strip_snippet(&p).unwrap();
         assert_eq!(read(&p), "# Rules\n");
@@ -1045,24 +1334,42 @@ mod tests {
     }
 
     #[test]
-    fn the_explicit_snippet_never_tells_the_agent_to_run_tokenstash() {
+    fn the_explicit_snippet_never_tells_the_agent_to_run_tokenstash_unasked() {
         let s = snippet_for(AgentMode::Explicit);
-        for rule in ["Never ask the user to paste a secret", "invent a stand-in value by any route", "never read, print or quote"] {
+        for rule in ["Never ask the user to paste a secret", "invent a stand-in value by any route", "never read, print or quote", "Do not run tokenstash until the user invokes", "a different task needs a new invocation", "never MCP tools"] {
             assert!(s.contains(rule), "{rule}: {s}");
         }
-        assert!(s.contains("do not run tokenstash unless they invoke it"));
-        assert!(!s.contains("secrets_request") && !s.contains("tokenstash need"));
+        assert!(!s.contains("secrets_request") && !s.contains("Use the tokenstash MCP tools"));
         assert!(s.starts_with(SNIPPET_MARK) && s.trim_end().ends_with(SNIPPET_END));
     }
 
     #[test]
-    fn a_non_default_home_is_baked_into_auto_registrations_only() {
+    fn a_non_default_home_reaches_both_modes() {
         let (mut w, mut m) = machine("ts-home");
         w.ts_home = Some("/srv/ts".into());
         wire(&mut m, &w, AgentMode::Auto).unwrap();
         assert!(read(&w.claude_json()).contains("\"TOKENSTASH_HOME\": \"/srv/ts\""));
         assert!(read(&w.codex().join("config.toml")).contains("TOKENSTASH_HOME = \"/srv/ts\""));
         wire(&mut m, &w, AgentMode::Explicit).unwrap();
-        assert!(!read(&w.codex().join("config.toml")).contains("/srv/ts"));
+        assert!(!w.codex().join("config.toml").exists());
+        for p in [w.claude_skill_dir().join("SKILL.md"), w.cursor_skill_dir().join("SKILL.md"), w.codex_prompt(), w.gemini_command()] {
+            assert!(read(&p).contains("TOKENSTASH_HOME=/srv/ts"), "{}", p.display());
+        }
+    }
+
+    #[test]
+    fn pristine_means_the_same_document_not_the_same_bytes() {
+        let d = scratch("pristine");
+        let (a, b) = (d.join("a.json"), d.join("b.json"));
+        fs::write(&a, "{\"mcpServers\":{\"x\":{\"command\":\"y\"}}}").unwrap();
+        fs::write(&b, "{\n  \"mcpServers\": {\n    \"x\": {\n      \"command\": \"y\"\n    }\n  }\n}").unwrap();
+        assert!(same_content(&a, &b));
+        fs::write(&b, "{\"mcpServers\":{}}").unwrap();
+        assert!(!same_content(&a, &b) && effectively_empty(&b) && !effectively_empty(&a));
+        let t = d.join("c.toml");
+        fs::write(&t, "[mcp_servers]\n").unwrap();
+        assert!(effectively_empty(&t));
+        fs::write(&t, "model = \"o3\"\n[mcp_servers]\n").unwrap();
+        assert!(!effectively_empty(&t));
     }
 }

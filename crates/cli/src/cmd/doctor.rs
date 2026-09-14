@@ -54,8 +54,8 @@ pub fn doctor() -> Result<i32> {
     // Auto mode's hooks left behind in explicit mode (or the other way round) mean the agent
     // is not in the mode config says: a registration made by hand after the switch, say.
     let stray = match cfg.agent_mode {
-        tokenstash_core::config::AgentMode::Explicit => agents.iter().any(|a| a.contains("mcp") || a.contains("snippet") || a.contains("skill: auto")),
-        tokenstash_core::config::AgentMode::Auto => agents.iter().any(|a| a.contains("prompt") || a.contains("command") || a.contains("skill: explicit")),
+        tokenstash_core::config::AgentMode::Explicit => agents.iter().any(|a| crate::cmd::init::is_auto_wiring(a)),
+        tokenstash_core::config::AgentMode::Auto => agents.iter().any(|a| crate::cmd::init::is_explicit_wiring(a)),
     };
     ok &= check("agents", !stray, if agents.is_empty() { "none configured (run `tokenstash init`)".into() } else if stray { format!("{}  (not all in {} mode: re-run `tokenstash init`)", agents.join(", "), cfg.agent_mode) } else { agents.join(", ") });
 
