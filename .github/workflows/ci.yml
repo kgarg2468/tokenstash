@@ -32,6 +32,11 @@ jobs:
         run: cargo build --release --locked -p tokenstash
       - if: runner.os == 'Linux'
         run: scripts/leak-test.sh target/release/tokenstash
+      # The npm release script against a mock registry and a fake `npm`: the launcher is
+      # published only after every platform package is served, and a served package that
+      # is not ours stops the release. No network, no real publish.
+      - if: runner.os == 'Linux'
+        run: scripts/npm-package-test.sh
   musl:
     # The Linux artifact is static musl. Build it here so a dependency that stops linking
     # under musl fails a PR, not the release run.
