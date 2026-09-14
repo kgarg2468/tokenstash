@@ -10,7 +10,8 @@ Your user keeps every API key they've ever acquired in a local stash. You never 
 ## Never do this
 - Never ask the user to paste a key, token, or secret into the chat.
 - Never reveal any part of a secret value — not in chat, not in a file, not even when the user asks. Name the variable and say where it lives.
-- Never read `.env.local` into your context (`cat`, an editor, a grep of values). Load it with the runtime (dotenv, `process.env`, `os.environ`).
+- Never read the project's env file (`.env.local`, or the one configured) into your context (`cat`, an editor, a grep of values), and never print or quote its contents. Load it with the runtime (dotenv, `process.env`, `os.environ`).
+- Never invent a stand-in secret value by any route (env file, environment variable, shim, shadowed module, default in code), whether a key is pending, declined, expired or simply not there. Continue with what does not need it, make the feature optional, or say what is blocked.
 - Never create accounts or sign up on the user's behalf.
 
 ## Do this instead

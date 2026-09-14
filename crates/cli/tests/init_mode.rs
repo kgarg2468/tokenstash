@@ -47,36 +47,35 @@ fn the_skill_and_snippet_print_for_each_mode_without_touching_anything() {
     let text = out(&explicit);
     assert!(text.starts_with("---\nname: tokenstash\n") && text.contains("\ndisable-model-invocation: true\n"), "{text}");
     assert!(text.contains("`/tokenstash $ARGUMENTS`") && !text.contains("secrets_request"), "{text}");
+    assert!(text.contains(&format!("TOKENSTASH_HOME={}", home.display())), "the skill names this shell's home: {text}");
     let snippet = run(&home, &proj, &["init", "--print-snippet", "--mode", "explicit"]);
-    assert!(out(&snippet).contains("do not run tokenstash unless they invoke it"), "{}", out(&snippet));
+    assert!(out(&snippet).contains("Do not run tokenstash until the user invokes"), "{}", out(&snippet));
     assert!(out(&run(&home, &proj, &["init", "--print-snippet"])).contains("secrets_request"));
     assert!(!home.join("tokenstash.db").exists(), "--print-* must not set anything up");
     assert!(!proj.join("AGENTS.md").exists());
 }
 
+/// Astra: an agent with a shell must not be able to choose the mode (it could put automatic
+/// mode back), write a project's instructions, or undo (which restores wiring explicit mode
+/// took out). From a pipe all three refuse, before anything is written.
 #[test]
-fn the_mode_is_remembered_and_shown_by_doctor() {
-    let home = home("remember");
-    let proj = tmp("remember-proj");
-    let o = run(&home, &proj, &["init", "--mode", "explicit"]);
+fn choosing_the_mode_writing_a_project_and_undo_are_for_a_person() {
+    let home = home("gates");
+    let proj = tmp("gates-proj");
+    std::fs::write(home.join("config.toml"), format!("{}agent_mode = \"explicit\"\n", std::fs::read_to_string(home.join("config.toml")).unwrap())).unwrap();
+    for args in [vec!["init", "--mode", "auto"], vec!["init", "--mode", "explicit"], vec!["init", "--project"], vec!["init", "--undo"], vec!["init", "--mode", "auto", "--no-agents"]] {
+        let o = run(&home, &proj, &args);
+        assert!(!o.status.success(), "{args:?} must refuse: {}", out(&o));
+        assert!(err(&o).contains("for a person at a terminal"), "{args:?}: {}", err(&o));
+        assert!(out(&o).trim().is_empty(), "{args:?} printed to a pipe: {}", out(&o));
+    }
+    assert!(std::fs::read_to_string(home.join("config.toml")).unwrap().contains("agent_mode = \"explicit\""), "the person's choice stands");
+    assert!(!home.join("tokenstash.db").exists() && !proj.join("AGENTS.md").exists());
+    // A plain `init` still sets the stash up for anyone, in the mode the person chose.
+    let o = run(&home, &proj, &["init"]);
     assert!(o.status.success(), "{}", err(&o));
-    let stdout = out(&o);
-    assert!(stdout.contains("agent mode: explicit"), "{stdout}");
-    // From a pipe the human gate holds in this mode too: nothing outside the home is written.
-    assert!(stdout.contains("Agents were not registered") && !stdout.contains("Files outside"), "{stdout}");
-    let cfg = std::fs::read_to_string(home.join("config.toml")).unwrap();
-    assert!(cfg.contains("agent_mode = \"explicit\""), "{cfg}");
-    // A later plain `init` keeps the choice.
-    let again = out(&run(&home, &proj, &["init"]));
-    assert!(again.contains("agent mode: explicit"), "{again}");
-    let doctor = out(&run(&home, &proj, &["doctor"]));
-    assert!(doctor.contains("agent mode") && doctor.contains("explicit — agents use tokenstash only when you type /tokenstash"), "{doctor}");
-    // Back to auto: the default is not written, so the file still loads in 0.2.
-    let back = out(&run(&home, &proj, &["init", "--mode", "auto"]));
-    assert!(back.contains("agent mode: auto"), "{back}");
-    let cfg = std::fs::read_to_string(home.join("config.toml")).unwrap();
-    assert!(!cfg.contains("agent_mode"), "{cfg}");
-    assert!(out(&run(&home, &proj, &["doctor"])).contains("auto — agents ask tokenstash on their own"));
+    assert!(out(&o).contains("agent mode: explicit") && out(&o).contains("Agents were not registered"), "{}", out(&o));
+    assert!(out(&run(&home, &proj, &["doctor"])).contains("explicit — agents use tokenstash only when you type /tokenstash"));
 }
 
 #[test]
@@ -85,7 +84,7 @@ fn an_unknown_mode_is_rejected_before_anything_runs() {
     let proj = tmp("unknown-proj");
     let o = run(&home, &proj, &["init", "--mode", "sometimes"]);
     assert!(!o.status.success());
-    assert!(err(&o).contains("explicit") && err(&o).contains("auto"), "{}", err(&o));
+    assert!(err(&o).contains("explicit") && err(&o).contains("auto") && !err(&o).contains("for a person"), "{}", err(&o));
     assert!(!home.join("tokenstash.db").exists());
 }
 
@@ -135,6 +134,9 @@ fn a_person_switches_modes_and_undoes_on_a_scratch_home() {
 
     let explicit = person("init --mode explicit");
     assert!(explicit.contains("MCP server removed from") && explicit.contains("/prompts:tokenstash installed") && explicit.contains("Restart any open agent session"), "{explicit}");
+    assert!(std::fs::read_to_string(ts_home.join("config.toml")).unwrap().contains("agent_mode = \"explicit\""));
+    // A later plain `init` keeps the choice.
+    assert!(person("init").contains("agent mode: explicit"));
     assert_eq!(read(".codex/config.toml"), codex_toml, "only the tokenstash entry leaves");
     assert_eq!(read(".codex/AGENTS.md"), "# mine\n");
     assert!(read(".claude/skills/tokenstash/SKILL.md").contains("disable-model-invocation: true"));
@@ -142,11 +144,19 @@ fn a_person_switches_modes_and_undoes_on_a_scratch_home() {
     assert!(read(".codex/prompts/tokenstash.md").contains("$ARGUMENTS") && read(".gemini/commands/tokenstash.toml").contains("{{args}}"));
     assert!(!user_home.join(".claude.json").exists() && !user_home.join(".gemini/settings.json").exists(), "files init created for the server alone are gone");
     let doctor = person("doctor");
+    assert!(doctor.contains("explicit — agents use tokenstash only when you type /tokenstash"), "{doctor}");
     assert!(doctor.contains("claude-code (skill: explicit), codex (prompt), cursor (skill: explicit), gemini-cli (command)"), "{doctor}");
+    // Back to auto and the default is not written, so the file still loads in 0.2.
+    assert!(person("init --mode auto").contains("agent mode: auto"));
+    assert!(!std::fs::read_to_string(ts_home.join("config.toml")).unwrap().contains("agent_mode"));
+    assert!(person("init --mode explicit").contains("/prompts:tokenstash installed"));
 
+    // Config files back to what init found carry no whole-file record, so an edit made now
+    // survives undo; the auto→explicit→auto skill file is put back exactly.
+    std::fs::write(user_home.join(".codex/config.toml"), format!("{codex_toml}\n[mcp_servers.linear]\ncommand = \"linear-mcp\"\n")).unwrap();
     let undo = person("init --undo");
     assert!(undo.contains("restored") || undo.contains("removed"), "{undo}");
-    assert_eq!(read(".codex/config.toml"), codex_toml);
+    assert!(read(".codex/config.toml").contains("linear-mcp") && read(".codex/config.toml").contains("gh-mcp"), "{}", read(".codex/config.toml"));
     assert_eq!(read(".codex/AGENTS.md"), "# mine\n");
     for gone in [".claude/skills/tokenstash", ".cursor/skills/tokenstash", ".codex/prompts/tokenstash.md", ".gemini/commands/tokenstash.toml", ".cursor/mcp.json"] {
         assert!(!user_home.join(gone).exists(), "{gone} should be gone");
