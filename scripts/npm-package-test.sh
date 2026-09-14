@@ -11,7 +11,10 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
 real_npm="$(command -v npm)" || { echo "npm is required (for npm pack)" >&2; exit 2; }
-work="$(mktemp -d)"; trap 'kill "${server:-}" 2>/dev/null; rm -rf "$work"' EXIT
+work="$(mktemp -d)"
+# Everything started here — the mock server, the fake npm's visibility and tamper jobs —
+# is stopped before the fixtures go, so nothing writes into a directory being removed.
+trap 'pkill -P $$ 2>/dev/null; kill "${server:-}" 2>/dev/null; wait 2>/dev/null; rm -rf "$work"' EXIT
 reg="$work/registry"; mkdir -p "$reg" "$work/bin" "$work/src"
 # Four fake platform tarballs, each holding one executable named tokenstash.
 for n in linux-x64 linux-arm64 darwin-arm64 darwin-x64; do
@@ -46,7 +49,9 @@ http.server.ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
 PY
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
 python3 "$work/registry.py" "$reg" "$port" & server=$!
-for _ in $(seq 1 50); do curl -fs "http://127.0.0.1:$port/nothing" >/dev/null 2>&1 && break; curl -s -o /dev/null "http://127.0.0.1:$port/nothing" 2>/dev/null && break; sleep 0.1; done
+ready=0
+for _ in $(seq 1 50); do curl -s -m 2 -o /dev/null "http://127.0.0.1:$port/nothing" 2>/dev/null && { ready=1; break; }; sleep 0.1; done
+[ "$ready" = 1 ] || { echo "the mock registry did not come up on port $port" >&2; exit 2; }
 # The fake npm. `publish` packs the directory into the registry and makes it visible after
 # FAKE_DELAY seconds (platform packages) or at once (the launcher); `view` answers from the
 # registry's visible state, like the real one answers from what it serves.
@@ -59,10 +64,12 @@ case "$1" in
   publish)
     name=$(python3 -c 'import json; print(json.load(open("package.json"))["name"])')
     ver=$(python3 -c 'import json; print(json.load(open("package.json"))["version"])')
+    # Timestamped on entry, before packing: the ordering check must see when the script
+    # decided to publish, not when the pack finished.
+    echo "publish $name $(now)" >> "$FAKE_REG/log"
     mkdir -p "$FAKE_REG/$name"
     "$REAL_NPM" pack --silent --pack-destination "$FAKE_REG/$name" >/dev/null
     mv "$FAKE_REG/$name"/*.tgz "$FAKE_REG/$name/$ver.tgz"
-    echo "publish $name $(now)" >> "$FAKE_REG/log"
     delay=0; case "$name" in tokenstash-*) delay="${FAKE_DELAY:-0}" ;; esac
     ( sleep "$delay"; touch "$FAKE_REG/$name/visible"; echo "visible $name $(now)" >> "$FAKE_REG/log" ) &
     ;;
