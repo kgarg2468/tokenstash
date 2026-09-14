@@ -49,9 +49,9 @@ same_package() { # <pkg dir>
   rm -rf "$tmp"; return $ok
 }
 # The registry can answer a version it accepted with a 404 for a while — writes and reads
-# take different paths, and 0.2.0 saw eleven minutes — so a package gets up to fifteen
-# minutes to appear before it is judged. A package that is there and differs still fails; it
-# just fails after the wait.
+# take different paths, and 0.2.0 saw eleven minutes — so a package gets 60 attempts, 15 s
+# apart (about fifteen minutes plus the lookups themselves), before it is judged. A package
+# that is there and differs still fails; it just fails after the wait.
 settled() { # <pkg dir>
   local i url
   for i in $(seq 1 60); do
@@ -62,7 +62,7 @@ settled() { # <pkg dir>
   if url=$(tarball_url "$name") && [ -n "$url" ]; then
     echo "$name@$version is on the registry ($url) but does not match what we built, or could not be compared" >&2
   else
-    echo "$name@$version did not appear on the registry within fifteen minutes" >&2
+    echo "$name@$version did not appear on the registry after 60 attempts over about fifteen minutes" >&2
   fi
   return 1
 }
