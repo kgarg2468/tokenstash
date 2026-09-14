@@ -208,23 +208,45 @@ impl Manifest {
         Ok(true)
     }
 
-    /// A shared config init changed is back to what init found — the tokenstash entry is out
-    /// and the rest matches the backup, or init created it and nothing else was ever put in
-    /// it — so its whole-file record is retired: an undo later would only restore a copy
-    /// over whatever the user changes from now on. A file that differs from its backup keeps
-    /// the record, since something in it is still init's to put back.
-    fn retire_if_pristine(&mut self, p: &Path) -> Result<()> {
+    /// Init's entry is out of a shared config it held a whole-file record for, so the record
+    /// is retired: whatever else the file holds is the user's — put there before init or
+    /// after it — and restoring a copy would overwrite it. What init itself replaced, a
+    /// tokenstash entry the user had before init, comes back through an entry record instead.
+    /// A file init created that holds nothing else is removed rather than left as a stub.
+    fn retire(&mut self, p: &Path) -> Result<()> {
         let Some(i) = self.files.iter().position(|(q, _)| q == p) else { return Ok(()) };
-        let pristine = match &self.files[i].1 {
-            Some(b) => same_content(p, b),
-            None => effectively_empty(p),
-        };
-        if !pristine { return Ok(()); }
-        if self.files[i].1.is_none() { remove_file_if_present(p)?; }
+        match self.files[i].1.clone() {
+            Some(b) => {
+                if let Some(value) = original_entry(&b) {
+                    self.entries.push(Removed { file: p.to_path_buf(), key: if is_toml(p) { "mcp_servers".into() } else { "mcpServers".into() }, value });
+                }
+            }
+            None => if effectively_empty(p) { remove_file_if_present(p)?; },
+        }
         self.files.remove(i);
         self.save()?;
         Ok(())
     }
+}
+
+fn is_toml(p: &Path) -> bool { p.extension().is_some_and(|e| e == "toml") }
+
+/// The tokenstash entry a backup holds — the user's own registration that init's replaced —
+/// as an entry record's value. None for a backup without one, or a non-config file.
+fn original_entry(backup: &Path) -> Option<String> {
+    let s = fs::read_to_string(backup).ok()?;
+    if backup.to_string_lossy().ends_with(".toml") {
+        let doc: toml_edit::DocumentMut = s.parse().ok()?;
+        let item = doc.get("mcp_servers")?.get("tokenstash")?.clone();
+        let mut snip = toml_edit::DocumentMut::new();
+        let mut t = toml_edit::Table::new();
+        t.set_implicit(true);
+        t.insert("tokenstash", item);
+        snip.insert("mcp_servers", toml_edit::Item::Table(t));
+        return Some(snip.to_string());
+    }
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    Some(v.get("mcpServers")?.get("tokenstash")?.to_string())
 }
 
 fn remove_file_if_present(p: &Path) -> Result<()> {
@@ -247,41 +269,29 @@ fn remove_skill_dir(d: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Same bytes, or the same document (a config rewritten by serde_json/toml_edit differs in
-/// whitespace from the user's original and nothing else).
-fn same_content(a: &Path, b: &Path) -> bool {
-    let (Ok(x), Ok(y)) = (fs::read_to_string(a), fs::read_to_string(b)) else { return false };
-    if x == y { return true; }
-    match a.extension().and_then(|e| e.to_str()) {
-        Some("json") => matches!((serde_json::from_str::<serde_json::Value>(&x), serde_json::from_str::<serde_json::Value>(&y)), (Ok(p), Ok(q)) if p == q),
-        Some("toml") => matches!((toml::from_str::<toml::Value>(&x), toml::from_str::<toml::Value>(&y)), (Ok(p), Ok(q)) if p == q),
-        _ => false,
-    }
-}
-
-/// Nothing but empty containers: `{"mcpServers": {}}`, `[mcp_servers]` with no entries, a
-/// blank AGENTS.md.
+/// Nothing but what init's own wiring leaves behind once its entry is gone: `{}` or
+/// `{"mcpServers": {}}`, a bare `[mcp_servers]` header, a blank AGENTS.md. Anything else —
+/// another key, an empty table of the user's, a comment — is theirs, and the file stays.
 fn effectively_empty(p: &Path) -> bool {
-    let Ok(s) = fs::read_to_string(p) else { return true };
-    fn json_empty(v: &serde_json::Value) -> bool {
-        match v { serde_json::Value::Object(m) => m.values().all(json_empty), serde_json::Value::Array(a) => a.is_empty(), _ => false }
-    }
-    fn toml_empty(v: &toml::Value) -> bool {
-        match v { toml::Value::Table(t) => t.values().all(toml_empty), toml::Value::Array(a) => a.is_empty(), _ => false }
-    }
+    let s = match fs::read_to_string(p) {
+        Ok(s) => s,
+        Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
+    };
     match p.extension().and_then(|e| e.to_str()) {
-        Some("json") => serde_json::from_str::<serde_json::Value>(&s).map(|v| json_empty(&v)).unwrap_or(false),
-        Some("toml") => toml::from_str::<toml::Value>(&s).map(|v| toml_empty(&v)).unwrap_or(false),
+        Some("json") => serde_json::from_str::<serde_json::Value>(&s).map(|v| v == serde_json::json!({}) || v == serde_json::json!({ "mcpServers": {} })).unwrap_or(false),
+        Some("toml") => { let t = s.trim(); t.is_empty() || t == "[mcp_servers]" }
         _ => s.trim().is_empty(),
     }
 }
 
 fn undo() -> Result<i32> {
     let m = Manifest::load()?;
-    undo_with(m)
+    undo_with(m, which("claude"))
 }
 
-fn undo_with(m: Manifest) -> Result<i32> {
+/// `claude_cli`: `claude` is on PATH, so init's own registration can be removed through it.
+/// A parameter, not a lookup, so a test on a fake home never reaches the real one.
+fn undo_with(m: Manifest, claude_cli: bool) -> Result<i32> {
     if m.is_empty() {
         println!("nothing to undo: no init manifest at {}", m.path().display());
         println!("(if that init ran with a custom TOKENSTASH_HOME under an older version, run --undo with the same TOKENSTASH_HOME set: the record is adopted from there)");
@@ -316,18 +326,25 @@ fn undo_with(m: Manifest) -> Result<i32> {
             Err(e) => { println!("! {}: {e} (kept in the manifest)", d.display()); i += 1; }
         }
     }
+    // Init's own CLI registration goes before any entry comes back: `reinsert` yields to a
+    // tokenstash entry already present, and init's would be mistaken for the user's.
+    if cur.claude_mcp_registered {
+        let ok = claude_cli && claude_mcp(&["remove", "-s", "user", "tokenstash"]);
+        if ok { println!("✓ claude mcp remove tokenstash"); cur.claude_mcp_registered = false; cur.save()?; } else {
+            println!("! could not run `claude mcp remove -s user tokenstash` (kept in the manifest; run it by hand or re-run --undo with `claude` on PATH)");
+        }
+    }
     let mut i = 0;
     while i < cur.entries.len() {
         let r = cur.entries[i].clone();
+        if cur.claude_mcp_registered && r.file.file_name().is_some_and(|n| n == ".claude.json") {
+            println!("! {}: the tokenstash entry waits until init's own registration is removed (kept in the manifest)", r.file.display());
+            i += 1;
+            continue;
+        }
         match reinsert(&r) {
             Ok(()) => { println!("✓ put the tokenstash MCP entry back in {}", r.file.display()); cur.entries.remove(i); cur.save()?; }
             Err(e) => { println!("! {}: {e} (kept in the manifest; re-run --undo to retry)", r.file.display()); i += 1; }
-        }
-    }
-    if cur.claude_mcp_registered {
-        let ok = which("claude") && claude_mcp(&["remove", "-s", "user", "tokenstash"]);
-        if ok { println!("✓ claude mcp remove tokenstash"); cur.claude_mcp_registered = false; cur.save()?; } else {
-            println!("! could not run `claude mcp remove -s user tokenstash` (kept in the manifest; run it by hand or re-run --undo with `claude` on PATH)");
         }
     }
     let all_done = cur.is_empty();
@@ -525,9 +542,9 @@ fn unwire_auto(manifest: &mut Manifest, w: &Wiring) -> Result<()> {
     let cagents = w.codex_agents();
     if has_snippet(&cagents) {
         manifest.mutate(&cagents, || strip_snippet(&cagents))?;
-        manifest.retire_if_pristine(&cagents)?;
         println!("✓ Codex: usage section removed from {}", cagents.display());
     }
+    manifest.retire(&cagents)?;
     remove_json_server(manifest, &w.cursor().join("mcp.json"), "Cursor", false)?;
     remove_json_server(manifest, &w.gemini().join("settings.json"), "Gemini CLI", false)?;
     Ok(())
@@ -535,64 +552,72 @@ fn unwire_auto(manifest: &mut Manifest, w: &Wiring) -> Result<()> {
 
 /// Take `tokenstash` out of a JSON config's `mcpServers` — and, for `~/.claude.json`, out of
 /// every project's local-scope `mcpServers` too, which is where a plain `claude mcp add`
-/// puts it. Init's own entry just goes; anyone else's is recorded for undo.
+/// puts it. Init's own entry just goes; anyone else's is recorded for undo. An entry that
+/// is already gone (an interrupted earlier run, the user) still settles the bookkeeping:
+/// the CLI flag and the whole-file record are reconciled either way.
 fn remove_json_server(manifest: &mut Manifest, p: &Path, name: &str, claude: bool) -> Result<()> {
-    if !json_has_server(p, claude) { return Ok(()); }
     let recorded = manifest.recorded(p);
-    let mut v = read_json(p)?;
-    let mut removed: Vec<(String, serde_json::Value)> = vec![];
-    if let Some(m) = v.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
-        if let Some(x) = m.remove("tokenstash") { removed.push(("mcpServers".into(), x)); }
-    }
-    if claude {
-        if let Some(projects) = v.get_mut("projects").and_then(|s| s.as_object_mut()) {
-            for (path, proj) in projects.iter_mut() {
-                if let Some(m) = proj.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
-                    if let Some(x) = m.remove("tokenstash") { removed.push((format!("projects/{path}"), x)); }
+    if json_has_server(p, claude) {
+        let mut v = read_json(p)?;
+        let mut removed: Vec<(String, serde_json::Value)> = vec![];
+        if let Some(m) = v.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
+            if let Some(x) = m.remove("tokenstash") { removed.push(("mcpServers".into(), x)); }
+        }
+        if claude {
+            if let Some(projects) = v.get_mut("projects").and_then(|s| s.as_object_mut()) {
+                for (path, proj) in projects.iter_mut() {
+                    if let Some(m) = proj.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
+                        if let Some(x) = m.remove("tokenstash") { removed.push((format!("projects/{path}"), x)); }
+                    }
                 }
             }
         }
+        // The user-scope entry is init's when init wrote this file, or registered through
+        // the CLI; either way it is not user data and undo must not bring it back.
+        let own_user_scope = recorded || (claude && manifest.claude_mcp_registered);
+        for (key, value) in removed {
+            if key == "mcpServers" && own_user_scope { continue; }
+            manifest.entries.push(Removed { file: p.to_path_buf(), key, value: value.to_string() });
+        }
+        // The records first: an entry recorded but still present is re-inserted by undo only
+        // if absent, so a crash between the two leaves nothing wrong. Ownership of init's
+        // registration is given up only once it is gone.
+        manifest.save()?;
+        fs::write(p, serde_json::to_string_pretty(&v)?)?;
+        println!("✓ {name}: MCP server removed from {}", p.display());
     }
-    // The user-scope entry is init's when init wrote this file, or registered through the
-    // CLI; either way it is not user data and undo must not bring it back.
-    let own_user_scope = recorded || (claude && manifest.claude_mcp_registered);
-    for (key, value) in removed {
-        if key == "mcpServers" && own_user_scope { continue; }
-        manifest.entries.push(Removed { file: p.to_path_buf(), key, value: value.to_string() });
+    if claude && manifest.claude_mcp_registered && !json_has_server(p, false) {
+        manifest.claude_mcp_registered = false;
+        manifest.save()?;
     }
-    if claude { manifest.claude_mcp_registered = false; }
-    // The record first: an entry recorded but still present is re-inserted by undo only if
-    // absent, so a crash between the two leaves nothing wrong.
-    manifest.save()?;
-    fs::write(p, serde_json::to_string_pretty(&v)?)?;
-    if recorded { manifest.retire_if_pristine(p)?; }
-    println!("✓ {name}: MCP server removed from {}", p.display());
+    if recorded { manifest.retire(p)?; }
     Ok(())
 }
 
 /// Same for Codex's `mcp_servers.tokenstash`, keeping the user's comments and formatting.
 fn remove_toml_server(manifest: &mut Manifest, p: &Path) -> Result<()> {
-    if !toml_has_server(p) { return Ok(()); }
     let recorded = manifest.recorded(p);
-    let mut doc = read_toml(p)?;
-    let item = doc.get_mut("mcp_servers").and_then(|s| s.as_table_like_mut()).and_then(|s| s.remove("tokenstash"));
-    if let (Some(item), false) = (item, recorded) {
-        let mut snip = toml_edit::DocumentMut::new();
-        let mut t = toml_edit::Table::new();
-        t.set_implicit(true);
-        t.insert("tokenstash", item);
-        snip.insert("mcp_servers", toml_edit::Item::Table(t));
-        manifest.entries.push(Removed { file: p.to_path_buf(), key: "mcp_servers".into(), value: snip.to_string() });
-        manifest.save()?;
+    if toml_has_server(p) {
+        let mut doc = read_toml(p)?;
+        let item = doc.get_mut("mcp_servers").and_then(|s| s.as_table_like_mut()).and_then(|s| s.remove("tokenstash"));
+        if let (Some(item), false) = (item, recorded) {
+            let mut snip = toml_edit::DocumentMut::new();
+            let mut t = toml_edit::Table::new();
+            t.set_implicit(true);
+            t.insert("tokenstash", item);
+            snip.insert("mcp_servers", toml_edit::Item::Table(t));
+            manifest.entries.push(Removed { file: p.to_path_buf(), key: "mcp_servers".into(), value: snip.to_string() });
+            manifest.save()?;
+        }
+        let out = doc.to_string();
+        let back: toml::Value = toml::from_str(&out).map_err(|e| anyhow::anyhow!("refusing to write {}: result would not parse ({e})", p.display()))?;
+        if back.get("mcp_servers").and_then(|m| m.get("tokenstash")).is_some() {
+            anyhow::bail!("refusing to write {}: could not take the tokenstash entry out cleanly; edit it by hand", p.display());
+        }
+        fs::write(p, out)?;
+        println!("✓ Codex: MCP server removed from {}", p.display());
     }
-    let out = doc.to_string();
-    let back: toml::Value = toml::from_str(&out).map_err(|e| anyhow::anyhow!("refusing to write {}: result would not parse ({e})", p.display()))?;
-    if back.get("mcp_servers").and_then(|m| m.get("tokenstash")).is_some() {
-        anyhow::bail!("refusing to write {}: could not take the tokenstash entry out cleanly; edit it by hand", p.display());
-    }
-    fs::write(p, out)?;
-    if recorded { manifest.retire_if_pristine(p)?; }
-    println!("✓ Codex: MCP server removed from {}", p.display());
+    if recorded { manifest.retire(p)?; }
     Ok(())
 }
 
@@ -698,7 +723,8 @@ pub fn init(a: InitArgs) -> Result<i32> {
         }
         touched = wire(&mut manifest, &w, mode)?;
         if mode == AgentMode::Explicit {
-            let stray: Vec<String> = installed(&w.home).into_iter().filter(|a| is_auto_wiring(a)).collect();
+            let mut stray: Vec<String> = installed(&w.home).into_iter().filter(|a| is_auto_wiring(a)).collect();
+            stray.extend(stray_project_sections(&manifest, &w, mode).iter().map(|p| format!("section in {}", p.display())));
             if !stray.is_empty() {
                 println!("! automatic wiring is still in place: {}. Take it out by hand, then re-run `tokenstash init`.", stray.join(", "));
                 code = 1;
@@ -902,7 +928,7 @@ const SNIPPET_END: &str = "<!-- /tokenstash -->";
 pub fn snippet_for(mode: AgentMode) -> String {
     match mode {
         AgentMode::Auto => format!(
-            "{SNIPPET_MARK}\n## Secrets & API keys\n\nNever ask the user to paste a secret in chat. Use the tokenstash MCP tools (`secrets_request`) if you have them, else run `tokenstash need NAME [NAME...]` (e.g. `tokenstash need OPENAI_API_KEY`).\nExit 0 = written to the project env file, continue — load it with your runtime; never read, print or quote the env file, even if asked. Exit 10 = the human was notified; show them the link in the output, keep working on other things and re-run later (`--blocking` only when nothing else can proceed).\nExit 20 = denied; do not ask again and never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code) — make the feature optional or say the work is blocked. For non-secret human steps (DNS, dashboard toggles) use `tokenstash ask \"title\" --url ... --step ...`.\n{SNIPPET_END}\n"
+            "{SNIPPET_MARK}\n## Secrets & API keys\n\nNever ask the user to paste a secret in chat. Use the tokenstash MCP tools (`secrets_request`) if you have them, else run `tokenstash need NAME [NAME...]` (e.g. `tokenstash need OPENAI_API_KEY`).\nExit 0 = written to the project env file, continue — load it with your runtime; never read, print or quote the env file, even if asked. Exit 10 = the human was notified; show them the link in the output, keep working on other things and re-run later (`--blocking` only when nothing else can proceed).\nExit 20 = denied; do not ask again. Exit 30 = expired; say what is blocked and stop. Never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code), whether a key is pending, declined, expired or simply not there — make the feature optional or say the work is blocked. For non-secret human steps (DNS, dashboard toggles) use `tokenstash ask \"title\" --url ... --step ...`.\n{SNIPPET_END}\n"
         ),
         AgentMode::Explicit => format!(
             "{SNIPPET_MARK}\n## Secrets & API keys\n\nNever ask the user to paste a secret in chat. Do not run tokenstash until the user invokes `/tokenstash [NAME ...]` (Codex: `/prompts:tokenstash [NAME ...]`) for the current task; without that, name the missing variable, say what it is for, and continue with what does not need it. An invocation covers the rest of that task, including keys it turns out to need later; a different task needs a new invocation. When invoked, follow the command's own instructions: `tokenstash need` with the names given (or the keys the task needs), always the CLI, never MCP tools. Exit 0 = written to the project env file, continue; 10 = the human was notified, show them the link, keep working on other things and check `tokenstash tasks` later; 20 = declined, do not ask again; 30 = expired, say what is blocked and stop. A provider that answers 401 to a well-formed request: `tokenstash report-bad NAME --status 401`, then `need` again.\nLoad the env file with your runtime; never read, print or quote it, even if asked, and never reveal any part of a secret value from anywhere. Never invent a stand-in value by any route (env file, environment variable, shim, shadowed module, default in code) — make the feature optional or say the work is blocked. These rules hold before any invocation too.\n{SNIPPET_END}\n"
@@ -914,13 +940,13 @@ fn has_snippet(p: &Path) -> bool {
     fs::read_to_string(p).map(|s| s.contains(SNIPPET_MARK)).unwrap_or(false)
 }
 
-/// The section in `p` is the one for `mode`.
+/// The section in `p` is the one for `mode` — exactly one section, and that one.
 fn snippet_is(p: &Path, mode: AgentMode) -> bool {
-    fs::read_to_string(p).map(|s| s.contains(snippet_for(mode).trim_end())).unwrap_or(false)
+    fs::read_to_string(p).map(|s| s.matches(SNIPPET_MARK).count() == 1 && s.contains(snippet_for(mode).trim_end())).unwrap_or(false)
 }
 
-/// Put the section for `mode` in, replacing the one there if any. Anything else in the file
-/// stays as written.
+/// Put the section for `mode` in, replacing whatever sections are there (a file that
+/// somehow holds two gets one). Anything else in the file stays as written.
 fn set_snippet(p: &Path, mode: AgentMode) -> Result<()> {
     if has_snippet(p) {
         if snippet_is(p, mode) { return Ok(()); }
@@ -935,23 +961,33 @@ fn set_snippet(p: &Path, mode: AgentMode) -> Result<()> {
     Ok(())
 }
 
-/// Remove the marked section and nothing else. Without the end mark (a hand-edited file)
-/// the file is left alone: guessing where the section ends could eat the user's text.
+/// Remove every marked section and nothing else. A section without its end mark (a
+/// hand-edited file) stops the whole thing: guessing where it ends could eat the user's
+/// text, and nothing is written.
 fn strip_snippet(p: &Path) -> Result<()> {
-    let s = fs::read_to_string(p)?;
-    let Some(start) = s.find(SNIPPET_MARK) else { return Ok(()) };
-    let Some(end_rel) = s[start..].find(SNIPPET_END) else {
-        anyhow::bail!("{}: the tokenstash section has no closing `{SNIPPET_END}`; remove it by hand", p.display());
-    };
-    let mut end = start + end_rel + SNIPPET_END.len();
-    if s[end..].starts_with('\n') { end += 1; }
-    // The blank line set_snippet put before the section goes with it; so does one that
-    // separated a section at the top of the file from the text under it.
-    let mut start = start;
-    if s[..start].ends_with("\n\n") { start -= 1; } else if start == 0 && s[end..].starts_with('\n') { end += 1; }
-    let out = format!("{}{}", &s[..start], &s[end..]);
-    fs::write(p, out)?;
+    let mut s = fs::read_to_string(p)?;
+    while let Some(start) = s.find(SNIPPET_MARK) {
+        let Some(end_rel) = s[start..].find(SNIPPET_END) else {
+            anyhow::bail!("{}: a tokenstash section has no closing `{SNIPPET_END}`; remove it by hand", p.display());
+        };
+        let mut end = start + end_rel + SNIPPET_END.len();
+        if s[end..].starts_with('\n') { end += 1; }
+        // The blank line set_snippet put before the section goes with it; so does one that
+        // separated a section at the top of the file from the text under it.
+        let mut start = start;
+        if s[..start].ends_with("\n\n") { start -= 1; } else if start == 0 && s[end..].starts_with('\n') { end += 1; }
+        s = format!("{}{}", &s[..start], &s[end..]);
+    }
+    fs::write(p, s)?;
     Ok(())
+}
+
+/// Project AGENTS.md files init wrote a section into that still carry a section for another
+/// mode (or more than one), for the explicit-mode postcondition.
+fn stray_project_sections(manifest: &Manifest, w: &Wiring, mode: AgentMode) -> Vec<PathBuf> {
+    manifest.files.iter().map(|(p, _)| p.clone())
+        .filter(|p| p.file_name().is_some_and(|n| n == "AGENTS.md") && *p != w.codex_agents() && has_snippet(p) && !snippet_is(p, mode))
+        .collect()
 }
 
 fn frontmatter(skill: &str) -> &str {
@@ -1147,8 +1183,8 @@ mod tests {
         assert!(read(&w.claude_skill_dir().join("SKILL.md")).contains("disable-model-invocation: true"));
         assert!(w.codex_prompt().is_file() && w.gemini_command().is_file() && w.cursor_skill_dir().join("SKILL.md").is_file());
         assert_eq!(installed(&w.home), EXPLICIT_INSTALLED);
-        // Files that are back to what init found have no whole-file record any more: an undo
-        // after the user edits them must not restore a stale copy.
+        // No shared config keeps a whole-file record once init's entry is out: an undo after
+        // the user edits it must not restore a stale copy.
         for p in [w.codex().join("config.toml"), w.codex_agents(), w.claude_json(), w.gemini().join("settings.json"), w.cursor().join("mcp.json")] {
             assert!(!m.recorded(&p), "{} still recorded: {:?}", p.display(), m.files);
         }
@@ -1180,7 +1216,7 @@ mod tests {
         wire(&mut m, &w, AgentMode::Auto).unwrap();
         wire(&mut m, &w, AgentMode::Explicit).unwrap();
         let root = m.root.clone();
-        assert_eq!(undo_with(m).unwrap(), 0);
+        assert_eq!(undo_with(m, false).unwrap(), 0);
         assert!(!root.join("init.manifest.json").exists());
         assert_eq!(read(&w.codex().join("config.toml")), codex_toml);
         for gone in [w.claude_skill_dir(), w.cursor_skill_dir(), w.codex_prompt(), w.gemini_command(), w.claude_json(), w.codex_agents(), w.cursor().join("mcp.json"), w.gemini().join("settings.json")] {
@@ -1191,21 +1227,56 @@ mod tests {
     }
 
     /// Astra: a whole-file record kept after the switch turns a later undo into a delete or
-    /// a stale restore over whatever the user put in the file since.
+    /// a stale restore over whatever the user put in the file — before the switch or after.
     #[test]
-    fn an_edit_made_after_the_switch_survives_undo() {
-        let (w, mut m) = machine("edit-after");
+    fn the_users_edits_before_and_after_the_switch_survive_undo() {
+        let (w, mut m) = machine("edit-around");
         let original = "[mcp_servers.github]\ncommand = \"gh-mcp\"\n";
         write(&w.codex().join("config.toml"), original);
+        write(&w.cursor().join("mcp.json"), "{\"mcpServers\":{\"github\":{\"command\":\"gh-mcp\"}}}");
         wire(&mut m, &w, AgentMode::Auto).unwrap();
+        // Between auto and explicit the user adds a server to Cursor's file and an empty
+        // setting to the Gemini file init created.
+        let mut cursor: serde_json::Value = serde_json::from_str(&read(&w.cursor().join("mcp.json"))).unwrap();
+        cursor["mcpServers"]["linear"] = serde_json::json!({ "command": "linear-mcp" });
+        write(&w.cursor().join("mcp.json"), &cursor.to_string());
+        let mut gemini: serde_json::Value = serde_json::from_str(&read(&w.gemini().join("settings.json"))).unwrap();
+        gemini["theme"] = serde_json::json!([]);
+        write(&w.gemini().join("settings.json"), &gemini.to_string());
         wire(&mut m, &w, AgentMode::Explicit).unwrap();
-        // Gemini's settings.json was created by init and is gone; the user now makes one.
-        write(&w.gemini().join("settings.json"), "{\"theme\":\"dark\"}");
-        // Codex's config.toml is back to the original; the user adds to it.
+        assert!(read(&w.cursor().join("mcp.json")).contains("linear-mcp") && !json_has_server(&w.cursor().join("mcp.json"), false));
+        assert!(w.gemini().join("settings.json").exists() && read(&w.gemini().join("settings.json")).contains("theme"), "the user's addition keeps the file");
+        assert!(m.files.iter().all(|(p, _)| !p.ends_with("mcp.json") && !p.ends_with("settings.json") && !p.ends_with("config.toml")), "{:?}", m.files);
+        // After the switch: Codex's config.toml is back to the original; the user adds to it.
         write(&w.codex().join("config.toml"), &format!("{original}\n[mcp_servers.linear]\ncommand = \"linear-mcp\"\n"));
-        assert_eq!(undo_with(m).unwrap(), 0);
-        assert_eq!(read(&w.gemini().join("settings.json")), "{\"theme\":\"dark\"}");
-        assert!(read(&w.codex().join("config.toml")).contains("linear-mcp"));
+        assert_eq!(undo_with(m, false).unwrap(), 0);
+        assert!(read(&w.cursor().join("mcp.json")).contains("linear-mcp") && read(&w.cursor().join("mcp.json")).contains("gh-mcp"));
+        assert!(read(&w.gemini().join("settings.json")).contains("theme"));
+        assert!(read(&w.codex().join("config.toml")).contains("linear-mcp") && read(&w.codex().join("config.toml")).contains("gh-mcp"));
+    }
+
+    /// The user had their own registration before init; auto init replaced it. Explicit mode
+    /// takes init's out, and undo brings the user's back as an entry, not as a copy of the
+    /// file from before init.
+    #[test]
+    fn a_registration_init_replaced_comes_back_as_an_entry() {
+        let (w, mut m) = machine("replaced");
+        write(&w.cursor().join("mcp.json"), "{\"mcpServers\":{\"tokenstash\":{\"command\":\"/old/tokenstash\"}}}");
+        write(&w.codex().join("config.toml"), "[mcp_servers.tokenstash]\ncommand = \"/old/tokenstash\"\n");
+        wire(&mut m, &w, AgentMode::Auto).unwrap();
+        assert!(read(&w.cursor().join("mcp.json")).contains("/opt/tokenstash"));
+        wire(&mut m, &w, AgentMode::Explicit).unwrap();
+        assert!(!json_has_server(&w.cursor().join("mcp.json"), false) && !toml_has_server(&w.codex().join("config.toml")));
+        assert_eq!(m.entries.len(), 2, "{:?}", m.entries);
+        let mut cursor: serde_json::Value = serde_json::from_str(&read(&w.cursor().join("mcp.json"))).unwrap();
+        cursor["mcpServers"]["linear"] = serde_json::json!({ "command": "linear-mcp" });
+        write(&w.cursor().join("mcp.json"), &cursor.to_string());
+        assert_eq!(undo_with(m, false).unwrap(), 0);
+        let cursor: serde_json::Value = serde_json::from_str(&read(&w.cursor().join("mcp.json"))).unwrap();
+        assert_eq!(cursor["mcpServers"]["tokenstash"]["command"], "/old/tokenstash");
+        assert_eq!(cursor["mcpServers"]["linear"]["command"], "linear-mcp");
+        let codex: toml::Value = toml::from_str(&read(&w.codex().join("config.toml"))).unwrap();
+        assert_eq!(codex["mcp_servers"]["tokenstash"]["command"].as_str(), Some("/old/tokenstash"));
     }
 
     #[test]
@@ -1228,7 +1299,7 @@ mod tests {
         assert!(!w.cursor_skill_dir().join("SKILL.md").exists());
         assert_eq!(read(&w.cursor_skill_dir().join("helper.sh")), "#!/bin/sh");
         write(&w.claude_skill_dir().join("notes.md"), "mine");
-        assert_eq!(undo_with(m).unwrap(), 0);
+        assert_eq!(undo_with(m, false).unwrap(), 0);
         assert!(!w.claude_skill_dir().join("SKILL.md").exists());
         assert_eq!(read(&w.claude_skill_dir().join("notes.md")), "mine");
     }
@@ -1256,7 +1327,7 @@ mod tests {
         // The user changes the files afterwards...
         write(&w.cursor().join("mcp.json"), "{\"mcpServers\":{\"github\":{\"command\":\"gh-mcp\"},\"linear\":{\"command\":\"linear-mcp\"}}}");
         // ...and undo brings the entries back beside those changes.
-        assert_eq!(undo_with(m).unwrap(), 0);
+        assert_eq!(undo_with(m, false).unwrap(), 0);
         let cursor: serde_json::Value = serde_json::from_str(&read(&w.cursor().join("mcp.json"))).unwrap();
         assert_eq!(cursor["mcpServers"]["tokenstash"]["command"], "/old/tokenstash");
         assert_eq!(cursor["mcpServers"]["linear"]["command"], "linear-mcp");
@@ -1284,10 +1355,54 @@ mod tests {
         assert!(!m.claude_mcp_registered);
         assert_eq!(m.entries.len(), 1, "{:?}", m.entries);
         assert!(m.entries[0].key.starts_with("projects/"));
-        assert_eq!(undo_with(m).unwrap(), 0);
+        assert_eq!(undo_with(m, false).unwrap(), 0);
         let claude: serde_json::Value = serde_json::from_str(&read(&w.claude_json())).unwrap();
         assert!(claude["mcpServers"].get("tokenstash").is_none(), "init's own registration must not come back: {claude}");
         assert_eq!(claude["projects"]["/home/u/app"]["mcpServers"]["tokenstash"]["command"], "/old/tokenstash");
+    }
+
+    /// Astra: ownership of init's CLI registration is given up only once it is gone; one
+    /// already gone (an interrupted run, the user) settles the flag without a write.
+    #[test]
+    fn the_cli_flag_is_reconciled_with_what_the_file_holds() {
+        let (w, mut m) = machine("cli-flag");
+        m.claude_mcp_registered = true;
+        m.save().unwrap();
+        wire(&mut m, &w, AgentMode::Explicit).unwrap();
+        assert!(!m.claude_mcp_registered && m.entries.is_empty());
+    }
+
+    /// Astra: the user's registration → explicit (recorded as an entry) → auto with the CLI
+    /// (init's own registration, flag set) → undo. Init's registration must go before the
+    /// entry comes back, or the entry would yield to it and be dropped. With no `claude` on
+    /// PATH the removal cannot happen, so the entry waits and undo reports unfinished.
+    #[test]
+    fn undo_keeps_the_users_entry_until_inits_registration_is_gone() {
+        let (w, mut m) = machine("undo-order");
+        write(&w.claude_json(), "{\"mcpServers\":{\"tokenstash\":{\"command\":\"/old/tokenstash\"}}}");
+        wire(&mut m, &w, AgentMode::Explicit).unwrap();
+        assert_eq!(m.entries.len(), 1);
+        // What `claude mcp add -s user` would do on the switch back to auto.
+        wire(&mut m, &w, AgentMode::Auto).unwrap();
+        write(&w.claude_json(), "{\"mcpServers\":{\"tokenstash\":{\"type\":\"stdio\",\"command\":\"/opt/tokenstash\",\"args\":[\"mcp\"]}}}");
+        m.files.retain(|(p, _)| p != &w.claude_json());
+        m.claude_mcp_registered = true;
+        m.save().unwrap();
+        let root = m.root.clone();
+        assert_eq!(undo_with(m, false).unwrap(), 1, "unfinished: init's registration is still there");
+        let left = Manifest::load_at(root).unwrap();
+        assert!(left.claude_mcp_registered && left.entries.len() == 1, "{left:?}");
+        assert!(read(&w.claude_json()).contains("/opt/tokenstash") && !read(&w.claude_json()).contains("/old/tokenstash"));
+    }
+
+    /// A manifest written by the previous version has no `entries`; it still loads.
+    #[test]
+    fn a_manifest_without_entries_loads() {
+        let root = scratch("legacy-manifest");
+        fs::write(root.join("init.manifest.json"), "{\"files\":[[\"/x/AGENTS.md\",null]],\"dirs\":[],\"claude_mcp_registered\":false}").unwrap();
+        let m = Manifest::load_at(root).unwrap();
+        assert_eq!(m.files.len(), 1);
+        assert!(m.entries.is_empty() && !m.is_empty());
     }
 
     /// Astra: `init --project` sections must follow the mode, in every project they were
@@ -1305,11 +1420,20 @@ mod tests {
         assert_eq!(s.matches(SNIPPET_MARK).count(), 1);
         wire(&mut m, &w, AgentMode::Auto).unwrap();
         assert!(read(&proj).contains("secrets_request") && !read(&proj).contains("Do not run tokenstash until"));
+        // Two sections (a copy-paste) become one for the new mode, and a file with two is
+        // not "already right" for either.
+        write(&proj, &format!("# App\n\n{}\n{}", snippet_for(AgentMode::Auto), snippet_for(AgentMode::Auto)));
+        assert!(!snippet_is(&proj, AgentMode::Auto));
+        wire(&mut m, &w, AgentMode::Explicit).unwrap();
+        assert_eq!(read(&proj).matches(SNIPPET_MARK).count(), 1);
+        assert!(snippet_is(&proj, AgentMode::Explicit) && !read(&proj).contains("secrets_request"));
+        assert!(stray_project_sections(&m, &w, AgentMode::Explicit).is_empty());
+        wire(&mut m, &w, AgentMode::Auto).unwrap();
         // set_snippet on a file already holding the right section changes nothing.
         let before = read(&proj);
         set_snippet(&proj, AgentMode::Auto).unwrap();
         assert_eq!(read(&proj), before);
-        assert_eq!(undo_with(m).unwrap(), 0);
+        assert_eq!(undo_with(m, false).unwrap(), 0);
         assert_eq!(read(&proj), "# App\n");
     }
 
@@ -1341,6 +1465,8 @@ mod tests {
         }
         assert!(!s.contains("secrets_request") && !s.contains("Use the tokenstash MCP tools"));
         assert!(s.starts_with(SNIPPET_MARK) && s.trim_end().ends_with(SNIPPET_END));
+        // The auto section states the stand-in rule for every unavailable key, not only a denied one.
+        assert!(snippet_for(AgentMode::Auto).contains("Exit 30 = expired; say what is blocked and stop. Never invent a stand-in value by any route"));
     }
 
     #[test]
@@ -1358,18 +1484,18 @@ mod tests {
     }
 
     #[test]
-    fn pristine_means_the_same_document_not_the_same_bytes() {
-        let d = scratch("pristine");
-        let (a, b) = (d.join("a.json"), d.join("b.json"));
-        fs::write(&a, "{\"mcpServers\":{\"x\":{\"command\":\"y\"}}}").unwrap();
-        fs::write(&b, "{\n  \"mcpServers\": {\n    \"x\": {\n      \"command\": \"y\"\n    }\n  }\n}").unwrap();
-        assert!(same_content(&a, &b));
-        fs::write(&b, "{\"mcpServers\":{}}").unwrap();
-        assert!(!same_content(&a, &b) && effectively_empty(&b) && !effectively_empty(&a));
+    fn effectively_empty_means_only_what_init_leaves_behind() {
+        let d = scratch("empty");
+        let j = d.join("a.json");
+        for (text, empty) in [("{}", true), ("{\"mcpServers\":{}}", true), ("{\"mcpServers\":{},\"theme\":[]}", false), ("{\"mcpServers\":{\"x\":{}}}", false), ("[]", false)] {
+            fs::write(&j, text).unwrap();
+            assert_eq!(effectively_empty(&j), empty, "{text}");
+        }
         let t = d.join("c.toml");
-        fs::write(&t, "[mcp_servers]\n").unwrap();
-        assert!(effectively_empty(&t));
-        fs::write(&t, "model = \"o3\"\n[mcp_servers]\n").unwrap();
-        assert!(!effectively_empty(&t));
+        for (text, empty) in [("", true), ("[mcp_servers]\n", true), ("# mine\n[mcp_servers]\n", false), ("[mcp_servers]\n[other]\n", false), ("model = \"o3\"\n", false)] {
+            fs::write(&t, text).unwrap();
+            assert_eq!(effectively_empty(&t), empty, "{text:?}");
+        }
+        assert!(effectively_empty(&d.join("missing.json")));
     }
 }
