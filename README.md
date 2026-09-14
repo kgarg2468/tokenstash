@@ -102,6 +102,16 @@ tokenstash open                                 # the inbox: everything waiting 
 tokenstash doctor                               # check the setup
 ```
 
+### Automatic, or only when you say so
+
+By default the agent asks tokenstash on its own: `init` registers the MCP server and installs a skill that tells the agent to request a key whenever code needs one. If you would rather nothing happen until you ask:
+
+```bash
+tokenstash init --mode explicit
+```
+
+This takes the MCP server and everything the agent reads unprompted back out, and installs one command that only you can invoke: `/tokenstash OPENAI_API_KEY` in Claude Code and Cursor, `/prompts:tokenstash OPENAI_API_KEY` in Codex, `/tokenstash OPENAI_API_KEY` in Gemini CLI. Typed bare, it requests whatever the current task needs. The command runs `tokenstash need` under the same rules, so the value still goes to `.env.local` and never into the chat. In a session where you don't type it, the agent doesn't know tokenstash exists and will ask you for keys the way it always did. `tokenstash init --mode auto` switches back, `doctor` shows the mode, and `init --undo` removes either.
+
 ## Uninstall
 
 1. **Take tokenstash out of your agents:** `tokenstash init --undo`. It puts back the agent config files `init` changed, from the copies it saved at the time, and deletes the files it created. An edit you made to one of those files since `init` (another MCP server added to Cursor, say) is lost with it, so check them first.
@@ -138,7 +148,7 @@ Keys already written into projects' `.env.local` files stay there until you dele
 | `tokenstash workspaces [list\|revoke DIR\|forget DIR]` | Which folders are approved for which keys; take a folder's approvals away |
 | `tokenstash export` · `import BUNDLE` | Move your stash to another machine in a passphrase-encrypted bundle |
 | `tokenstash run -- COMMAND` | Run a program with `.env.local` loaded; see below |
-| `tokenstash init [--undo]` · `doctor` · `audit` · `registry` | Set up or remove the agent connections; check the setup; see every delivery; list known providers |
+| `tokenstash init [--mode auto\|explicit] [--undo]` · `doctor` · `audit` · `registry` | Set up or remove the agent connections, automatic or on your command only; check the setup; see every delivery; list known providers |
 | `tokenstash mcp` · `inbox` | The MCP server and the inbox (started for you) |
 
 `tokenstash run` loads `.env.local` into the program's environment. If the program exits with an error and its output names a registry-known variable that isn't set, tokenstash asks for it and restarts the program once it arrives. A key requested this way needs your approval each time, even in an approved folder, since the program's output chose it.
