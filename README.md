@@ -110,7 +110,7 @@ By default the agent asks tokenstash on its own: `init` registers the MCP server
 tokenstash init --mode explicit
 ```
 
-This takes the MCP server and everything the agent reads unprompted back out, and installs one command that only you can invoke: `/tokenstash OPENAI_API_KEY` in Claude Code and Cursor, `/prompts:tokenstash OPENAI_API_KEY` in Codex, `/tokenstash OPENAI_API_KEY` in Gemini CLI. Typed bare, it requests whatever the current task needs. The command runs `tokenstash need` under the same rules, so the value still goes to `.env.local` and never into the chat. In a session where you don't type it, the agent doesn't know tokenstash exists and will ask you for keys the way it always did. `tokenstash init --mode auto` switches back, `doctor` shows the mode, and `init --undo` removes either.
+This takes the MCP server and everything the agent reads unprompted back out, and installs one command that only you can invoke: `/tokenstash OPENAI_API_KEY` in Claude Code and Cursor, `/prompts:tokenstash OPENAI_API_KEY` in Codex, `/tokenstash OPENAI_API_KEY` in Gemini CLI. Typed bare, it requests whatever the current task needs, and it covers the rest of that task: a key the work turns out to need later goes through it too. The command runs `tokenstash need` under the same rules, so the value still goes to `.env.local` and never into the chat. In a session where you don't type it, the agent doesn't know tokenstash exists and will ask you for keys the way it always did. `tokenstash init --mode auto` switches back, `doctor` shows the mode, and `init --undo` removes either.
 
 ## Uninstall
 
