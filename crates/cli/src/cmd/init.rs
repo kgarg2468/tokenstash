@@ -705,9 +705,9 @@ pub fn init(a: InitArgs) -> Result<i32> {
     let env_home = std::env::var("TOKENSTASH_HOME").ok().filter(|h| !h.is_empty());
     // Printing follows the mode chosen for this machine unless one is named, so text
     // redirected into a file by hand is the text init would have written.
-    let print_mode = || a.mode.map(Into::into).unwrap_or_else(|| Config::load().map(|c| c.agent_mode).unwrap_or_default());
-    if a.print_snippet { print!("{}", snippet_for(print_mode())); return Ok(0); }
-    if a.print_skill { print!("{}", skill_text(print_mode(), env_home.as_deref())); return Ok(0); }
+    let print_mode = || -> Result<AgentMode> { match a.mode { Some(m) => Ok(m.into()), None => Ok(Config::load()?.agent_mode) } };
+    if a.print_snippet { print!("{}", snippet_for(print_mode()?)); return Ok(0); }
+    if a.print_skill { print!("{}", skill_text(print_mode()?, env_home.as_deref())); return Ok(0); }
     // Undo restores what init found, which can be automatic wiring explicit mode took out;
     // the mode and a project's instructions decide how agents reach tokenstash. All three
     // are the person's call, not an agent's.
