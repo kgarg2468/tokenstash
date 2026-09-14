@@ -356,8 +356,10 @@ fn undo_with(m: Manifest, claude_cli: bool) -> Result<i32> {
 }
 
 /// Put a removed registration back where it was, unless a tokenstash entry is there already
-/// (the user re-added one since; theirs wins).
+/// (the user re-added one since; theirs wins). The file, and its directory, may be gone by
+/// now (an agent uninstalled in between): they are recreated around the entry.
 fn reinsert(r: &Removed) -> Result<()> {
+    if let Some(d) = r.file.parent() { fs::create_dir_all(d)?; }
     if r.key == "mcp_servers" {
         let mut doc = read_toml(&r.file)?;
         let snip: toml_edit::DocumentMut = r.value.parse().map_err(|e| anyhow::anyhow!("the saved entry does not parse ({e})"))?;
@@ -1393,6 +1395,21 @@ mod tests {
         let left = Manifest::load_at(root).unwrap();
         assert!(left.claude_mcp_registered && left.entries.len() == 1, "{left:?}");
         assert!(read(&w.claude_json()).contains("/opt/tokenstash") && !read(&w.claude_json()).contains("/old/tokenstash"));
+    }
+
+    /// Greptile: the agent's config directory may be gone by the time of undo.
+    #[test]
+    fn undo_recreates_a_config_directory_removed_in_between() {
+        let (w, mut m) = machine("dir-gone");
+        write(&w.cursor().join("mcp.json"), "{\"mcpServers\":{\"tokenstash\":{\"command\":\"/old/tokenstash\"}}}");
+        write(&w.codex().join("config.toml"), "[mcp_servers.tokenstash]\ncommand = \"/old/tokenstash\"\n");
+        wire(&mut m, &w, AgentMode::Explicit).unwrap();
+        fs::remove_dir_all(w.cursor()).unwrap();
+        fs::remove_dir_all(w.codex()).unwrap();
+        assert_eq!(undo_with(m, false).unwrap(), 0);
+        let cursor: serde_json::Value = serde_json::from_str(&read(&w.cursor().join("mcp.json"))).unwrap();
+        assert_eq!(cursor["mcpServers"]["tokenstash"]["command"], "/old/tokenstash");
+        assert!(toml_has_server(&w.codex().join("config.toml")));
     }
 
     /// A manifest written by the previous version has no `entries`; it still loads.
