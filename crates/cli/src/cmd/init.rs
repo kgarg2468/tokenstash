@@ -366,7 +366,7 @@ fn undo_with(m: Manifest, claude_cli: bool, home: &Path) -> Result<i32> {
             continue;
         }
         match reinsert(&r) {
-            Ok(()) => { println!("✓ put the tokenstash MCP entry back in {}", r.file.display()); cur.entries.remove(i); cur.save()?; }
+            Ok(()) => { println!("✓ put the tokenstash {} back in {}", if r.key == "section" { "section" } else { "MCP entry" }, r.file.display()); cur.entries.remove(i); cur.save()?; }
             Err(e) => { println!("! {}: {e} (kept in the manifest; re-run --undo to retry)", r.file.display()); i += 1; }
         }
     }
