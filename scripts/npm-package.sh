@@ -24,6 +24,9 @@
 set -euo pipefail
 version="${1:?version}"; src="${2:?tarball dir}"; out="${3:?out dir}"
 tagopt=(); case "$version" in *-*) tagopt=(--tag next) ;; esac
+# Overridable for scripts/npm-package-test.sh, which runs this against a mock registry.
+registry="${NPM_REGISTRY_URL:-https://registry.npmjs.org}"
+settle_attempts="${NPM_SETTLE_ATTEMPTS:-60}"; settle_pause="${NPM_SETTLE_PAUSE:-15}"
 here="$(cd "$(dirname "$0")/.." && pwd)"
 # Skip a package already on the registry at this version so a re-run after a partial
 # failure finishes the set instead of dying on E403 — but only if what is there is OURS:
@@ -35,15 +38,17 @@ here="$(cd "$(dirname "$0")/.." && pwd)"
 # The tarball URL for name@version, from the registry's own document with the CDN cache
 # bypassed (`?write=true`): `npm view` reads through the CDN, which can serve a packument
 # up to five minutes stale. A version the registry does not serve yet is a miss.
+# Every request is bounded: a registry that accepts the connection and then says nothing
+# must not hold the settle loop past its own budget.
 tarball_url() { # <name>
-  curl -fsSL "https://registry.npmjs.org/$1?write=true" 2>/dev/null \
+  curl -fsSL --connect-timeout 10 --max-time 60 "$registry/$1?write=true" 2>/dev/null \
     | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["versions"][sys.argv[1]]["dist"]["tarball"])' "$version" 2>/dev/null
 }
 same_package() { # <pkg dir>
   local dir="$1" url tmp ok=1
   url=$(tarball_url "$name") && [ -n "$url" ] || return 1
   tmp=$(mktemp -d); mkdir -p "$tmp/theirs" "$tmp/ours" "$tmp/pack"
-  if curl -fsSL "$url" -o "$tmp/theirs.tgz" && tar -xzf "$tmp/theirs.tgz" -C "$tmp/theirs" \
+  if curl -fsSL --connect-timeout 10 --max-time 300 "$url" -o "$tmp/theirs.tgz" && tar -xzf "$tmp/theirs.tgz" -C "$tmp/theirs" \
      && (cd "$dir" && npm pack --silent --pack-destination "$tmp/pack" >/dev/null) \
      && tar -xzf "$tmp"/pack/*.tgz -C "$tmp/ours" && diff -r "$tmp/theirs" "$tmp/ours" >/dev/null; then ok=0; fi
   rm -rf "$tmp"; return $ok
@@ -54,15 +59,15 @@ same_package() { # <pkg dir>
 # that is there and differs still fails; it just fails after the wait.
 settled() { # <pkg dir>
   local i url
-  for i in $(seq 1 60); do
+  for i in $(seq 1 "$settle_attempts"); do
     same_package "$1" && return 0
-    if [ "$i" -lt 60 ]; then sleep 15; fi
+    if [ "$i" -lt "$settle_attempts" ]; then sleep "$settle_pause"; fi
   done
   # Two different failures read the same from here; say which one this was.
   if url=$(tarball_url "$name") && [ -n "$url" ]; then
     echo "$name@$version is on the registry ($url) but does not match what we built, or could not be compared" >&2
   else
-    echo "$name@$version did not appear on the registry after 60 attempts over about fifteen minutes" >&2
+    echo "$name@$version did not appear on the registry after $settle_attempts attempts, $settle_pause s apart" >&2
   fi
   return 1
 }
