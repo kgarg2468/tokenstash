@@ -12,9 +12,17 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
 real_npm="$(command -v npm)" || { echo "npm is required (for npm pack)" >&2; exit 2; }
 work="$(mktemp -d)"
-# Everything started here — the mock server, the fake npm's visibility and tamper jobs —
-# is stopped before the fixtures go, so nothing writes into a directory being removed.
-trap 'pkill -P $$ 2>/dev/null; kill "${server:-}" 2>/dev/null; wait 2>/dev/null; rm -rf "$work"' EXIT
+# Everything started here — the mock server, and the fake npm's visibility jobs, which
+# outlive the npm process that started them and are recorded in $reg/jobs — is stopped
+# before the fixtures go, so nothing writes into a directory being removed.
+cleanup() {
+  local p
+  for p in $(cat "$reg/jobs" 2>/dev/null); do kill "$p" 2>/dev/null || true; done
+  kill "${server:-}" 2>/dev/null || true
+  wait 2>/dev/null || true
+  rm -rf "$work"
+}
+trap cleanup EXIT
 reg="$work/registry"; mkdir -p "$reg" "$work/bin" "$work/src"
 # Four fake platform tarballs, each holding one executable named tokenstash.
 for n in linux-x64 linux-arm64 darwin-arm64 darwin-x64; do
@@ -72,6 +80,9 @@ case "$1" in
     mv "$FAKE_REG/$name"/*.tgz "$FAKE_REG/$name/$ver.tgz"
     delay=0; case "$name" in tokenstash-*) delay="${FAKE_DELAY:-0}" ;; esac
     ( sleep "$delay"; touch "$FAKE_REG/$name/visible"; echo "visible $name $(now)" >> "$FAKE_REG/log" ) &
+    # This npm process exits at once; the job outlives it, so the harness gets its pid to
+    # stop on cleanup.
+    echo $! >> "$FAKE_REG/jobs"
     ;;
   view)
     spec="$2"; name="${spec%@*}"; ver="${spec##*@}"; field="${3:-}"
