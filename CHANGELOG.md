@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+**Explicit mode.** `tokenstash init --mode explicit` installs a command only you can invoke — `/tokenstash NAME` in Claude Code and Cursor (a skill with `disable-model-invocation: true`), `/prompts:tokenstash NAME` in Codex, `/tokenstash NAME` in Gemini CLI — and takes out the MCP server, the auto-loading skill and the AGENTS.md snippet, so nothing an agent reads unprompted mentions tokenstash. The command runs the CLI under the same rules. `init --mode auto` switches back and removes the commands; the choice is kept in `config.toml` (`agent_mode`) and shown by `doctor`, which also flags wiring left over from the other mode. `init --undo` restores either mode's files. `init --print-skill [--mode ...]` prints the skill text; `--print-snippet --mode explicit` prints an AGENTS.md section that keeps the no-paste and no-stand-in rules without telling the agent to run tokenstash. A config that chose explicit mode does not load in 0.2 (unknown field); one that kept auto still does.
+
 ## 0.2.0 — trust v2: directories pair once
 
 **Breaking**

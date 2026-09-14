@@ -36,6 +36,34 @@ pub struct Config {
     /// before the agent ever sees a 401.
     #[serde(default)]
     pub verify_every: VerifyEvery,
+    /// How agents reach tokenstash. `auto` (default): `init` registers the MCP server and
+    /// installs a skill the agent loads on its own, so keys are requested whenever code needs
+    /// one. `explicit`: no MCP server and nothing the agent reads unprompted; `init` installs a
+    /// slash command (`/tokenstash`) the person types, which runs the CLI.
+    /// Not written while it is the default, so a config this version saved still loads in
+    /// 0.2 (which rejects unknown fields) unless explicit mode was chosen.
+    #[serde(default, skip_serializing_if = "AgentMode::is_auto")]
+    pub agent_mode: AgentMode,
+}
+
+/// See [`Config::agent_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentMode {
+    #[default]
+    Auto,
+    Explicit,
+}
+
+impl AgentMode {
+    pub fn is_auto(&self) -> bool { *self == AgentMode::Auto }
+    pub fn as_str(self) -> &'static str {
+        match self { AgentMode::Auto => "auto", AgentMode::Explicit => "explicit" }
+    }
+}
+
+impl std::fmt::Display for AgentMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.as_str()) }
 }
 
 /// Parsed at load time so an invalid value is a config error, not a silent default.
@@ -116,6 +144,7 @@ impl Default for Config {
             notifications: true,
             inbox_links: default_links(),
             verify_every: VerifyEvery::default(),
+            agent_mode: AgentMode::Auto,
         }
     }
 }
